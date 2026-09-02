@@ -1,57 +1,104 @@
-# Closed tag vocabulary injected into the hadith pipeline prompt.
-# Keep this list short so Gemini does not invent a parallel ontology.
+# Concept catalog for hadith tags (semantic bridges, not SEO / chapter titles).
+# group: false = parent heading, never used as a Phase 2 cosine bucket.
+# group: true  = mid-grain claim-level ID used to group hadiths across books.
 concepts:
-  - الإيمان
-  - الكفر
-  - التوحيد
-  - العدل
-  - الإمامة
-  - المعاد
-  - الصلاة
-  - الزكاة
-  - الصوم
-  - الحج
-  - الخمس
-  - الجهاد
-  - الأمر بالمعروف
-  - النهي عن المنكر
-  - النكاح
-  - الطلاق
-  - النفقة
-  - حسن العشرة
-  - الرفق
-  - كظم الغيظ
-  - العفو
-  - الحلم
-  - الصبر
-  - التوكل
-  - الرزق
-  - الفقر
-  - الغنى
-  - الدعاء
-  - التوبة
-  - التقوى
-  - الورع
-  - الرياء
-  - الكبر
-  - الغيبة
-  - الكذب
-  - الأمانة
-  - بر الوالدين
-  - صلة الرحم
-  - حق الجار
-  - عيادة المريض
-  - الموت
-  - القبر
-  - القيامة
-  - الشفاعة
-  - الولاية
-  - البراءة
-  - التقية
-  - البدعة
-  - السنة
-  - الحلال
-  - الحرام
-  - المكروه
-  - المستحب
-  - الواجب
+  # --- parents (former flat ontology) ---
+  - {id: الإيمان, pref: الإيمان, group: false}
+  - {id: الكفر, pref: الكفر, group: false}
+  - {id: التوحيد, pref: التوحيد, group: false}
+  - {id: العدل, pref: العدل, group: false}
+  - {id: الإمامة, pref: الإمامة, group: false}
+  - {id: المعاد, pref: المعاد, group: false}
+  - {id: الصلاة, pref: الصلاة, group: false}
+  - {id: الزكاة, pref: الزكاة, group: false}
+  - {id: الصوم, pref: الصوم, group: false}
+  - {id: الحج, pref: الحج, group: false}
+  - {id: الخمس, pref: الخمس, group: false}
+  - {id: الجهاد, pref: الجهاد, group: false}
+  - {id: الأمر بالمعروف, pref: الأمر بالمعروف, group: false}
+  - {id: النهي عن المنكر, pref: النهي عن المنكر, group: false}
+  - {id: النكاح, pref: النكاح, group: false}
+  - {id: الطلاق, pref: الطلاق, group: false}
+  - {id: النفقة, pref: النفقة, group: false}
+  - {id: حسن العشرة, pref: حسن العشرة, group: false}
+  - {id: الرفق, pref: الرفق, group: false}
+  - {id: كظم الغيظ, pref: كظم الغيظ, group: false}
+  - {id: العفو, pref: العفو, group: false}
+  - {id: الحلم, pref: الحلم, group: false}
+  - {id: الصبر, pref: الصبر, group: false}
+  - {id: التوكل, pref: التوكل, group: false}
+  - {id: الرزق, pref: الرزق, group: false}
+  - {id: الفقر, pref: الفقر, group: false}
+  - {id: الغنى, pref: الغنى, group: false}
+  - {id: الدعاء, pref: الدعاء, group: false}
+  - {id: التوبة, pref: التوبة, group: false}
+  - {id: التقوى, pref: التقوى, group: false}
+  - {id: الورع, pref: الورع, group: false}
+  - {id: الرياء, pref: الرياء, group: false}
+  - {id: الكبر, pref: الكبر, group: false}
+  - {id: الغيبة, pref: الغيبة, group: false}
+  - {id: الكذب, pref: الكذب, group: false}
+  - {id: الأمانة, pref: الأمانة, group: false}
+  - {id: بر الوالدين, pref: بر الوالدين, group: false}
+  - {id: صلة الرحم, pref: صلة الرحم, group: false}
+  - {id: حق الجار, pref: حق الجار, group: false}
+  - {id: عيادة المريض, pref: عيادة المريض, group: false}
+  - {id: الموت, pref: الموت, group: false}
+  - {id: القبر, pref: القبر, group: false}
+  - {id: القيامة, pref: القيامة, group: false}
+  - {id: الشفاعة, pref: الشفاعة, group: false}
+  - {id: الولاية, pref: الولاية, group: false}
+  - {id: البراءة, pref: البراءة, group: false}
+  - {id: التقية, pref: التقية, group: false}
+  - {id: البدعة, pref: البدعة, group: false}
+  - {id: السنة, pref: السنة, group: false}
+  - {id: الحلال, pref: الحلال, group: false}
+  - {id: الحرام, pref: الحرام, group: false}
+  - {id: المكروه, pref: المكروه, group: false}
+  - {id: المستحب, pref: المستحب, group: false}
+  - {id: الواجب, pref: الواجب, group: false}
+
+  # --- mid-grain grouping concepts (seed; grow via aliases, not re-extraction) ---
+  - id: الانتحار
+    pref: الانتحار
+    aliases: [قتل النفس, قتل نفسه]
+    broader: الموت
+    group: true
+  - id: عذاب_البرزخ
+    pref: عذاب البرزخ
+    aliases: [عذاب القبر]
+    broader: المعاد
+    group: true
+  - id: الجزاء_الأخروي
+    pref: الجزاء الأخروي
+    aliases: [الجزاء الأخروي, الثواب والعقاب]
+    broader: المعاد
+    group: true
+  - id: العقل
+    pref: العقل
+    aliases: [عقول]
+    group: true
+  - id: الجهل
+    pref: الجهل
+    group: true
+  - id: النكراء
+    pref: النكراء
+    aliases: [الشيطنة]
+    group: true
+  - id: العبادة
+    pref: العبادة
+    group: true
+  - id: الجنة
+    pref: الجنة
+    aliases: [الجنان]
+    broader: المعاد
+    group: true
+  - id: الحساب
+    pref: الحساب
+    aliases: [حساب القيامة]
+    broader: القيامة
+    group: true
+  - id: محبة_أهل_البيت
+    pref: محبة أهل البيت
+    broader: الولاية
+    group: true

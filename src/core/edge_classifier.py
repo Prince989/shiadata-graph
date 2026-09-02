@@ -15,6 +15,9 @@ from src.state_manager import ChunkRecord, ChunkStatus, StateManager
 
 logger = logging.getLogger(__name__)
 
+EXTREME_DF_RATIO = 0.15
+EXTREME_DF_MIN_CHUNKS = 20
+
 EDGE_SYSTEM = (
     "Determine the logical relationship between these two Shia textual units. "
     "SUPPORTS: they agree or one corroborates the other. "
@@ -61,8 +64,32 @@ def verify_duplicates(
 
 
 def embed_preview(chunk: ChunkRecord) -> str:
-    payload = chunk.payload() or {}
-    return str(payload.get("hadith") or chunk.text)[:4000]
+    from src.core.vector_engine import embed_text_for_chunk
+
+    return embed_text_for_chunk(chunk)[:4000]
+
+
+def build_tag_buckets(
+    chunks: list[ChunkRecord],
+    *,
+    max_df_ratio: float = EXTREME_DF_RATIO,
+    min_chunks_for_df: int = EXTREME_DF_MIN_CHUNKS,
+) -> dict[str, list[str]]:
+    """Chunk ids per grouping tag. Singleton tags are kept. Extreme-df skipped only on large sets."""
+    by_tag: dict[str, list[str]] = defaultdict(list)
+    for chunk in chunks:
+        for tag in concepts_for_chunk(chunk):
+            by_tag[tag].append(chunk.id)
+    n = len(chunks)
+    apply_df = n >= min_chunks_for_df
+    buckets: dict[str, list[str]] = {}
+    for tag, ids in by_tag.items():
+        unique = list(dict.fromkeys(ids))
+        if apply_df and unique and (len(unique) / n) > max_df_ratio:
+            logger.info("skip extreme-df tag %s df=%s/%s", tag, len(unique), n)
+            continue
+        buckets[tag] = unique
+    return buckets
 
 
 def classify_tag_groups(
@@ -74,15 +101,10 @@ def classify_tag_groups(
     threshold: float,
     group_cap: int,
 ) -> int:
-    by_tag: dict[str, list[str]] = defaultdict(list)
     lookup = {c.id: c for c in chunks}
-    for chunk in chunks:
-        for tag in concepts_for_chunk(chunk):
-            by_tag[tag].append(chunk.id)
-
     created = 0
-    for tag, ids in by_tag.items():
-        unique = list(dict.fromkeys(ids))
+    for tag, ids in build_tag_buckets(chunks).items():
+        unique = ids
         if len(unique) > group_cap:
             logger.warning("tag %s has %d items; truncating to %d", tag, len(unique), group_cap)
             unique = unique[:group_cap]

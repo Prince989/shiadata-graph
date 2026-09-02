@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from src.agents.gemini import GeminiAgent
+from src.extractors.chunkers import split_hadith_page
 from src.extractors.epub_parser import ParsedUnit
-from src.models import HadithExtraction, HistoryExtraction, TafsirExtraction
-from src.pipelines.catalog import load_ontology
+from src.models import HadithPageExtraction, HistoryExtraction, TafsirExtraction
+from src.pipelines.ontology import grouping_prefs, remap_hadith_payload
 from src.state_manager import ChunkStatus, StateManager
 
 logger = logging.getLogger(__name__)
@@ -31,9 +34,34 @@ def should_skip(text: str, min_chars: int) -> bool:
     return any(marker in stripped for marker in SKIP_MARKERS)
 
 
+def phase1_filename(source_path: str, locator: str, cid: str) -> str:
+    stem = Path(source_path).stem or "unknown"
+    loc = re.sub(r"[^\w\u0600-\u06FF]+", "_", locator, flags=re.UNICODE)
+    loc = re.sub(r"_+", "_", loc).strip("_")[:120]
+    if loc:
+        return f"{stem}__{loc}.json"
+    return f"{stem}__{cid[:16]}.json"
+
+
+def hadith_system_extra(text: str) -> str:
+    tokens = [token for token, _ in split_hadith_page(text)]
+    if not tokens:
+        return (
+            "No numbered start was detected; this page is likely a continuation. "
+            "Return hadiths with one continuation item (or more if the page still "
+            "contains distinct narrations)."
+        )
+    listed = ", ".join(tokens)
+    return (
+        f"Detected numbered starts on this page: {listed}. "
+        f"The hadiths array MUST include each of these {len(tokens)} numbered "
+        "narrations (plus a leading continuation item if the page starts mid-hadith)."
+    )
+
+
 def schema_for(pipeline: str) -> type[BaseModel]:
     if pipeline == "hadith":
-        return HadithExtraction
+        return HadithPageExtraction
     if pipeline == "tafsir":
         return TafsirExtraction
     if pipeline == "history":
@@ -41,16 +69,31 @@ def schema_for(pipeline: str) -> type[BaseModel]:
     raise ValueError(f"Unknown pipeline {pipeline}")
 
 
-def system_prompt(pipeline: str) -> str:
+def system_prompt(pipeline: str, extra: str = "") -> str:
     if pipeline == "hadith":
-        ontology = "، ".join(load_ontology())
+        examples = "، ".join(grouping_prefs())
         return (
-            "You extract one hadith unit from classical Shia Arabic. "
-            "Return the original Arabic, fluent Persian, precise English, "
+            "You extract EVERY hadith on this printed page, not just the first. "
+            "Return JSON with page (copy the locator) and hadiths: an array with one "
+            "object per distinct narration. "
+            "If the page starts mid-hadith (no new number), include that fragment first "
+            "with marker 'continuation'. "
+            "Then include each numbered hadith (e.g. '3 -', '8-', '[ ١٥٤٩٥ ] ١ ـ'). "
+            "Ignore editor footnotes like [1] [2] at the bottom of the page. "
+            "For each item: original Arabic, fluent Persian, precise English, "
             "narrators in chain order, and tags. "
-            "Prefer tags from this Base Ontology and do not invent a parallel vocabulary: "
-            f"{ontology}. "
-            "If none apply, emit at most one extra tag. Never fabricate a hadith."
+            "Tags are ontological concept IDs (semantic bridges), not keywords and not "
+            "kitāb/bāb titles. Assign 2–6 mid-grain fuṣḥā labels that name the "
+            "theological, legal, or ethical CLAIM of the matn. "
+            "Never tag instruments, props, proper names-as-topics, or a word merely "
+            "because it occurs. Never use a root heading (الإيمان، المعاد، الحرام، …) "
+            "unless the hadith is actually defining that heading. "
+            "Example: afterlife punishment for a man who killed himself with hot steel "
+            "→ [الانتحار, عذاب البرزخ, الجزاء الأخروي] — not حديد and not كتاب العقل. "
+            "Known grouping concepts (examples, not an exclusive menu): "
+            f"{examples}. "
+            "Never fabricate a hadith. "
+            f"{extra}"
         )
     if pipeline == "tafsir":
         return (
@@ -84,16 +127,19 @@ def process_unit(
         state.mark(cid, ChunkStatus.SKIPPED, error="too short or table of contents")
         return ChunkStatus.SKIPPED
 
+    extra = hadith_system_extra(unit.text) if pipeline == "hadith" else ""
     result = agent.complete_structured(
         f"Locator: {unit.locator}\n\nText:\n{unit.text}",
         schema_for(pipeline),
-        system=system_prompt(pipeline),
+        system=system_prompt(pipeline, extra=extra),
     )
     payload = result.model_dump()
+    if pipeline == "hadith":
+        payload = remap_hadith_payload(payload)
     dest = output_dir / book_id
     dest.mkdir(parents=True, exist_ok=True)
-    (dest / f"{cid}.json").write_text(
-        result.model_dump_json(indent=2, ensure_ascii=False),
+    (dest / phase1_filename(unit.source_path, unit.locator, cid)).write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     state.mark(cid, ChunkStatus.PROCESSED_PHASE1, payload=payload)

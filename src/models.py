@@ -8,11 +8,21 @@ from pydantic import BaseModel, Field
 
 
 class HadithExtraction(BaseModel):
+    """One narration. Also used as an element of a page array."""
+
+    marker: str = ""
     hadith: str
     hadith_fa: str
     hadith_en: str
     tags: list[str] = Field(default_factory=list)
     ravis: list[str] = Field(default_factory=list)
+
+
+class HadithPageExtraction(BaseModel):
+    """One printed Folklib page → every hadith that appears on it."""
+
+    page: str
+    hadiths: list[HadithExtraction] = Field(default_factory=list)
 
 
 class TafsirExtraction(BaseModel):

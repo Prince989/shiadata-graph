@@ -7,7 +7,10 @@ from pathlib import Path
 
 import yaml
 
-from config.paths import BOOKS_YAML, ONTOLOGY_YAML, RAW_EPUBS_DIR
+from config.paths import BOOKS_YAML, RAW_EPUBS_DIR
+from src.pipelines.ontology import load_ontology
+
+__all__ = ["BookSpec", "load_book_catalog", "load_ontology", "resolve_book"]
 
 
 @dataclass(frozen=True)
@@ -16,11 +19,6 @@ class BookSpec:
     pipeline: str
     description: str
     files: list[Path]
-
-
-def load_ontology() -> list[str]:
-    data = yaml.safe_load(ONTOLOGY_YAML.read_text(encoding="utf-8"))
-    return list(data.get("concepts", []))
 
 
 def load_book_catalog() -> dict:

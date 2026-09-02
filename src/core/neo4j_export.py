@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from config.paths import OUTPUT_DIR
-from src.core.vector_engine import concepts_for_chunk
+from src.core.vector_engine import concepts_for_chunk, hadith_items
 from src.state_manager import ChunkStatus, StateManager
 
 
@@ -79,7 +79,12 @@ def export_neo4j(state: StateManager, dest: Path | None = None) -> Path:
                     )
                     + "\n"
                 )
-            for ravi in payload.get("ravis") or []:
+            ravis: list[str] = []
+            for item in hadith_items(payload):
+                ravis.extend(item.get("ravis") or [])
+            if not ravis:
+                ravis = list(payload.get("ravis") or [])
+            for ravi in ravis:
                 narrators.add(ravi)
                 edges.write(
                     json.dumps(

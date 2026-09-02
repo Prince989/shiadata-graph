@@ -62,10 +62,21 @@ def dbscan_duplicate_clusters(
     return [group for group in buckets.values() if len(group) >= 2]
 
 
+def hadith_items(payload: dict) -> list[dict]:
+    items = payload.get("hadiths")
+    if isinstance(items, list) and items:
+        return [item for item in items if isinstance(item, dict)]
+    if payload.get("hadith"):
+        return [payload]
+    return []
+
+
 def embed_text_for_chunk(chunk: ChunkRecord) -> str:
     payload = chunk.payload() or {}
     if chunk.pipeline == "hadith":
-        return str(payload.get("hadith") or chunk.text)
+        parts = [str(item.get("hadith") or "") for item in hadith_items(payload)]
+        joined = "\n\n".join(part for part in parts if part)
+        return joined or str(payload.get("hadith") or chunk.text)
     if chunk.pipeline == "tafsir":
         return str(payload.get("tafsir_chunk") or payload.get("summary_fa") or chunk.text)
     if chunk.pipeline == "history":
@@ -76,9 +87,16 @@ def embed_text_for_chunk(chunk: ChunkRecord) -> str:
 
 
 def concepts_for_chunk(chunk: ChunkRecord) -> list[str]:
+    from src.pipelines.ontology import is_grouping_label, remap_tag_list
+
     payload = chunk.payload() or {}
     if chunk.pipeline == "hadith":
-        return list(payload.get("tags") or [])
+        tags: list[str] = []
+        for item in hadith_items(payload):
+            tags.extend(item.get("tags") or [])
+        if not tags:
+            tags = list(payload.get("tags") or [])
+        return [t for t in remap_tag_list(tags) if is_grouping_label(t)]
     if chunk.pipeline == "tafsir":
         return list(payload.get("core_concepts") or [])
     if chunk.pipeline == "history":
@@ -94,10 +112,11 @@ def embed_pending_chunks(
     state: StateManager,
     agent: EmbeddingAgent,
     book_id: str | None = None,
+    statuses: list[ChunkStatus] | None = None,
 ) -> int:
     chunks = state.list_chunks(
         book_id=book_id,
-        statuses=[ChunkStatus.PROCESSED_PHASE1, ChunkStatus.EMBEDDED],
+        statuses=statuses or [ChunkStatus.PROCESSED_PHASE1, ChunkStatus.EMBEDDED],
     )
     count = 0
     for chunk in chunks:

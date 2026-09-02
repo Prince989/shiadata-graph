@@ -9,3 +9,7 @@ data/output/
 *.egg-info/
 dist/
 build/
+
+*.zip
+
+data/
