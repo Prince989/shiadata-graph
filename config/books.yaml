@@ -1,0 +1,31 @@
+hadith:
+  pipeline: hadith
+  description: Al-Kafi volumes
+  globs:
+    - hadith/al-kafi-*.txt
+
+vasael-o-shia:
+  pipeline: hadith
+  description: Wasa'il al-Shia volumes
+  globs:
+    - hadith/vasael-o-shia-*.txt
+
+sahifa:
+  pipeline: hadith
+  description: Al-Sahifa al-Sajjadiyya (add files under hadith/ or sahifa/)
+  globs:
+    - hadith/*sahifa*
+    - sahifa/**
+    - "**/*sahifa*"
+
+al-mizan:
+  pipeline: tafsir
+  description: Al-Mizan tafsir
+  globs:
+    - tafsir/al-mizan.txt
+
+waqat-siffin:
+  pipeline: history
+  description: Waq'at Siffin
+  globs:
+    - hadith/waqat-siffin-*.txt
