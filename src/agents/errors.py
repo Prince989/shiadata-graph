@@ -1,6 +1,11 @@
 """Errors that callers of the reusable Gemini / embedding agents can catch."""
 
 
+FREE_TIER_TODAY = (
+    "End of Gemini free tier for today. Progress is saved; try again tomorrow."
+)
+
+
 class AgentError(Exception):
     """Base class for LLM and embedding agent failures."""
 

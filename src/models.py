@@ -8,9 +8,12 @@ from pydantic import BaseModel, Field
 
 
 class HadithExtraction(BaseModel):
-    """One narration. Also used as an element of a page array."""
+    """One narration (page fragment or flushed complete hadith)."""
 
     marker: str = ""
+    locator: str = ""
+    page_start: str = ""
+    page_end: str = ""
     hadith: str
     hadith_fa: str
     hadith_en: str
@@ -19,10 +22,17 @@ class HadithExtraction(BaseModel):
 
 
 class HadithPageExtraction(BaseModel):
-    """One printed Folklib page → every hadith that appears on it."""
+    """Internal per-page Gemini extract; not the Phase 1 product."""
 
     page: str
     hadiths: list[HadithExtraction] = Field(default_factory=list)
+
+
+class HadithUnify(BaseModel):
+    """Second-pass tags and ravis for a multi-page assembled matn."""
+
+    tags: list[str] = Field(default_factory=list)
+    ravis: list[str] = Field(default_factory=list)
 
 
 class TafsirExtraction(BaseModel):

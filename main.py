@@ -13,6 +13,7 @@ from pathlib import Path
 
 import typer
 
+from config.paths import OUTPUT_DIR
 from config.settings import get_settings
 from src.agents.embeddings import EmbeddingAgent
 from src.agents.errors import AllKeysExhausted
@@ -20,6 +21,7 @@ from src.agents.gemini import GeminiAgent
 from src.core.neo4j_export import export_neo4j
 from src.core.phase2 import run_phase2
 from src.pipelines.catalog import load_book_catalog, resolve_book
+from src.pipelines.reset import reset_catalog_book
 from src.pipelines.runner import run_phase1
 from src.state_manager import StateManager
 
@@ -45,7 +47,11 @@ def _stack() -> tuple[StateManager, GeminiAgent, EmbeddingAgent]:
 @app.command("run-phase1")
 def phase1(
     book: str = typer.Option(..., "--book", help="Catalog id, e.g. al-kafi"),
-    limit: int | None = typer.Option(None, "--limit", help="Max new chunks this run"),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        help="Max pages/chunks this run across all volume files (not per file)",
+    ),
 ) -> None:
     """Parse a book and run Gemini structured extraction."""
     _setup_logging()
@@ -100,6 +106,42 @@ def status(
     typer.echo(f"embed_model={settings.embedding_model}")
     typer.echo(f"raw_data={settings.raw_data_dir}")
     state.close()
+
+
+@app.command("reset-book")
+def reset_book_cmd(
+    book: str = typer.Option(..., "--book", help="Catalog id, e.g. hadith"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not prompt"),
+    keep_outputs: bool = typer.Option(
+        False, "--keep-outputs", help="Leave data/output/phase1/<book>/*.json"
+    ),
+    cooldowns: bool = typer.Option(
+        False, "--cooldowns", help="Also clear Gemini key cooldowns (all books)"
+    ),
+) -> None:
+    """Drop SQLite chunks/buffer/progress for a book so Phase 1 starts over."""
+    _setup_logging()
+    settings = get_settings()
+    delete_outputs = not keep_outputs
+    extra = " and Phase 1 JSON" if delete_outputs else ""
+    extra += " and Gemini cooldowns" if cooldowns else ""
+    if not yes and not typer.confirm(f"Reset '{book}' SQLite state{extra}?"):
+        raise typer.Abort()
+    state = StateManager(settings.state_db)
+    try:
+        stats = reset_catalog_book(
+            state,
+            book,
+            output_dir=OUTPUT_DIR,
+            delete_outputs=delete_outputs,
+            clear_cooldowns=cooldowns,
+        )
+    except KeyError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        state.close()
+    typer.echo(stats)
 
 
 @app.command("list-books")

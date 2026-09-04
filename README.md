@@ -48,6 +48,7 @@ python main.py run-phase1 --book al-mizan --limit 2
 python main.py run-phase1 --book waqat-siffin --limit 1
 python main.py run-phase2 --book al-kafi
 python main.py export-neo4j
+python main.py reset-book --book hadith --yes
 python main.py status --book al-kafi
 ```
 

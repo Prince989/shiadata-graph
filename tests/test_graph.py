@@ -7,18 +7,21 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from src.agents.errors import AllKeysExhausted, RateLimited
+from config.settings import Settings
+from src.agents.errors import AllKeysExhausted, RateLimited, StructuredOutputError
 from src.agents.gemini import GeminiAgent
 from src.agents.key_pool import FailureKind, KeyPool, LlmKey
 from src.core.edge_classifier import build_tag_buckets
 from src.core.phase2 import remap_existing_hadith_tags
 from src.core.vector_engine import concepts_for_chunk, cosine_similarity, pairs_above_threshold
-from src.extractors.chunkers import hadith_units, split_hadith_page
+from src.extractors.chunkers import hadith_units, page_prefix_and_starts, split_hadith_page, strip_folklib_footnotes
 from src.extractors.epub_parser import ParsedUnit, parse_epub, strip_html
 from src.extractors.txt_parser import parse_txt
-from src.models import HadithExtraction, HadithPageExtraction, HistoryExtraction, TafsirExtraction
-from src.pipelines.llm_processor import phase1_filename, process_unit, system_prompt
+from src.models import HadithExtraction, HadithPageExtraction, HadithUnify, HistoryExtraction, TafsirExtraction
+from src.pipelines.hadith_accumulator import OpenHadith, consume_page
+from src.pipelines.llm_processor import phase1_filename, process_unit, system_prompt, unify_assembled_hadith
 from src.pipelines.ontology import canonicalize_tag, is_grouping_label, remap_hadith_payload
+from src.pipelines.reset import reset_catalog_book
 from src.state_manager import ChunkRecord, ChunkStatus, StateManager
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -27,6 +30,34 @@ FIXTURES = Path(__file__).parent / "fixtures"
 @pytest.fixture
 def state(tmp_path: Path) -> StateManager:
     return StateManager(tmp_path / "state.db")
+
+
+def test_reset_catalog_book_wipes_chunks_buffer_and_json(tmp_path: Path, state: StateManager):
+    book_id = "hadith"
+    out = tmp_path / "output" / "phase1" / book_id
+    out.mkdir(parents=True)
+    (out / "al-kafi-1__1.json").write_text("{}", encoding="utf-8")
+    state.upsert_chunks(
+        [
+            {
+                "id": "h1",
+                "book_id": book_id,
+                "pipeline": "hadith",
+                "locator": "جلد 1 - صفحه 10",
+                "source_path": "al-kafi-1.txt",
+                "text": "متن",
+            }
+        ]
+    )
+    state.set_hadith_progress(book_id, "al-kafi-1.txt", "جلد 1 - صفحه 10")
+    state.set_hadith_buffer(book_id, "al-kafi-1.txt", {"marker": "11 -"})
+    stats = reset_catalog_book(state, book_id, output_dir=tmp_path / "output")
+    assert stats["chunks_removed"] == 1
+    assert stats["json_removed"] == 1
+    assert state.counts(book_id) == {}
+    assert state.get_hadith_progress(book_id, "al-kafi-1.txt") is None
+    assert state.get_hadith_buffer(book_id, "al-kafi-1.txt") is None
+    assert not (out / "al-kafi-1__1.json").exists()
 
 
 def test_txt_parser_preserves_arabic_and_banners():
@@ -181,6 +212,99 @@ def test_key_rotation_on_429(state: StateManager):
     assert result.hadith == "x"
     assert calls[0] == "key-a"
     assert "key-b" in calls
+
+
+def test_collect_google_keys_keeps_three_unique_secrets():
+    from config.settings import collect_google_keys
+
+    keys = collect_google_keys(
+        {
+            "GOOGLE_API_KEY": "alpha",
+            "GOOGLE_API_KEY1": "alpha",
+            "GOOGLE_API_KEY2": "beta",
+            "GOOGLE_API_KEY3": "gamma",
+            "GOOGLE_API_KEY_4": "delta",
+        }
+    )
+    assert keys == ["alpha", "beta", "gamma", "delta"]
+
+
+def test_round_robin_cycles_every_configured_key(state: StateManager):
+    pool = KeyPool(state, keys=["a", "b", "c"])
+    order = [pool.acquire().secret for _ in range(6)]
+    assert order == ["a", "b", "c", "a", "b", "c"]
+    first = pool.acquire()
+    pool.report_failure(first, FailureKind.RATE_LIMITED, 60_000)
+    skipped = [pool.acquire().secret for _ in range(4)]
+    assert skipped == ["b", "c", "b", "c"]
+    assert "a" not in skipped
+
+
+def test_classify_per_day_429_is_daily_quota():
+    from src.agents.gemini import classify_provider_error
+
+    kind, ms = classify_provider_error(
+        Exception(
+            "429 RESOURCE_EXHAUSTED. You exceeded your current quota. "
+            "Quota exceeded for metric: generate_content_free_tier_requests, "
+            "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
+            "Please retry in 3.295465684s. retryDelay': '3s'"
+        )
+    )
+    assert kind == FailureKind.QUOTA_EXHAUSTED
+    assert ms is None
+
+
+def test_classify_rpm_429_uses_retry_delay():
+    from src.agents.gemini import classify_provider_error
+
+    kind, ms = classify_provider_error(
+        Exception(
+            "429 RESOURCE_EXHAUSTED. Please retry in 12.5s. "
+            "quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier."
+        )
+    )
+    assert kind == FailureKind.RATE_LIMITED
+    assert ms is not None
+    assert 12_000 <= ms <= 14_000
+
+
+def test_acquire_waits_out_short_rate_limit(state: StateManager):
+    settings = Settings(key_acquire_wait_max_ms=2_000, google_api_keys=["k"])
+    pool = KeyPool(state, settings=settings, keys=["k"])
+    key = pool.acquire()
+    pool.report_failure(key, FailureKind.RATE_LIMITED, 80)
+    again = pool.acquire()
+    assert again.secret == "k"
+
+
+def test_acquire_does_not_wait_on_daily_quota(state: StateManager, monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.key_pool.time.sleep",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("slept")),
+    )
+    pool = KeyPool(state, keys=["k"])
+    key = pool.acquire()
+    pool.report_failure(key, FailureKind.QUOTA_EXHAUSTED)
+    with pytest.raises(AllKeysExhausted, match="tomorrow"):
+        pool.acquire()
+
+
+def test_gemini_exits_on_daily_quota_without_retry_loop(state: StateManager):
+    def fail(**_kwargs):
+        raise RuntimeError(
+            "429 RESOURCE_EXHAUSTED. quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
+            "Please retry in 55s."
+        )
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_max_attempts=20),
+        key_pool=KeyPool(state, keys=["a", "b"]),
+        generate_fn=fail,
+    )
+    with pytest.raises(AllKeysExhausted, match="tomorrow"):
+        agent.complete("x")
 
 
 def test_all_keys_exhausted_leaves_chunks_pending(state: StateManager):
@@ -483,4 +607,253 @@ def test_process_unit_canonicalizes_alias_tags(tmp_path: Path, state: StateManag
     written = tmp_path / "phase1" / "hadith" / phase1_filename(unit.source_path, unit.locator, "x")
     data = json.loads(written.read_text(encoding="utf-8"))
     assert data["hadiths"][0]["tags"] == ["الانتحار", "عذاب البرزخ"]
+
+
+def test_structured_output_retries_truncated_json(state: StateManager):
+    calls = {"n": 0}
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return '{"hadith": "unterminated'
+        return json.dumps(
+            {
+                "hadith": "x",
+                "hadith_fa": "ی",
+                "hadith_en": "x",
+                "tags": [],
+                "ravis": [],
+            },
+            ensure_ascii=False,
+        )
+
+    settings = Settings(gemini_max_attempts=3, google_api_keys=["k"])
+    agent = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    result = agent.complete_structured("hi", HadithExtraction)
+    assert result.hadith == "x"
+    assert calls["n"] == 2
+
+
+def test_run_phase1_records_truncated_page_error(
+    tmp_path: Path, state: StateManager, monkeypatch: pytest.MonkeyPatch
+):
+    from src.pipelines import runner as runner_mod
+    from src.pipelines.catalog import BookSpec
+
+    raw = tmp_path / "hadith"
+    raw.mkdir()
+    book = raw / "al-kafi-1.txt"
+    long = "متن حديث طويل بما يكفي. " * 8
+    book.write_text(
+        f"--- [جلد 1 - صفحه 10] ---\n\n1- {long}\n\n--- [جلد 1 - صفحه 11] ---\n\n2- {long}\n",
+        encoding="utf-8",
+    )
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        return '{"page": "p", "hadiths": [{"hadith": "cut'
+
+    settings = Settings(gemini_max_attempts=2, google_api_keys=["k"], skip_min_chars=10)
+    agent = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    monkeypatch.setattr(runner_mod, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(
+        runner_mod,
+        "resolve_book",
+        lambda *a, **k: BookSpec("hadith", "hadith", "", [book]),
+    )
+    stats = runner_mod.run_phase1("hadith", state, agent, settings=settings, limit=2)
+    assert stats["errors"] == 1
+    assert stats["processed"] == 0
+
+
+def test_hadith_limit_and_json_error_do_not_open_next_volume(
+    tmp_path: Path, state: StateManager, monkeypatch: pytest.MonkeyPatch
+):
+    from src.pipelines import runner as runner_mod
+    from src.pipelines.catalog import BookSpec
+
+    raw = tmp_path / "hadith"
+    raw.mkdir()
+    long = "متن حديث طويل بما يكفي. " * 8
+
+    def volume(name: str, vol: int) -> Path:
+        path = raw / name
+        pages = "\n".join(
+            f"--- [جلد {vol} - صفحه {n}] ---\n\n{n}- {long}\n" for n in range(10, 16)
+        )
+        path.write_text(pages, encoding="utf-8")
+        return path
+
+    v1 = volume("al-kafi-1.txt", 1)
+    v2 = volume("al-kafi-2.txt", 2)
+    v3 = volume("al-kafi-3.txt", 3)
+    page_calls: list[str] = []
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        if schema is HadithUnify:
+            return json.dumps({"tags": [], "ravis": []})
+        page_calls.append(prompt.split("Locator:", 1)[-1][:80])
+        marker = "10 -"
+        for n in range(10, 16):
+            if f"صفحه {n}" in prompt:
+                marker = f"{n} -"
+                break
+        return json.dumps(
+            {
+                "page": "p",
+                "hadiths": [
+                    {
+                        "marker": marker,
+                        "hadith": long,
+                        "hadith_fa": "ی",
+                        "hadith_en": "x",
+                        "tags": [],
+                        "ravis": [],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    settings = Settings(gemini_max_attempts=2, google_api_keys=["k"], skip_min_chars=10)
+    agent = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    monkeypatch.setattr(runner_mod, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(
+        runner_mod,
+        "resolve_book",
+        lambda *a, **k: BookSpec("hadith", "hadith", "", [v1, v2, v3]),
+    )
+    stats = runner_mod.run_phase1("hadith", state, agent, settings=settings, limit=2)
+    assert stats["pages"] == 2
+    assert stats["errors"] == 0
+    assert len(page_calls) == 2
+    assert state.get_hadith_progress("hadith", str(v2)) is None
+    assert state.get_hadith_progress("hadith", str(v3)) is None
+    assert state.get_hadith_progress("hadith", str(v1)) == "جلد 1 - صفحه 11"
+
+    def boom(*, key, prompt, system, model, schema):
+        return '{"page": "p", "hadiths": [{"hadith": "cut'
+
+    agent2 = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=boom,
+    )
+    stats2 = runner_mod.run_phase1("hadith", state, agent2, settings=settings, limit=20)
+    assert stats2["errors"] == 1
+    assert state.get_hadith_progress("hadith", str(v2)) is None
+    assert state.get_hadith_progress("hadith", str(v3)) is None
+
+
+def test_page_prefix_keeps_continuation_before_new_marker():
+    page = """تتمة الحديث السابق من دون رقم.
+
+13 - علي بن محمد قال العقل غطاء.
+
+14 - عدة من اصحابنا عن احمد قال الفضل جمال.
+"""
+    leading, starts = page_prefix_and_starts(page)
+    assert "تتمة الحديث" in leading
+    assert [t for t, _ in starts] == ["13 -", "14 -"]
+    assert "تتمة" not in starts[0][1]
+
+
+def test_strip_folklib_footnotes_drops_editor_notes_keeps_matn():
+    page = """11 - عِدَّةٌ مِنْ أَصْحَابِنَا عَنْ أَحْمَدَ قَالَ قَالَ رَسُولُ اللَّهِ ص‌ مَا قَسَمَ اللَّهُ لِلْعِبَادِ شَيْئاً أَفْضَلَ مِنَ الْعَقْلِ فَنَوْمُ الْعَاقِلِ‌
+[1] أي: يجازى على اعماله بقدر عقله فكل من كان عقله أكمل كان
+ثوابه أجزل( آت)
+[2] أي بالوسواس في نيتها أو أفعالهما.
+أَفْضَلُ مِنْ سَهَرِ الْجَاهِلِ وَ إِقَامَةُ الْعَاقِلِ أَفْضَلُ مِنْ شُخُوصِ الْجَاهِلِ‌ [1]
+وَ مَا يَتَذَكَّرُ إِلَّا أُولُوا الْأَلْبابِ‌ [2] .
+"""
+    clean = strip_folklib_footnotes(page)
+    assert "يجازى" not in clean
+    assert "بالوسواس" not in clean
+    assert "[1]" not in clean
+    assert "أَفْضَلُ مِنْ سَهَرِ الْجَاهِلِ" in clean
+    assert "أُولُوا الْأَلْبابِ" in clean
+    flushed, buf = consume_page("جلد 1 - صفحه 12", clean, [], None, None)
+    assert buf is None
+    assert len(flushed) == 1
+    assert "يجازى" not in flushed[0]["hadith"]
+    assert "سَهَرِ الْجَاهِلِ" in flushed[0]["hadith"]
+
+
+def test_accumulator_merges_cross_page_hadiths_and_holds_buffer(state: StateManager):
+    p1 = """كتاب العقل
+
+1- الحديث الاول كامل في هذه الصفحة بما يكفي من الحروف.
+
+2- الحديث الثاني يبدا هنا
+"""
+    p2 = """تتمة الثاني على الصفحة التالية بما يكفي.
+
+3- الحديث الثالث يبدا
+"""
+    p3 = """تتمة الثالث حتى نهاية المجلد بما يكفي من الحروف للنص.
+"""
+    flushed, buf = consume_page("جلد 1 - صفحه 10", p1, [], None, p2)
+    assert [r["marker"] for r in flushed] == ["1-"]
+    assert buf is not None and buf.marker == "2-"
+    state.set_hadith_buffer("hadith", "al-kafi-1.txt", buf.to_dict())
+    held = OpenHadith.from_dict(state.get_hadith_buffer("hadith", "al-kafi-1.txt"))
+    flushed2, buf = consume_page("جلد 1 - صفحه 11", p2, [], held, p3)
+    assert [r["marker"] for r in flushed2] == ["2-"]
+    assert "تتمة الثاني" in flushed2[0]["hadith"]
+    assert flushed2[0]["page_start"] != flushed2[0]["page_end"]
+    assert buf is not None and buf.marker == "3-"
+    flushed3, buf = consume_page("جلد 1 - صفحه 12", p3, [], buf, None)
+    assert [r["marker"] for r in flushed3] == ["3-"]
+    assert buf is None
+    assert "تتمة الثالث" in flushed3[0]["hadith"]
+
+
+def test_unify_only_when_multipage(state: StateManager):
+    calls: list = []
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        calls.append(schema)
+        return json.dumps({"tags": ["العقل"], "ravis": ["هشام بن الحكم"]}, ensure_ascii=False)
+
+    agent = GeminiAgent(
+        state,
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    single = {
+        "marker": "1-",
+        "locator": "جلد 1 - صفحه 10",
+        "page_start": "جلد 1 - صفحه 10",
+        "page_end": "جلد 1 - صفحه 10",
+        "hadith": "متن",
+        "hadith_fa": "متن",
+        "hadith_en": "text",
+        "tags": ["الجهل"],
+        "ravis": ["زرارة"],
+    }
+    out = unify_assembled_hadith(agent, single)
+    assert calls == []
+    assert out["ravis"] == ["زرارة"]
+    multi = dict(single)
+    multi["page_end"] = "جلد 1 - صفحه 12"
+    multi["locator"] = "جلد 1 - صفحه 10 تا 12"
+    out = unify_assembled_hadith(agent, multi)
+    assert calls == [HadithUnify]
+    assert out["ravis"] == ["هشام بن الحكم"]
+    assert "العقل" in out["tags"]
 

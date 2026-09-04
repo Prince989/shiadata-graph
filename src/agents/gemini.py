@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, TypeVar
 
@@ -20,6 +21,7 @@ from config.settings import Settings, get_settings
 from src.agents.errors import (
     AllKeysExhausted,
     AuthInvalid,
+    FREE_TIER_TODAY,
     ProviderServerError,
     QuotaExhausted,
     RateLimited,
@@ -32,6 +34,12 @@ from src.state_manager import StateManager
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+
+COMPACT_JSON_RETRY = (
+    "\n\nYour previous JSON was truncated or invalid. Emit COMPLETE valid JSON only. "
+    "Copy each Arabic hadith once. Keep Persian and English faithful and concise. "
+    "Do not repeat sentences or pad fields."
+)
 
 
 def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int | None]:
@@ -50,8 +58,10 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
     retry_after = _parse_retry_after(text)
 
     if status == 429 or "429" in text or "resource exhausted" in lowered or "rate" in lowered:
-        if "quota" in lowered:
-            return FailureKind.QUOTA_EXHAUSTED, retry_after
+        compact = lowered.replace("_", "").replace("-", "")
+        daily = "perday" in compact or "requestsperday" in compact
+        if daily:
+            return FailureKind.QUOTA_EXHAUSTED, None
         return FailureKind.RATE_LIMITED, retry_after
     if status in {401, 403} or "api key" in lowered or "permission" in lowered:
         return FailureKind.AUTH_INVALID, None
@@ -63,9 +73,15 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
 
 
 def _parse_retry_after(text: str) -> int | None:
-    match = re.search(r"retry[- ]after[:\s]*(\d+)", text, re.I)
-    if match:
-        return int(match.group(1)) * 1000
+    patterns = (
+        r"please retry in (\d+(?:\.\d+)?)\s*s",
+        r"retryDelay['\":\s]+(\d+(?:\.\d+)?)s",
+        r"retry[- ]after[:\s]*(\d+(?:\.\d+)?)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            return int(float(match.group(1)) * 1000) + 500
     return None
 
 
@@ -120,17 +136,35 @@ class GeminiAgent:
         schema: type[BaseModel] | None,
     ) -> str:
         last_error: BaseException | None = None
-        for _ in range(self.settings.gemini_max_attempts):
+        attempts = max(self.settings.gemini_max_attempts, self.pool.pool_size())
+        for attempt in range(attempts):
             try:
                 key = self.pool.acquire()
             except AllKeysExhausted:
                 raise
+            sys = system
+            if attempt and schema is not None:
+                sys = (system or "") + COMPACT_JSON_RETRY
             try:
-                text = self._call_once(key, prompt, system, model, schema)
+                text = self._call_once(key, prompt, sys, model, schema)
+                if schema is not None:
+                    data = json.loads(text) if isinstance(text, str) else text
+                    if isinstance(data, str):
+                        data = json.loads(data)
+                    schema.model_validate(data)
+                    if not isinstance(text, str):
+                        text = json.dumps(data, ensure_ascii=False)
                 self.pool.report_success(key)
                 return text
-            except StructuredOutputError:
-                raise
+            except (StructuredOutputError, json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                logger.warning(
+                    "structured output retry %s/%s: %s",
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 — classified below
                 last_error = exc
                 kind, retry_ms = classify_provider_error(exc)
@@ -138,7 +172,14 @@ class GeminiAgent:
                     raise
                 self.pool.report_failure(key, kind, retry_ms)
                 logger.warning("Gemini call failed on %s: %s", key.id, exc)
+                if kind == FailureKind.QUOTA_EXHAUSTED and self.pool.all_daily_quota_locked():
+                    raise AllKeysExhausted(FREE_TIER_TODAY) from exc
                 continue
+        if isinstance(last_error, (StructuredOutputError, json.JSONDecodeError, ValidationError)):
+            raise StructuredOutputError(str(last_error)) from last_error
+        kind, _ = classify_provider_error(last_error) if last_error else (None, None)
+        if kind == FailureKind.QUOTA_EXHAUSTED:
+            raise AllKeysExhausted(FREE_TIER_TODAY) from last_error
         raise ProviderServerError(str(last_error) if last_error else "gemini failed")
 
     def _call_once(
@@ -157,19 +198,43 @@ class GeminiAgent:
                 model=model or self.settings.gemini_model,
                 schema=schema,
             )
-        client = genai.Client(api_key=key.secret)
-        config_kwargs: dict[str, Any] = {}
-        if system:
-            config_kwargs["system_instruction"] = system
-        if schema is not None:
-            config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = schema
-        response = client.models.generate_content(
-            model=model or self.settings.gemini_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(**config_kwargs),
-        )
+        previous = os.environ.get("GOOGLE_API_KEY")
+        os.environ["GOOGLE_API_KEY"] = key.secret
+        try:
+            client = genai.Client(api_key=key.secret)
+            config_kwargs: dict[str, Any] = {}
+            if system:
+                config_kwargs["system_instruction"] = system
+            if schema is not None:
+                config_kwargs["response_mime_type"] = "application/json"
+                config_kwargs["response_schema"] = schema
+            max_tokens = int(getattr(self.settings, "gemini_max_output_tokens", 0) or 0)
+            if max_tokens:
+                config_kwargs["max_output_tokens"] = max_tokens
+            response = client.models.generate_content(
+                model=model or self.settings.gemini_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("GOOGLE_API_KEY", None)
+            else:
+                os.environ["GOOGLE_API_KEY"] = previous
+        finish_name = _finish_reason_name(response)
+        if finish_name in {"MAX_TOKENS", "LENGTH"}:
+            raise StructuredOutputError(f"response truncated ({finish_name})")
         text = getattr(response, "text", None)
         if not text:
             raise StructuredOutputError("empty Gemini response")
         return text
+
+
+def _finish_reason_name(response: Any) -> str:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return ""
+    finish = getattr(candidates[0], "finish_reason", None)
+    if finish is None:
+        return ""
+    return str(getattr(finish, "name", finish))

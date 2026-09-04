@@ -19,24 +19,84 @@ HADITH_START_RE = re.compile(
 
 _MIN_HADITH_CHARS = 20
 
+# Folklib editor notes: ASCII [1] at line start. Do not touch Wasa'il "[ ١٥٤٩٥ ]".
+_FOOTNOTE_LINE = re.compile(r"^[ \t]*\[\d{1,3}\]")
+_INLINE_FOOTNOTE_REF = re.compile(r"\[\d{1,3}\]")
+_HARKAT = re.compile(r"[\u064B-\u0652]")
+_NOTE_CONTINUATION = re.compile(
+    r"^(أي|اى|في بعض|مضمون|و السبب|والسبب|أي خروجه|و في بعض)",
+)
 
-def split_hadith_page(text: str) -> list[tuple[str, str]]:
-    """Return (start_token, body) for each hadith on a Folklib page.
 
-    Text before the first marker (bab title) is dropped, not glued onto hadith 1.
+def _looks_like_matn_resume(stripped: str) -> bool:
+    if not stripped:
+        return False
+    if HADITH_START_RE.match(stripped):
+        return True
+    if _FOOTNOTE_LINE.match(stripped) or _NOTE_CONTINUATION.match(stripped):
+        return False
+    if re.match(r"^[\u0600-\u06FF]", stripped) and _HARKAT.search(stripped):
+        return True
+    return False
+
+
+def strip_folklib_footnotes(text: str) -> str:
+    """Drop editor footnotes ([1] أي …) and leftover inline [n] markers from matn."""
+    out: list[str] = []
+    in_note = False
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if _FOOTNOTE_LINE.match(line) or _FOOTNOTE_LINE.match(stripped):
+            in_note = True
+            continue
+        if in_note:
+            if not stripped:
+                continue
+            if _looks_like_matn_resume(stripped):
+                in_note = False
+                out.append(line)
+            continue
+        out.append(line)
+    joined = "\n".join(out)
+    joined = _INLINE_FOOTNOTE_REF.sub("", joined)
+    return re.sub(r"\n{3,}", "\n\n", joined).strip()
+
+
+def page_prefix_and_starts(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split a page into leading text (before the first numbered start) and starts.
+
+    Unlike split_hadith_page, the prefix is kept: on a continuation page it is the
+    rest of the previous hadith, not a bab title to drop.
     """
     matches = list(HADITH_START_RE.finditer(text))
     if not matches:
-        return []
-    out: list[tuple[str, str]] = []
+        return text.strip(), []
+    leading = text[: matches[0].start()].strip()
+    starts: list[tuple[str, str]] = []
     for i, match in enumerate(matches):
         token = (match.group("kafi") or match.group("wasail") or match.group(0)).strip()
         start = match.start()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         body = text[start:end].strip()
-        if len(body) >= _MIN_HADITH_CHARS:
-            out.append((token, body))
-    return out
+        if body:
+            starts.append((token, body))
+    return leading, starts
+
+
+def split_hadith_page(text: str) -> list[tuple[str, str]]:
+    """Return (start_token, body) for each numbered hadith; drop prefix and short bodies."""
+    _, starts = page_prefix_and_starts(text)
+    return [(token, body) for token, body in starts if len(body) >= _MIN_HADITH_CHARS]
+
+
+def next_page_continues(next_text: str | None) -> bool:
+    """True if the following page still belongs to the hadith that ended the previous page."""
+    if not next_text or not next_text.strip():
+        return False
+    leading, starts = page_prefix_and_starts(next_text)
+    if not starts:
+        return True
+    return bool(leading)
 
 
 def _is_footnote_page(text: str) -> bool:
@@ -54,16 +114,20 @@ def hadith_units(units: list[ParsedUnit]) -> list[ParsedUnit]:
     refined: list[ParsedUnit] = []
     started = False
     for unit in units:
-        text = unit.text.strip()
+        text = strip_folklib_footnotes(unit.text.strip())
         if not text or _is_footnote_page(text):
             continue
         pieces = split_hadith_page(text)
         if pieces:
             started = True
-            refined.append(unit)
+            refined.append(
+                ParsedUnit(locator=unit.locator, text=text, source_path=unit.source_path)
+            )
             continue
         if started and len(text) >= _MIN_HADITH_CHARS:
-            refined.append(unit)
+            refined.append(
+                ParsedUnit(locator=unit.locator, text=text, source_path=unit.source_path)
+            )
     return refined
 
 

@@ -62,6 +62,13 @@ def dbscan_duplicate_clusters(
     return [group for group in buckets.values() if len(group) >= 2]
 
 
+def is_embeddable_hadith_payload(payload: dict) -> bool:
+    """Drop legacy page-array extracts; keep flushed complete narrations."""
+    if payload.get("page") and isinstance(payload.get("hadiths"), list) and not payload.get("page_start"):
+        return False
+    return True
+
+
 def hadith_items(payload: dict) -> list[dict]:
     items = payload.get("hadiths")
     if isinstance(items, list) and items:
@@ -121,6 +128,9 @@ def embed_pending_chunks(
     count = 0
     for chunk in chunks:
         if chunk.status == ChunkStatus.SKIPPED:
+            continue
+        payload = chunk.payload() or {}
+        if chunk.pipeline == "hadith" and not is_embeddable_hadith_payload(payload):
             continue
         agent.embed_and_store(chunk.id, embed_text_for_chunk(chunk))
         if chunk.status == ChunkStatus.PROCESSED_PHASE1:

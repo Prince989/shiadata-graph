@@ -11,10 +11,10 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from src.agents.gemini import GeminiAgent
-from src.extractors.chunkers import split_hadith_page
+from src.extractors.chunkers import split_hadith_page, strip_folklib_footnotes
 from src.extractors.epub_parser import ParsedUnit
-from src.models import HadithPageExtraction, HistoryExtraction, TafsirExtraction
-from src.pipelines.ontology import grouping_prefs, remap_hadith_payload
+from src.models import HadithPageExtraction, HadithUnify, HistoryExtraction, TafsirExtraction
+from src.pipelines.ontology import grouping_prefs, remap_hadith_payload, remap_tag_list
 from src.state_manager import ChunkStatus, StateManager
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,17 @@ def should_skip(text: str, min_chars: int) -> bool:
     return any(marker in stripped for marker in SKIP_MARKERS)
 
 
-def phase1_filename(source_path: str, locator: str, cid: str) -> str:
+def phase1_filename(source_path: str, locator: str, cid: str, marker: str = "") -> str:
+    stem = Path(source_path).stem or "unknown"
+    loc = re.sub(r"[^\w\u0600-\u06FF]+", "_", locator, flags=re.UNICODE)
+    loc = re.sub(r"_+", "_", loc).strip("_")[:120]
+    mark = re.sub(r"[^\w\u0600-\u06FF]+", "_", marker, flags=re.UNICODE)
+    mark = re.sub(r"_+", "_", mark).strip("_")[:32]
+    if mark and loc:
+        return f"{stem}__{mark}__{loc}.json"
+    if loc:
+        return f"{stem}__{loc}.json"
+    return f"{stem}__{cid[:16]}.json"
     stem = Path(source_path).stem or "unknown"
     loc = re.sub(r"[^\w\u0600-\u06FF]+", "_", locator, flags=re.UNICODE)
     loc = re.sub(r"_+", "_", loc).strip("_")[:120]
@@ -92,6 +102,8 @@ def system_prompt(pipeline: str, extra: str = "") -> str:
             "→ [الانتحار, عذاب البرزخ, الجزاء الأخروي] — not حديد and not كتاب العقل. "
             "Known grouping concepts (examples, not an exclusive menu): "
             f"{examples}. "
+            "JSON must be complete and compact: copy each Arabic matn once, "
+            "do not repeat sentences, do not pad translations. "
             "Never fabricate a hadith. "
             f"{extra}"
         )
@@ -106,6 +118,86 @@ def system_prompt(pipeline: str, extra: str = "") -> str:
         "Split into distinct events with titles, characters, concepts, and the "
         "paragraphs covering each event. Do not invent events absent from the text."
     )
+
+
+UNIFY_AR_HEAD = 4000
+UNIFY_BODY_BUDGET = 20_000
+
+UNIFY_SYSTEM = (
+    "From the assembled hadith, return only ravis (isnad chain in order, from the opening) "
+    "and mid-grain fuṣḥā concept tags for the CLAIM of the whole narration. "
+    "Do not retell the matn. Do not use kitāb titles or instruments as tags."
+)
+
+
+def extract_hadith_page(agent: GeminiAgent, unit: ParsedUnit) -> dict:
+    text = strip_folklib_footnotes(unit.text)
+    extra = hadith_system_extra(text)
+    result = agent.complete_structured(
+        f"Locator: {unit.locator}\n\nText:\n{text}",
+        HadithPageExtraction,
+        system=system_prompt("hadith", extra=extra),
+    )
+    return remap_hadith_payload(result.model_dump())
+
+
+def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
+    """Fill tags/ravis for multi-page hadiths. Does not re-translate."""
+    if payload.get("page_start") == payload.get("page_end"):
+        return remap_hadith_payload(payload)
+    arabic = str(payload.get("hadith") or "")
+    head = arabic[:UNIFY_AR_HEAD]
+    if len(arabic) <= UNIFY_BODY_BUDGET:
+        body = arabic
+    else:
+        body = str(payload.get("hadith_en") or payload.get("hadith_fa") or arabic[:UNIFY_BODY_BUDGET])
+    result = agent.complete_structured(
+        f"Isnad / opening:\n{head}\n\nMatn (for tags):\n{body}",
+        HadithUnify,
+        system=UNIFY_SYSTEM,
+    )
+    out = dict(payload)
+    out["ravis"] = list(result.ravis or payload.get("ravis") or [])
+    out["tags"] = remap_tag_list(list(result.tags or []))
+    return remap_hadith_payload(out)
+
+
+def persist_complete_hadith(
+    state: StateManager,
+    *,
+    book_id: str,
+    source_path: str,
+    payload: dict,
+    output_dir: Path,
+) -> str:
+    """Write one complete narration and upsert it as an embeddable Phase 1 chunk."""
+    locator = str(payload.get("locator") or "")
+    marker = str(payload.get("marker") or "")
+    arabic = str(payload.get("hadith") or "")
+    cid = chunk_id(book_id, f"{marker}|{locator}", arabic)
+    existing = state.get_chunk(cid)
+    if existing and existing.status not in {ChunkStatus.PENDING, ChunkStatus.ERROR}:
+        return cid
+    dest = output_dir / book_id
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / phase1_filename(source_path, locator, cid, marker=marker)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if not existing:
+        state.upsert_chunks(
+            [
+                {
+                    "id": cid,
+                    "book_id": book_id,
+                    "pipeline": "hadith",
+                    "locator": locator,
+                    "source_path": source_path,
+                    "text": arabic,
+                }
+            ]
+        )
+    state.mark(cid, ChunkStatus.PROCESSED_PHASE1, payload=payload)
+    logger.info("phase1 hadith flushed %s %s", locator, marker)
+    return cid
 
 
 def process_unit(

@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from config.paths import DEFAULT_RAG_ENV, LOCAL_ENV, PROJECT_ROOT, RAW_EPUBS_DIR, STATE_DB_PATH
 
-_GOOGLE_KEY_PATTERN = re.compile(r"^GOOGLE_API_KEY(\d*)$")
+_GOOGLE_KEY_PATTERN = re.compile(r"^GOOGLE_API_KEY_?(\d*)$")
 
 
 def collect_env_maps() -> dict[str, str]:
@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     key_cooldown_base_ms: int = 30_000
     key_cooldown_max_ms: int = 1_800_000
     key_quota_cooldown_ms: int = 86_400_000  # 24h — resume tomorrow
+    key_acquire_wait_max_ms: int = 120_000
     embed_batch_size: int = 64
     history_pages_per_call: int = 50
     history_max_chars: int = 80_000
@@ -80,14 +81,16 @@ class Settings(BaseSettings):
     edge_similarity: float = 0.5
     edge_group_cap: int = 200
     skip_min_chars: int = 40
+    gemini_max_output_tokens: int = 65_536
 
     @model_validator(mode="after")
     def _load_keys(self) -> "Settings":
         env = collect_env_maps()
         if not self.openai_api_key:
             object.__setattr__(self, "openai_api_key", env.get("OPENAI_API_KEY", ""))
-        if not self.google_api_keys:
-            object.__setattr__(self, "google_api_keys", collect_google_keys(env))
+        collected = collect_google_keys(env)
+        if collected:
+            object.__setattr__(self, "google_api_keys", collected)
         if env.get("GEMINI_MODEL"):
             object.__setattr__(self, "gemini_model", env["GEMINI_MODEL"])
         if env.get("EMBEDDING_MODEL"):

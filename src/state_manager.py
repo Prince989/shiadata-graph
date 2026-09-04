@@ -101,6 +101,20 @@ class StateManager:
                 started_at TEXT NOT NULL,
                 finished_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS hadith_buffer (
+                book_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (book_id, source_path)
+            );
+            CREATE TABLE IF NOT EXISTS hadith_progress (
+                book_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                last_locator TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (book_id, source_path)
+            );
             """
         )
         self._conn.commit()
@@ -197,6 +211,28 @@ class StateManager:
         )
         self._conn.commit()
 
+    def reset_book(self, book_id: str) -> None:
+        """Drop chunks, embeddings, edges, and hadith resume state for one catalog id."""
+        ids = [
+            str(row["id"])
+            for row in self._conn.execute(
+                "SELECT id FROM chunks WHERE book_id = ?", (book_id,)
+            )
+        ]
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            self._conn.execute(
+                f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})", ids
+            )
+            self._conn.execute(
+                f"DELETE FROM edge_pairs WHERE left_id IN ({placeholders}) OR right_id IN ({placeholders})",
+                [*ids, *ids],
+            )
+        self._conn.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
+        self._conn.execute("DELETE FROM hadith_buffer WHERE book_id = ?", (book_id,))
+        self._conn.execute("DELETE FROM hadith_progress WHERE book_id = ?", (book_id,))
+        self._conn.commit()
+
     def counts(self, book_id: str | None = None) -> dict[str, int]:
         if book_id:
             rows = self._conn.execute(
@@ -282,6 +318,58 @@ class StateManager:
 
     def clear_cooldown(self, key_id: str) -> None:
         self._conn.execute("DELETE FROM key_cooldowns WHERE key_id = ?", (key_id,))
+        self._conn.commit()
+
+    def clear_all_cooldowns(self) -> None:
+        self._conn.execute("DELETE FROM key_cooldowns")
+        self._conn.commit()
+
+    def get_hadith_buffer(self, book_id: str, source_path: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT payload_json FROM hadith_buffer WHERE book_id = ? AND source_path = ?",
+            (book_id, source_path),
+        ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
+    def set_hadith_buffer(
+        self, book_id: str, source_path: str, payload: dict[str, Any] | None
+    ) -> None:
+        if payload is None:
+            self._conn.execute(
+                "DELETE FROM hadith_buffer WHERE book_id = ? AND source_path = ?",
+                (book_id, source_path),
+            )
+        else:
+            self._conn.execute(
+                """
+                INSERT INTO hadith_buffer(book_id, source_path, payload_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(book_id, source_path) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (book_id, source_path, json.dumps(payload, ensure_ascii=False), self.now()),
+            )
+        self._conn.commit()
+
+    def get_hadith_progress(self, book_id: str, source_path: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT last_locator FROM hadith_progress WHERE book_id = ? AND source_path = ?",
+            (book_id, source_path),
+        ).fetchone()
+        return str(row["last_locator"]) if row else None
+
+    def set_hadith_progress(self, book_id: str, source_path: str, last_locator: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO hadith_progress(book_id, source_path, last_locator, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(book_id, source_path) DO UPDATE SET
+                last_locator = excluded.last_locator,
+                updated_at = excluded.updated_at
+            """,
+            (book_id, source_path, last_locator, self.now()),
+        )
         self._conn.commit()
 
     def record_job(self, phase: str, book_id: str | None, pause_reason: str | None = None) -> int:
