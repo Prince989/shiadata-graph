@@ -62,9 +62,54 @@ _MAX_JOINED_LINES = 2
 # every volume has one and they would merge unrelated narrations.
 _EMPTY_TOPICS = ("النوادر", "نوادر")
 
+# A long kitab is printed across several volumes, and the publisher stamps the
+# division into the title: `كتاب الصلاة القسم الثالث`. Wasa'il also titles the
+# fihrist that opens or closes a volume `كتاب الحج فهرس`. Neither the part
+# number nor the word fihrist names a subject -- they are apparatus -- and
+# leaving them attached forged five parents (الصلاة القسم الثالث/الرابع/الخامس,
+# الطهارة القسم الثاني, الحج فهرس) out of books the corpus already had under
+# their real names. Stripping them merges those spans onto the one kitab they
+# always were.
+#
+# A trailing bare conjunction is the same kind of damage from the other end: a
+# title that wrapped mid-phrase where `_join_wrapped` could not follow it, as in
+# the fihrist row `كتاب الفرائض و` whose المواريث sits past a page number. No
+# Arabic noun phrase ends in a dangling و, so the truncation is recoverable
+# without guessing what was cut off.
+_APPARATUS = re.compile(r"\s*(?:القسم\s+\S+|فهرست?)\s*$")
+_DANGLING_CONJUNCTION = re.compile(r"\s+و\s*$")
+
 
 def _strip_marks(text: str) -> str:
     return re.sub(r"[ـً-ٟۖ-ۭ]", "", text or "")
+
+
+def _names_a_book(topic: str) -> bool:
+    """True when the words after كتاب form a title rather than a sentence.
+
+    كتاب is also an ordinary noun -- a letter, a scripture, a written thing --
+    and prose using it that way was opening spurious books mid-volume, each one
+    stealing the babs of the real kitab it interrupted: `كتاب اللَّه حقّ` ("the
+    Book of God is truth") took 26, `كتاب جليل و إذا فيه` ("a magnificent book,
+    and therein...") took 36.
+
+    A title is a definite noun phrase. It is definite itself (الصلاة) or is the
+    head of an annexation to a definite noun (فضل العلم, معاني الأخبار), and
+    every later word is definite too, conjoined, or governed by a preposition.
+    A bare indefinite word in final position is a predicate, which is what makes
+    the line a sentence. Checked against all 80 kitab titles the corpus prints:
+    none is rejected.
+    """
+    words = _strip_marks(topic).split()
+    if not words:
+        return False
+    annexed = len(words) > 1 and words[1].startswith("ال")
+    if not words[0].startswith("ال") and not annexed:
+        return False
+    last = words[-1]
+    if len(words) > 1 and not last.startswith(("ال", "و", "ب", "ل", "ف")):
+        return False
+    return True
 
 
 def _looks_like_heading(text: str) -> bool:
@@ -72,7 +117,11 @@ def _looks_like_heading(text: str) -> bool:
         return False
     if not (_KITAB.match(text) or _BAB.match(text)):
         return False
-    return not _SENTENCE_PUNCT.search(_TRAILING_COLON.sub("", text))
+    if _SENTENCE_PUNCT.search(_TRAILING_COLON.sub("", text)):
+        return False
+    if _KITAB.match(text) and not _names_a_book(heading_topic(text)):
+        return False
+    return True
 
 
 def heading_topic(title: str) -> str:
@@ -82,7 +131,9 @@ def heading_topic(title: str) -> str:
     part that names a subject.
     """
     text = _TRAILING_COLON.sub("", clean_heading(title))
-    return _HEADING_PREFIX.sub("", text).strip()
+    text = _HEADING_PREFIX.sub("", text).strip()
+    text = _APPARATUS.sub("", text).strip()
+    return _DANGLING_CONJUNCTION.sub("", text).strip()
 
 
 def is_empty_topic(heading: str) -> bool:
@@ -127,6 +178,14 @@ def page_headings(text: str) -> list[tuple[str, str]]:
 
     Only matn lines are considered: a heading-shaped line inside a footnote is
     the editor glossing a bab title, not the bab itself.
+
+    The fihrist pages are read like any other. They are dense -- a Wasa'il index
+    lists 300-odd bab titles in a dozen pages -- but they are the book's own
+    table of contents, grouped under the book's own kitab, and for the volumes
+    whose body headings this parser cannot see they are the only record of those
+    chapters at all: dropping them cost Wasa'il vol 4 all but two of its 181
+    titles, and cost the catalog seven real parents (الرهن, الضمان, الوصية,
+    المزارعة والمساقاة among them) to remove one malformed one.
     """
     matn = [line for line, role, _ in iter_line_roles(text) if role == "matn"]
     found: list[tuple[str, str]] = []

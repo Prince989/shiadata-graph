@@ -236,6 +236,23 @@ class HistoryExtraction(BaseModel):
     events: list[HistoricalEvent] = Field(default_factory=list)
 
 
+class Adjudication(BaseModel):
+    """One verdict on one orphan label, from the offline vocabulary adjudicator.
+
+    A closed set of three moves. The model may merge a label into an existing
+    term, promote it to a term of its own, or reject it -- it may not invent a
+    hierarchy, and it never sees a hadith.
+    """
+
+    label: str
+    verdict: Literal["alias", "new", "drop"]
+    target: str = ""
+
+
+class AdjudicationBatch(BaseModel):
+    verdicts: list[Adjudication] = Field(default_factory=list)
+
+
 class DuplicateVerdict(BaseModel):
     duplicate: bool
     reason: str = ""

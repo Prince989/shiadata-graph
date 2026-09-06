@@ -183,6 +183,79 @@ def list_books() -> None:
             typer.echo(f"{book_id}\t{entry['pipeline']}\tMISSING")
 
 
+@app.command("harvest-ontology")
+def harvest_ontology(
+    min_df: int = typer.Option(2, "--min-df", help="Corpus df before a term is promoted"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report without writing"),
+) -> None:
+    """Build the concept catalog from the books' own chapter headings.
+
+    Layers 1-3 of the enrichment ladder, all free and deterministic:
+    headings become terms, long titles are mined for the terms inside them, and
+    labels the corpus keeps reaching for are promoted on the same evidence.
+
+    Writes config/derived_ontology.yaml only. base_ontology.yaml -- the
+    hand-written aliases and judgement calls -- is never touched.
+    """
+    _setup_logging()
+    from src.pipelines import harvest as harvester
+
+    # Build from the hand-written catalog only. Reading the derived file the
+    # harvest is about to replace lets its own junk cite itself as evidence.
+    if not dry_run:
+        harvester.reset_derived()
+    found = harvester.scan()
+    typer.echo(f"layer 1 (headings)     {found.summary()}")
+    if not dry_run:
+        # Layer 2 decomposes against layer 1, so layer 1 has to be on disk first.
+        harvester.write(found)
+    mined = harvester.mine_long_titles(found)
+    typer.echo(f"layer 2 (decomposed)   +{mined}")
+    promoted = harvester.promote_recurring(found, min_df=min_df)
+    typer.echo(f"layer 3 (recurring)    +{promoted}")
+    if dry_run:
+        typer.echo(harvester.report(found))
+        typer.echo("(dry run: nothing written)")
+        return
+    written = harvester.write(found)
+    typer.echo(f"wrote {written} concepts to config/derived_ontology.yaml")
+
+
+@app.command("adjudicate")
+def adjudicate_cmd(
+    apply: bool = typer.Option(False, "--apply", help="Write accepted verdicts to the catalog"),
+    limit: int | None = typer.Option(None, "--limit", help="Max orphans to ask about"),
+    ask: bool = typer.Option(True, "--ask/--no-ask", help="Call Gemini for uncached orphans"),
+) -> None:
+    """Layer 4: judge the labels no catalog or morphology could resolve.
+
+    Asked once per distinct label, offline, and cached in config/adjudicated.json
+    so the same string is never paid for twice. Run --no-ask to see the residue
+    and replay the cache without spending anything.
+    """
+    _setup_logging()
+    from src.pipelines import adjudicate as adj
+
+    orphans = adj.find_orphans()
+    if not orphans:
+        typer.echo("no orphan labels; layers 1-3 resolved everything")
+        return
+    cache = adj.load_cache()
+    if ask:
+        _, gemini, _ = _stack()
+        try:
+            cache = adj.adjudicate(gemini, orphans, cache, limit=limit)
+        except AllKeysExhausted as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=2) from exc
+        adj.save_cache(cache)
+    plan = adj.build_plan(cache)
+    typer.echo(adj.report(orphans, plan))
+    if apply:
+        rows = adj.apply_plan(plan)
+        typer.echo(f"appended {rows} adjudicated concepts; re-run resolve-nodes")
+
+
 @app.command("resolve-nodes")
 def resolve_nodes(
     dry_run: bool = typer.Option(

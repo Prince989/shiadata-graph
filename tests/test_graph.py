@@ -849,8 +849,12 @@ def test_qualified_compounds_reduce_to_the_shared_concept():
 
 def test_unreducible_compounds_are_dropped_not_stored():
     """Nothing else in the corpus will ever carry these, so they are noise."""
-    for label in ("اجتهاد المجتهدين", "عتاب الله", "التكليف الإلهي", "فرائض الله"):
+    for label in ("اجتهاد المجتهدين", "عتاب الله", "التكليف الإلهي"):
         assert resolve_node(label, "concept") is None
+    # فرائض الله now reaches الفرائض, which the harvest found as a chapter title.
+    # That is the enrichment working, not a leak: it resolves to a real term
+    # rather than being stored as a singleton nobody can reach.
+    assert resolve_node("فرائض الله", "concept") == "الفرائض"
     # A Qur'anic phrase the model retyped as a group to dodge the ayah ban.
     assert resolve_node("أولي الأبصار", "group") is None
     assert resolve_node("أولو الألباب", "concept") is None

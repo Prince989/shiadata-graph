@@ -178,13 +178,26 @@ def load_ontology() -> list[str]:
     return [c.pref for c in load_concept_catalog()]
 
 
+@lru_cache(maxsize=1)
 def _concept_index() -> dict[str, Concept]:
+    """Folded surface form -> concept. Cached: this is rebuilt per lookup
+    otherwise, and with a harvested catalog of ~1,900 terms that turned every
+    `decompose()` call into thousands of dict insertions. The harvest went from
+    ten minutes to seconds."""
     table: dict[str, Concept] = {}
     for concept in load_concept_catalog():
         keys = (concept.id, concept.pref, *concept.aliases)
         for key in keys:
             table[normalize_ar(key)] = concept
     return table
+
+
+def clear_catalog_caches() -> None:
+    """Drop every cached view of the catalogs, after a file on disk changed."""
+    load_concept_catalog.cache_clear()
+    load_entity_catalog.cache_clear()
+    _concept_index.cache_clear()
+    _entity_index.cache_clear()
 
 
 def lookup_concept(label: str) -> Concept | None:
@@ -294,6 +307,7 @@ def load_entity_catalog() -> tuple[Entity, ...]:
     return tuple(out)
 
 
+@lru_cache(maxsize=1)
 def _entity_index() -> dict[tuple[str, str], Entity]:
     table: dict[tuple[str, str], Entity] = {}
     for entity in load_entity_catalog():
@@ -335,10 +349,17 @@ def repair_to_vocabulary(label: str) -> str | None:
     and عتاب الله have no vocabulary anchor, and that is exactly the signal that
     they belong in proposed_nodes instead of the graph.
     """
+    from src.pipelines.resolver import _MEASURE_WORDS
+
     words = [w for w in (label or "").split(" ") if w]
     if len(words) < 2:
         return None
     for word in words:
+        # Skip measure words for the same reason `decompose` does: `قدر` inside
+        # `قدر العقول` is "in proportion to", not the topic, and the harvested
+        # catalog now contains it as a term in its own right.
+        if normalize_ar(word) in _MEASURE_WORDS:
+            continue
         hit = lookup_concept(word)
         if hit:
             logger.info("repair %s -> %s", label, hit.pref)

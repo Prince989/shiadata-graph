@@ -40,8 +40,50 @@ logger = logging.getLogger(__name__)
 # `باب أن الأرض لا تخلو من حجة` is a proposition about the earth, and as a node
 # it would be true of exactly one chapter. 358 of al-Kafi's 2,002 are like this.
 _PROPOSITIONAL = re.compile(
-    r"^(?:أن|أنّ|ان|إن|أنه|انه|ما|من|في|إذا|اذا|كيف|هل|لا|كم|متى|حكم من|قول)\b"
+    r"^(?:أن|أنّ|ان|إن|أنه|أنها|انه|انها|ما|من|في|فيمن|فيما|إذا|اذا|كيف|هل|لا"
+    r"|كم|متى|حكم من|قول)\b"
 )
+
+# Rijal volumes index narrators alphabetically, and each letter gets a heading:
+# `الثاء ثابت`, `الجيم جابر`, `الخاء خالد`. The shape is exact -- the article,
+# a letter NAME, then one word -- so it is recognisable without listing narrators.
+_LETTER_INDEX = re.compile(
+    r"^ال(?:ألف|الف|باء|تاء|ثاء|جيم|حاء|خاء|دال|ذال|راء|زاي|سين|شين|صاد|ضاد"
+    r"|طاء|ظاء|عين|غين|فاء|قاف|كاف|لام|ميم|نون|هاء|واو|ياء)\s+\S+$"
+)
+
+# Persian orthography. These four letters do not exist in classical Arabic, so
+# any heading carrying one came from a translated footnote, not from the matn:
+# `چهارم در ناخن` is a Persian gloss that leaked into the heading stream.
+_PERSIAN = re.compile(r"[پچژگ]")
+
+# Bare masdars and verbal nouns. Each names an action with no object, so as a
+# standalone node it groups everything and distinguishes nothing -- `ترك` is
+# "abandoning", true of a thousand chapters. They are rejected only as the WHOLE
+# term; `ترك الصلاة` is a real topic and keeps its head.
+_GENERIC_SINGLE = frozenset(
+    normalize_ar(w)
+    for w in (
+        "ترك", "إتيان", "اتيان", "كون", "كيفية", "إخراج", "اخراج", "عمل",
+        "إعطاء", "اعطاء", "إعادة", "اعادة", "حضور", "طلب", "دخول", "خروج",
+        "طول", "طرح", "مقدار", "وضع", "رفع", "أخذ", "اخذ", "جعل", "نقل",
+        "بيع", "شراء", "قطع", "منع", "دفع", "رد", "صرف", "قدر",
+    )
+)
+
+# `الرجل يقتل` is a sentence: subject then imperfect verb. A ي-initial word in
+# any position but the first is nearly always that verb -- these few nouns are
+# the exceptions, and the class is closed because Arabic nouns rarely begin ي.
+_YA_NOUNS = frozenset(
+    normalize_ar(w) for w in ("يوم", "يقين", "يد", "يمين", "يتيم", "يهود", "يونس", "يس")
+)
+_IMPERFECT = re.compile(r"^ي[^\s]{3,}$")
+
+# `وجوبه` / `وجوبها` are back-references -- "its obligation" -- pointing at the
+# previous chapter rather than naming a topic. A real term almost always carries
+# the article, and a pronoun-suffixed one never does, which separates وجوبها
+# from الفقه without listing either.
+_PRONOUN_SUFFIX = re.compile(r"(?:ه|ها|هم|هن|هما)$")
 
 # Descriptive heads. `باب صفة العلماء` is about العلماء, not about صفة.
 _META_HEADS = (
@@ -93,6 +135,12 @@ def _strip_meta_head(topic: str) -> str:
 # and the printer's brackets -- so it does not grow with the corpus the way a
 # list of banned topics would.
 _NOT_A_TOPIC = re.compile(r"[()\[\]{}«»<>0-9٠-٩|]")
+# Structural words naming the BOOK's furniture rather than a subject. They can
+# appear anywhere in a title -- "الطلاق عنوان الباب", "الطلاق أبواب الايلاء" --
+# so unlike the function words these are checked at every position.
+_EDITORIAL = frozenset(
+    normalize_ar(w) for w in ("عنوان", "الباب", "باب", "أبواب", "الأبواب", "كتاب", "الكتاب")
+)
 _FUNCTION_WORDS = frozenset(
     normalize_ar(w)
     for w in (
@@ -113,14 +161,116 @@ def _is_term(topic: str) -> bool:
         return False
     if not re.search(r"[؀-ۿ]", topic):
         return False
+    if _LETTER_INDEX.match(topic) or _PERSIAN.search(topic):
+        return False
     words = topic.split()
     if normalize_ar(words[0]) in _FUNCTION_WORDS:
         return False
-    # A lone short word is almost always a fragment of a wrapped heading rather
-    # than a subject. Multi-word phrases carry their own evidence of being one.
-    if len(words) == 1 and len(normalize_ar(topic)) < 3:
+    if any(normalize_ar(w) in _EDITORIAL for w in words):
         return False
+    # A ي-initial word after the first is an imperfect verb, which makes the
+    # heading a clause: `الرجل يقتل`, `الرجل يتعدى`.
+    for word in words[1:]:
+        folded = normalize_ar(word)
+        if _IMPERFECT.match(folded) and folded not in _YA_NOUNS:
+            return False
+    if len(words) == 1:
+        folded = normalize_ar(topic)
+        # Measured on the SURFACE form, not the folded one. `normalize_ar` strips
+        # the article, so الحج folds to حج and a two-character floor rejected it
+        # -- along with الحق, الدم and الأم. That silently killed `كتاب الحج`,
+        # and every Hajj chapter after it inherited الصيام as its parent.
+        if len(topic) < _MIN_TERM_CHARS:
+            return False
+        if folded in _GENERIC_SINGLE:
+            return False
+        if not topic.startswith("ال") and _PRONOUN_SUFFIX.search(topic):
+            return False
     return True
+
+
+# Not every kitab boundary is printed. Faqih vol 2 runs كتاب الصوم straight into
+# the Hajj chapters with no heading between them -- the words `كتاب الحج` appear
+# nowhere in its body -- so a running kitab variable handed الصوم to 165 chapters
+# about إحرام and طواف and said it as fact.
+#
+# The book cannot be asked where the seam is, but the narrations answer: a kitab
+# is discussed throughout its own span. Measured page by page, whether the kitab
+# label occurs at all, a sound span stays lit end to end (al-Kafi 4's الحج, 66%;
+# its الصيام, 54%) while a span holding two books lights up and then goes dark.
+# So look for the one split where a well-attested prefix meets a silent tail.
+#
+# The tail is orphaned, not re-parented. We can tell these chapters are not
+# الصوم; we cannot tell what they are, and an honest gap beats a confident lie.
+#
+# Every threshold is a floor on evidence, not a tuned constant: enough span to
+# split, enough prefix to establish the subject was ever discussed, and a tail
+# long enough that its silence means something. Across the corpus's 86 spans
+# this fires once -- on Faqih vol 2, cutting between بَاب الاعتكاف (the last
+# fasting chapter) and بَاب علل الحج (the first Hajj one).
+_SPLIT_MIN_SPAN = 50
+_SPLIT_MIN_PREFIX = 15
+_SPLIT_MIN_PREFIX_HITS = 8
+_SPLIT_MIN_PREFIX_RATE = 0.35
+_SPLIT_MAX_SUFFIX_RATE = 0.06
+_SPLIT_MIN_SUFFIX = 25
+_SPLIT_MIN_SUFFIX_FRACTION = 0.40
+
+
+def _abandoned_from(flags: list[int]) -> int | None:
+    """Index after which the kitab stops being discussed, or None if it never does."""
+    total = len(flags)
+    if total < _SPLIT_MIN_SPAN:
+        return None
+    seen = sum(flags)
+    best: tuple[float, int] | None = None
+    hits = 0
+    for cut in range(1, total):
+        hits += flags[cut - 1]
+        if cut < _SPLIT_MIN_PREFIX or hits < _SPLIT_MIN_PREFIX_HITS:
+            continue
+        tail = total - cut
+        if tail < _SPLIT_MIN_SUFFIX or tail < _SPLIT_MIN_SUFFIX_FRACTION * total:
+            continue
+        before, after = hits / cut, (seen - hits) / tail
+        if before < _SPLIT_MIN_PREFIX_RATE or after > _SPLIT_MAX_SUFFIX_RATE:
+            continue
+        if best is None or before - after > best[0]:
+            best = (before - after, cut)
+    return None if best is None else best[1]
+
+
+def _flush_span(out: Harvest, kitab: str, span: list[tuple[bool, str, int]]) -> None:
+    """Record one kitab's chapters, dropping the parent past an unmarked seam."""
+    cut = _abandoned_from([flag for _, _, flag in span]) if kitab else None
+    if cut is not None:
+        logger.info(
+            "kitab %r stops being discussed after %d of %d chapters; "
+            "orphaning the rest rather than guessing their book",
+            kitab,
+            cut,
+            len(span),
+        )
+    for position, (is_term, label, _) in enumerate(span):
+        parent = "" if cut is not None and position >= cut else kitab
+        if is_term:
+            out.terms.setdefault(label, parent if parent != label else "")
+            out.sources[label] += 1
+        else:
+            out.long_titles.append((label, parent))
+
+
+def reset_derived(path: Path | None = None) -> None:
+    """Empty the derived catalog before a harvest.
+
+    Without this the harvest reads the file it is about to replace: layer 2
+    decomposes against the previous run's output, so any junk term it produced
+    is found again and re-emitted. `أخذ` survived three harvests that way, each
+    one citing the last as evidence.
+    """
+    path = path or DERIVED_ONTOLOGY_YAML
+    path.write_text("concepts: []\n", encoding="utf-8")
+    _reload_catalog()
 
 
 def scan(root: Path | None = None, pattern: str = "*.txt") -> Harvest:
@@ -129,13 +279,21 @@ def scan(root: Path | None = None, pattern: str = "*.txt") -> Harvest:
     out = Harvest()
     for path in sorted(root.glob(pattern)):
         kitab = ""
+        # A chapter's parent cannot be settled until its kitab's whole span has
+        # been read, because the span is what shows whether the kitab was ever
+        # abandoned. Chapters are held here and written out at the next kitab.
+        span: list[tuple[bool, str, int]] = []
         try:
             units = parse_txt(path)
         except (OSError, ValueError) as exc:
             logger.warning("skip unreadable book %s: %s", path, exc)
             continue
         for unit in units:
-            for level, title in page_headings(unit.text):
+            headings = page_headings(unit.text)
+            if not headings:
+                continue
+            page: str | None = None
+            for level, title in headings:
                 topic = plain(heading_topic(title))
                 if not topic or is_empty_topic(topic):
                     continue
@@ -143,24 +301,39 @@ def scan(root: Path | None = None, pattern: str = "*.txt") -> Harvest:
                     out.skipped_propositional += 1
                     continue
                 if level == "kitab":
+                    _flush_span(out, kitab, span)
+                    span = []
                     candidate = _strip_meta_head(topic) or topic
                     # Only a real term may become a parent. Prose beginning with
                     # the word kitab -- a citation line like
                     # "كتاب ( تهذيب الأحكام ) أن النبيذ المسكر..." -- otherwise
                     # became the `broader` of every bab after it.
-                    if _is_term(candidate):
-                        kitab = candidate
+                    #
+                    # And a REJECTED kitab clears the current one rather than
+                    # leaving it standing. State that outlives the section it
+                    # describes is worse than no state: when `كتاب الحج` was
+                    # rejected the scan kept الصيام and handed it to hundreds of
+                    # Hajj chapters, which reads as fact rather than as a gap.
+                    kitab = candidate if _is_term(candidate) else ""
+                    if kitab:
                         out.terms.setdefault(kitab, "")
                         out.sources[kitab] += 1
+                    else:
+                        logger.info("kitab heading not usable as a parent: %r", topic)
                     continue
                 stripped = _strip_meta_head(topic)
-                if _is_term(stripped):
-                    # A book's own kitab is the natural parent, and it is almost
-                    # always already a term because kitab titles are short.
-                    out.terms.setdefault(stripped, kitab if kitab != stripped else "")
-                    out.sources[stripped] += 1
-                elif stripped:
-                    out.long_titles.append((stripped, kitab))
+                if not stripped:
+                    continue
+                # A book's own kitab is the natural parent, and it is almost
+                # always already a term because kitab titles are short. Whether
+                # this page still talks about that kitab is recorded alongside,
+                # for `_flush_span` to judge once the span is complete.
+                if page is None:
+                    page = normalize_ar(unit.text)
+                head = normalize_ar(kitab).split()[0] if kitab else ""
+                attested = 1 if head and head in page else 0
+                span.append((_is_term(stripped), stripped, attested))
+        _flush_span(out, kitab, span)
     return out
 
 
@@ -193,12 +366,51 @@ def mine_long_titles(harvest: Harvest, rounds: int = 3) -> int:
     return added
 
 
+def promote_recurring(harvest: Harvest, min_df: int = 2, root: Path | None = None) -> int:
+    """Layer 3: terms the corpus keeps reaching for that no chapter is named after.
+
+    Headings only tell you what a book chose to chapter on. `النكراء` is a real
+    topic that no bab is titled after, and it would stay invisible to layers 1
+    and 2 forever. A label several distinct narrations independently used has
+    demonstrated the same thing a chapter title demonstrates -- that it groups
+    something -- so it earns a place on the same evidence.
+
+    Reads the resolved node table, so it only runs after `resolve-nodes`.
+    """
+    from config.paths import OUTPUT_DIR
+    import json
+
+    path = (root or (OUTPUT_DIR / "phase1")) / "nodes.json"
+    if not path.exists():
+        logger.info("no node table at %s; skipping frequency promotion", path)
+        return 0
+    try:
+        table = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("unreadable node table %s: %s", path, exc)
+        return 0
+
+    added = 0
+    for entry in table.values():
+        if entry.get("type") != "concept" or entry.get("curated"):
+            continue
+        if int(entry.get("df") or 0) < min_df:
+            continue
+        label = plain(str(entry.get("label") or ""))
+        if not _is_term(label) or label in harvest.terms:
+            continue
+        harvest.terms[label] = ""
+        harvest.sources[label] += int(entry.get("df") or 0)
+        added += 1
+    logger.info("promoted %d recurring corpus terms", added)
+    return added
+
+
 def _reload_catalog() -> None:
     """Drop the cached catalog so the next decompose() sees new terms."""
-    from src.pipelines.ontology import load_concept_catalog, load_entity_catalog
+    from src.pipelines.ontology import clear_catalog_caches
 
-    load_concept_catalog.cache_clear()
-    load_entity_catalog.cache_clear()
+    clear_catalog_caches()
 
 
 def _yaml_quote(value: str) -> str:

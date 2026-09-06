@@ -126,6 +126,22 @@ def _seed_key(text: str, node_type: str) -> tuple[str, str, str] | None:
     return None
 
 
+# Measure and relational words. Inside a construct these are grammar -- `على قدر
+# العقل` means "in proportion to the intellect", and قدر contributes nothing --
+# but several are also catalog terms in their own right (القدر, divine decree),
+# and lookup folds away the article that would have told them apart. So they are
+# skipped as CONSTITUENTS only; a whole label that is one of them still resolves
+# normally. A closed grammatical class, so it does not grow with the corpus.
+_MEASURE_WORDS = frozenset(
+    normalize_ar(w)
+    for w in (
+        "قدر", "مقدار", "حد", "حدود", "عدد", "نحو", "مثل", "بعض", "سائر",
+        "جملة", "وجه", "باب", "أبواب", "كتاب", "وقت", "أوقات", "كيفية",
+        "صفة", "صفات", "معنى", "أنواع", "نوع", "قسم", "أقسام",
+    )
+)
+
+
 def decompose(text: str) -> list[tuple[str, str]]:
     """Every catalog concept named by a constituent of a multi-word label.
 
@@ -146,6 +162,8 @@ def decompose(text: str) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
     for word in (text or "").split():
+        if normalize_ar(word) in _MEASURE_WORDS:
+            continue
         for candidate in _clitic_forms(word):
             hit = lookup_concept(candidate)
             if hit is None:

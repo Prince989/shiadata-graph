@@ -519,9 +519,11 @@ def test_a_compound_names_every_topic_in_it():
     # ولاة is a word, not a conjunction plus لاة. Stripping is only accepted
     # when what remains actually resolves, so no length heuristic can mangle it.
     assert labels("ولاة العدل") == ["العدل"]
-    # A concept constituent must never reach the gazetteer: الحجة is an alias of
-    # الإمام المهدي, and letting it through collapsed three kalam concepts onto him.
-    assert labels("الحجة الباطنة") == []
+    # الحجة is BOTH a gazetteer alias of الإمام المهدي and, since the harvest,
+    # a concept in its own right (al-Kafi has كتاب الحجة). A constituent must
+    # reach the concept and never the person -- letting it reach the person
+    # collapsed إكمال الحجة, الحجة الباطنة and الحجة الظاهرة onto the Imam.
+    assert labels("الحجة الباطنة") == ["الحجة"]
 
 
 def test_a_coordinated_mention_reaches_both_nodes(tmp_path: Path):
