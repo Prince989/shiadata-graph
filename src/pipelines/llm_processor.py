@@ -13,7 +13,13 @@ from pydantic import BaseModel
 from src.agents.gemini import GeminiAgent
 from src.extractors.chunkers import split_hadith_page, strip_folklib_footnotes
 from src.extractors.epub_parser import ParsedUnit
-from src.models import HadithPageExtraction, HadithUnify, HistoryExtraction, TafsirExtraction
+from src.models import (
+    HadithPageExtraction,
+    HadithUnify,
+    HistoryExtraction,
+    MentionsFill,
+    TafsirExtraction,
+)
 from src.pipelines.ontology import (
     enforce_node_policy,
     remap_hadith_payload,
@@ -22,6 +28,7 @@ from src.pipelines.ontology import (
 from src.pipelines.prompts import (
     HISTORY_PROMPT,
     TAFSIR_PROMPT,
+    mentions_fill_prompt,
     hadith_prompt,
     unify_prompt,
 )
@@ -134,7 +141,16 @@ def needs_enrichment(payload: dict) -> bool:
 
 
 def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
-    """Fill missing FA/EN/semantic_nodes/ravis; always refresh ravis on multi-page."""
+    """Fill missing FA/EN/mentions/ravis; always refresh ravis on multi-page.
+
+    When topics are missing, a dedicated MentionsFill call runs first so the
+    model cannot return FA/ravis with mentions:[]. Soft unify then fills
+    translations. When topics are already present, a failed unify keeps the
+    assembled payload. When topics stay missing after MentionsFill, failure is
+    raised so the runner marks ERROR instead of writing hollow PROCESSED files.
+    """
+    from src.agents.errors import ProviderServerError, StructuredOutputError
+
     payload = dict(payload)
     payload["hadith"] = strip_folklib_footnotes(str(payload.get("hadith") or ""))
     if not needs_enrichment(payload):
@@ -145,18 +161,56 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
         body = arabic
     else:
         body = arabic[:UNIFY_BODY_BUDGET]
-    result = agent.complete_structured(
-        f"Isnad / opening:\n{head}\n\nMatn:\n{body}",
-        HadithUnify,
-        system=unify_prompt(),
-    )
+    topic_count = len(payload.get("mentions") or []) + len(semantic_nodes_of(payload))
+    need_topics = topic_count < 1
+    label = payload.get("marker") or payload.get("locator")
+
+    if need_topics:
+        try:
+            filled = agent.complete_structured(
+                f"Arabic hadith:\n{body}",
+                MentionsFill,
+                system=mentions_fill_prompt(),
+            )
+        except (StructuredOutputError, ProviderServerError) as exc:
+            raise StructuredOutputError(
+                f"mentions fill failed for {label}: {exc}"
+            ) from exc
+        payload["mentions"] = _merge_mentions(
+            payload.get("mentions"),
+            [m.model_dump() for m in filled.mentions],
+        )
+        payload = remap_hadith_payload(payload)
+        if not (payload.get("mentions") or []):
+            raise StructuredOutputError(
+                f"mentions fill returned topics that grounding dropped for {label}"
+            )
+        if not needs_enrichment(payload):
+            return payload
+
+    # Topics present (or MentionsFill already ran): soft unify for FA/EN/ravis.
+    schema = HadithUnify
+    system = unify_prompt(require_topics=False)
+    try:
+        result = agent.complete_structured(
+            f"Isnad / opening:\n{head}\n\nMatn:\n{body}",
+            schema,
+            system=system,
+        )
+    except (StructuredOutputError, ProviderServerError) as exc:
+        if need_topics and not (payload.get("mentions") or []):
+            raise StructuredOutputError(
+                f"unify could not extract mentions for {label}: {exc}"
+            ) from exc
+        logger.warning(
+            "unify failed for %s; persisting assembled payload: %s",
+            label,
+            exc,
+        )
+        return remap_hadith_payload(payload)
     out = dict(payload)
     if result.ravis:
         out["ravis"] = list(result.ravis)
-    # Mentions are the live channel: merge rather than replace-if-empty. Unify
-    # runs whenever a narration has fewer than two, so a single surviving
-    # mention would otherwise block the entire result and the call would be
-    # paid for and thrown away.
     if result.mentions:
         out["mentions"] = _merge_mentions(
             payload.get("mentions"), [m.model_dump() for m in result.mentions]
@@ -175,7 +229,12 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
         out["hadith_fa"] = result.hadith_fa
     if result.hadith_en and not str(payload.get("hadith_en") or "").strip():
         out["hadith_en"] = result.hadith_en
-    return remap_hadith_payload(out)
+    out = remap_hadith_payload(out)
+    if need_topics and not (out.get("mentions") or []):
+        raise StructuredOutputError(
+            f"unify returned mentions that grounding dropped for {label}"
+        )
+    return out
 
 
 def _merge_mentions(existing, extra) -> list[dict]:
@@ -216,6 +275,8 @@ def persist_complete_hadith(
     source_path: str,
     payload: dict,
     output_dir: Path,
+    status: ChunkStatus = ChunkStatus.PROCESSED_PHASE1,
+    error: str | None = None,
 ) -> str:
     """Write one complete narration and upsert it as an embeddable Phase 1 chunk."""
     payload["hadith"] = strip_folklib_footnotes(str(payload.get("hadith") or ""))
@@ -225,7 +286,8 @@ def persist_complete_hadith(
     cid = chunk_id(book_id, f"{marker}|{locator}", arabic)
     existing = state.get_chunk(cid)
     if existing and existing.status not in {ChunkStatus.PENDING, ChunkStatus.ERROR}:
-        return cid
+        if status == ChunkStatus.PROCESSED_PHASE1:
+            return cid
     dest = output_dir / book_id
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / phase1_filename(source_path, locator, cid, marker=marker)
@@ -243,8 +305,13 @@ def persist_complete_hadith(
                 }
             ]
         )
-    state.mark(cid, ChunkStatus.PROCESSED_PHASE1, payload=payload)
-    logger.info("phase1 hadith flushed %s %s", locator, marker)
+    state.mark(cid, status, payload=payload, error=error)
+    logger.info(
+        "phase1 hadith %s %s %s",
+        status.value,
+        locator,
+        marker,
+    )
     return cid
 
 

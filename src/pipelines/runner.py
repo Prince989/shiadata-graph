@@ -7,7 +7,7 @@ from pathlib import Path
 
 from config.paths import OUTPUT_DIR, RAW_EPUBS_DIR
 from config.settings import Settings, get_settings
-from src.agents.errors import AllKeysExhausted, StructuredOutputError
+from src.agents.errors import AllKeysExhausted, ProviderServerError, StructuredOutputError
 from src.agents.gemini import GeminiAgent
 from src.extractors.epub_parser import parse_epub
 from src.extractors.txt_parser import parse_txt
@@ -24,6 +24,7 @@ from src.pipelines.llm_processor import (
     should_skip,
     unify_assembled_hadith,
 )
+from src.pipelines.ontology import remap_hadith_payload
 from src.state_manager import ChunkStatus, StateManager
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,17 @@ def run_hadith_phase1(
                     )
                     stop = True
                     break
+                except ProviderServerError as exc:
+                    # Temporary Gemini overload (503). Save resume point and stop
+                    # cleanly so the same CLI command can continue later.
+                    errors += 1
+                    logger.error(
+                        "phase1 provider unavailable %s: %s", unit.locator, exc
+                    )
+                    state.set_hadith_buffer(
+                        book_id, source, buf.to_dict() if buf else None
+                    )
+                    raise
                 items = [it for it in (page_payload.get("hadiths") or []) if isinstance(it, dict)]
                 complete, buf = consume_page(
                     unit.locator,
@@ -153,7 +165,25 @@ def run_hadith_phase1(
                 )
                 last_buf = buf
                 for rec in complete:
-                    rec = unify_assembled_hadith(agent, rec)
+                    try:
+                        rec = unify_assembled_hadith(agent, rec)
+                    except StructuredOutputError as exc:
+                        errors += 1
+                        logger.error(
+                            "phase1 unify mentions failed %s: %s",
+                            rec.get("marker") or unit.locator,
+                            exc,
+                        )
+                        persist_complete_hadith(
+                            state,
+                            book_id=book_id,
+                            source_path=source,
+                            payload=remap_hadith_payload(dict(rec)),
+                            output_dir=output_dir,
+                            status=ChunkStatus.ERROR,
+                            error=str(exc)[:2000],
+                        )
+                        continue
                     persist_complete_hadith(
                         state,
                         book_id=book_id,
@@ -171,15 +201,34 @@ def run_hadith_phase1(
             if stop:
                 break
             if i >= len(ordered) and buf:
-                rec = unify_assembled_hadith(agent, buf.assemble())
-                persist_complete_hadith(
-                    state,
-                    book_id=book_id,
-                    source_path=source,
-                    payload=rec,
-                    output_dir=output_dir,
-                )
-                flushed += 1
+                assembled = buf.assemble()
+                try:
+                    rec = unify_assembled_hadith(agent, assembled)
+                except StructuredOutputError as exc:
+                    errors += 1
+                    logger.error(
+                        "phase1 unify mentions failed %s: %s",
+                        assembled.get("marker") or assembled.get("locator"),
+                        exc,
+                    )
+                    persist_complete_hadith(
+                        state,
+                        book_id=book_id,
+                        source_path=source,
+                        payload=remap_hadith_payload(dict(assembled)),
+                        output_dir=output_dir,
+                        status=ChunkStatus.ERROR,
+                        error=str(exc)[:2000],
+                    )
+                else:
+                    persist_complete_hadith(
+                        state,
+                        book_id=book_id,
+                        source_path=source,
+                        payload=rec,
+                        output_dir=output_dir,
+                    )
+                    flushed += 1
                 buf = None
                 last_buf = None
                 state.set_hadith_buffer(book_id, source, None)
@@ -189,6 +238,13 @@ def run_hadith_phase1(
                 book_id, last_source, last_buf.to_dict() if last_buf else None
             )
         state.finish_job(job_id, pause_reason="all_keys_exhausted")
+        raise
+    except ProviderServerError:
+        if last_source is not None:
+            state.set_hadith_buffer(
+                book_id, last_source, last_buf.to_dict() if last_buf else None
+            )
+        state.finish_job(job_id, pause_reason="provider_unavailable")
         raise
     state.finish_job(job_id)
     logger.info(
@@ -258,12 +314,18 @@ def run_phase1(
                 errors += 1
                 logger.error("phase1 JSON failed %s: %s", chunk.locator, exc)
                 continue
+            except ProviderServerError as exc:
+                logger.error("phase1 provider unavailable %s: %s", chunk.locator, exc)
+                raise
             if status == ChunkStatus.SKIPPED:
                 skipped += 1
             else:
                 processed += 1
     except AllKeysExhausted:
         state.finish_job(job_id, pause_reason="all_keys_exhausted")
+        raise
+    except ProviderServerError:
+        state.finish_job(job_id, pause_reason="provider_unavailable")
         raise
     state.finish_job(job_id)
     return {

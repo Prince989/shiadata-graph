@@ -16,7 +16,7 @@ import typer
 from config.paths import OUTPUT_DIR
 from config.settings import get_settings
 from src.agents.embeddings import EmbeddingAgent
-from src.agents.errors import AllKeysExhausted
+from src.agents.errors import AllKeysExhausted, ProviderServerError
 from src.agents.gemini import GeminiAgent
 from src.core.neo4j_export import export_neo4j
 from src.core.phase2 import run_phase2
@@ -69,6 +69,14 @@ def phase1(
     except AllKeysExhausted as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
+    except ProviderServerError as exc:
+        typer.echo(
+            "Gemini temporarily unavailable (503/5xx). "
+            "Progress saved — re-run the same command later.\n"
+            f"{exc}",
+            err=True,
+        )
+        raise typer.Exit(code=2) from exc
     finally:
         state.close()
     typer.echo(stats)
@@ -85,6 +93,14 @@ def phase2(
         stats = run_phase2(book, state, gemini, embeddings)
     except AllKeysExhausted as exc:
         typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    except ProviderServerError as exc:
+        typer.echo(
+            "Gemini temporarily unavailable (503/5xx). "
+            "Progress saved — re-run the same command later.\n"
+            f"{exc}",
+            err=True,
+        )
         raise typer.Exit(code=2) from exc
     finally:
         state.close()

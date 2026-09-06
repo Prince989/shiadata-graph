@@ -21,106 +21,110 @@ If the page starts mid-hadith with no new number, include that fragment first wi
 Then one object per numbered hadith (e.g. '3 -', '8-', '[ ١٥٤٩٥ ] ١ ـ').
 Ignore editor footnotes and bracketed editor asides.
 
-For each item give: the original Arabic (hadith), fluent Persian (hadith_fa),
-precise English (hadith_en), the narrators in isnad order (ravis), the mentions,
-and any quotes.
+Do NOT copy the Arabic matn back. It is already known from the page; repeating
+it wastes the whole response. Return only:
+  1. marker      the printed number, e.g. "3 -"
+  2. mentions    REQUIRED for every numbered hadith -- prefer 3-8, never []
+  3. ravis       isnad order
+  4. quotes      Qur'anic spans only (kind "quran"), no sura/verse numbers
+  5. hadith_fa   fluent Persian
+  6. hadith_en   precise English
 
 WHAT A MENTION IS
 
-A mention is something this narration is ABOUT, written the way the matn writes
-it. You are not choosing from a list and you are not naming a category. You are
-reporting an observation, and something else decides later how it lines up with
-the rest of the corpus.
-
-Each mention has:
-  text      the term itself, in standard Arabic, as short as it can be while
-            still being the thing the matn discusses
+A mention is something this narration is ABOUT. You report an observation;
+identity across the corpus is decided later. Each mention:
+  text      Arabic term for the subject
   type      concept | person | place | group | event | work
-  salience  0.0 to 1.0 -- how much of THIS narration is about it. Use the full
-            range. The subject of the hadith is near 1.0; something named once
-            in passing is near 0.2.
-  evidence  the words of the matn that made you say it, copied verbatim
+  salience  0.0-1.0 (subject near 1.0; passing name near 0.2)
+  evidence  verbatim matn span that prompted it
 
-RULES
+KEEP vs STRIP
 
-1. SAY IT PLAINLY. Write العقل, not عقل المرء. Write الحساب, not حساب العباد.
-   A possessor or a genitive that belongs to this sentence's grammar is not part
-   of the term. If the matn is about the creation of the intellect, خلق العقل is
-   right, because that is a distinct subject and not a rewording of العقل.
+KEEP the real subject as a unit:
+  - خلق العقل stays خلق العقل (do NOT split into خلق + العقل alone as the only topics)
+  - محبة أهل البيت stays the compound when that is what the matn discusses
+STRIP sentence grammar only:
+  - عقل المرء → العقل
+  - حساب العباد → الحساب
+Never emit a bare verb like خلق as a mention by itself.
 
-2. GROUND EVERYTHING. person, place, event, group and work must appear literally
-   in the matn, and `evidence` must be the words you took them from. A concept
-   may be inferred, but only from what this matn actually asserts -- never from
-   the chapter heading, never from a neighbouring hadith.
-
-3. NARRATORS ARE NOT MENTIONS. Everyone in the isnad belongs in ravis, and so
-   does the Imam or Prophet whose words are being quoted. A hadith is not about
-   the man who narrated it. معاوية in "فالذي كان في معاوية" IS a mention,
-   because the matn discusses him. أبو عبد الله in "قلت لأبي عبد الله" is not,
-   because he is the one answering.
-
-4. INDEX WHAT IS ASSERTED, NOT WHAT IS DENIED. "ليس أولئك ممن عاتب الله" denies
-   that the group is blamed, so blame is not a mention of this narration.
-
-5. QUOTES ARE SEPARATE. When the matn quotes the Qur'an, put the quoted words in
-   `quotes` with kind "quran". Do NOT give a sura name or a verse number and do
-   NOT make the verse a mention -- the citation is resolved against the actual
-   mushaf afterwards. Copy the quoted span and nothing else.
-
-6. BE COMPLETE. Give 3 to 8 mentions for a hadith of any substance. Missing a
-   real subject costs more than including a minor one, because salience already
-   says which is which.
+Other rules (short):
+- person/place/group/event/work must appear in the matn; evidence is their words
+- concepts may be inferred from what THIS matn asserts (not the chapter title)
+- NARRATORS ARE NOT MENTIONS: isnad + the Imam/Prophet being quoted go in ravis
+  معاوية in "فالذي كان في معاوية" IS a mention; أبو عبد الله answering is not
+- INDEX WHAT IS ASSERTED, NOT WHAT IS DENIED
+- Qur'an goes in quotes as the quoted words only -- never a verse number, never a mention
 
 EXAMPLES
 
-"ما العقل قال ما عبد به الرحمن و اكتسب به الجنان ... فالذي كان في معاوية فقال تلك النكراء"
-  mentions: العقل/concept/0.95 evidence "ما العقل قال ما عبد به الرحمن"
-            النكراء/concept/0.8 evidence "تلك النكراء تلك الشيطنة"
-            معاوية/person/0.4 evidence "فالذي كان في معاوية"
-            العبادة/concept/0.3 evidence "ما عبد به الرحمن"
-  The Imam answering is a narrator, not a mention.
+"ما العقل قال ما عبد به الرحمن ... فالذي كان في معاوية فقال تلك النكراء"
+  mentions: العقل/0.95, النكراء/0.8, معاوية/person/0.4, العبادة/0.3
 
 "صديق كل امرئ عقله و عدوه جهله"
-  mentions: العقل/concept/0.9, الجهل/concept/0.9
-  NOT عقل المرء or جهل المرء -- the possessor is grammar, not subject.
+  mentions: العقل/0.9, الجهل/0.9  (NOT عقل المرء)
 
 "لما خلق الله العقل استنطقه ثم قال له أقبل فأقبل"
-  mentions: خلق العقل/concept/0.9 evidence "لما خلق الله العقل استنطقه"
-            العقل/concept/0.7
-  Here the compound IS the subject: this narration is about the creation of the
-  intellect, which other narrations also recount.
+  mentions: خلق العقل/0.9, العقل/0.7
+  NOT: خلق as a standalone mention
 
-"إن عندنا قوما لهم محبة و ليست لهم تلك العزيمة ... إنما قال الله فاعتبروا يا أولي الأبصار"
-  mentions: محبة أهل البيت/concept/0.8 evidence "إن عندنا قوما لهم محبة"
-            العزيمة/concept/0.6 evidence "ليست لهم تلك العزيمة"
-  quotes:   {text: "فاعتبروا يا أولي الأبصار", kind: "quran"}
-  No verse number. أبو الحسن is being asked, so he is a narrator.
+"إن عندنا قوما لهم محبة ... فاعتبروا يا أولي الأبصار"
+  mentions: محبة أهل البيت/0.8, العزيمة/0.6
+  quotes: {text: "فاعتبروا يا أولي الأبصار", kind: "quran"}
 
-JSON must be complete and compact: copy each Arabic matn once, do not repeat
-sentences, do not pad translations. Every numbered hadith needs non-empty
-hadith_fa, hadith_en, ravis and mentions. Continuation fragments may omit
-translations only when the fragment is isnad with no matn yet.
-Never fabricate a hadith.
+Empty mentions on a numbered hadith is invalid. Continuations may omit
+translations when the fragment is isnad with no matn yet. Never fabricate a hadith.
 """
 
 UNIFY_PROMPT = """\
-From THIS assembled Arabic hadith only (ignore chapter titles and any other
-narration), return Persian (hadith_fa), English (hadith_en), ravis, mentions
-and quotes.
+From THIS assembled Arabic hadith only (ignore chapter titles and other narrations),
+return Persian (hadith_fa), English (hadith_en), ravis, mentions, and quotes.
 
-A mention is something the narration is ABOUT, in the matn's own words, with a
-type (concept | person | place | group | event | work), a salience from 0.0 to
-1.0, and the verbatim `evidence` span it came from. You are not choosing from a
-vocabulary; identity is resolved elsewhere against the whole corpus.
-
-Say it plainly -- العقل, not عقل المرء. Ground every person, place, event, group
-and work literally in the matn. Narrators and the speaker being quoted go in
-ravis and never in mentions. Never index something the matn denies. Put Qur'anic
-quotations in `quotes` as the quoted words only, with no sura name and no verse
-number.
-
-Give 3 to 8 mentions. Never return an empty list.
+Mentions = what the matn is ABOUT: {text, type, salience, evidence}.
+type is concept|person|place|group|event|work. Prefer plain forms (العقل not عقل المرء)
+but KEEP real compounds (خلق العقل). Narrators and the speaker go in ravis only.
+Put Qur'anic quotations in quotes as the words only (no verse numbers).
 """
+
+UNIFY_REQUIRE_TOPICS = """\
+CRITICAL: mentions are missing. Your FIRST job is mentions (at least 2), then
+translations and ravis. An empty mentions array is invalid JSON for this call.
+Do not use semantic_nodes. Example shape:
+  "mentions": [
+    {"text": "العقل", "type": "concept", "salience": 0.9, "evidence": "لما خلق الله العقل"},
+    {"text": "خلق العقل", "type": "concept", "salience": 0.8, "evidence": "لما خلق الله العقل استنطقه"}
+  ]
+"""
+
+UNIFY_TOPICS_OPTIONAL = """\
+Mentions are already present. You may add better ones; empty mentions is OK when
+you are only filling translations or ravis.
+"""
+
+MENTIONS_FILL_PROMPT = """\
+List what THIS Arabic hadith is ABOUT. Return JSON with only `mentions`
+(at least 2 objects). Each: {text, type, salience, evidence}.
+
+type: concept | person | place | group | event | work
+salience: 0.0-1.0
+evidence: short verbatim span from the matn
+
+KEEP compounds that are the subject (خلق العقل). STRIP grammar possessors
+(عقل المرء → العقل). Do NOT emit bare خلق. Do NOT put narrators or the Imam
+speaker in mentions -- only subjects discussed in the matn.
+Prefer 3-6 mentions. Never return mentions: [].
+"""
+
+
+def unify_prompt(*, require_topics: bool = False) -> str:
+    extra = UNIFY_REQUIRE_TOPICS if require_topics else UNIFY_TOPICS_OPTIONAL
+    return f"{UNIFY_PROMPT}\n{extra}"
+
+
+def mentions_fill_prompt() -> str:
+    return MENTIONS_FILL_PROMPT
+
 
 TAFSIR_PROMPT = """\
 You extract one Al-Mizan tafsir unit anchored to a Qur'anic ayah range.
@@ -150,7 +154,3 @@ concepts plainly.
 
 def hadith_prompt(extra: str = "") -> str:
     return f"{HADITH_PROMPT}\n{extra}" if extra else HADITH_PROMPT
-
-
-def unify_prompt() -> str:
-    return UNIFY_PROMPT

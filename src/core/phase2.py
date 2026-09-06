@@ -11,7 +11,7 @@ import numpy as np
 from config.paths import OUTPUT_DIR
 from config.settings import Settings, get_settings
 from src.agents.embeddings import EmbeddingAgent
-from src.agents.errors import AllKeysExhausted
+from src.agents.errors import AllKeysExhausted, ProviderServerError
 from src.agents.gemini import GeminiAgent
 from src.core.edge_classifier import (
     apply_canonical_ids,
@@ -119,6 +119,9 @@ def run_phase2(
         )
     except AllKeysExhausted:
         state.finish_job(job_id, pause_reason="all_keys_exhausted")
+        raise
+    except ProviderServerError:
+        state.finish_job(job_id, pause_reason="provider_unavailable")
         raise
     state.finish_job(job_id)
     logger.info(

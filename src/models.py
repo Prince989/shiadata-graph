@@ -92,16 +92,65 @@ class HadithExtraction(BaseModel):
     proposed_nodes: list[str] = Field(default_factory=list)
     ravis: list[str] = Field(default_factory=list)
 
+    # Mentions are required in the prompt and enforced at unify when the page
+    # pass leaves them empty (HadithUnifyRequireTopics). A hard gate here used
+    # to reject the entire page extract after 6 retries even when FA/ravis were
+    # fine, which stalled Phase 1 with errors=1 and nothing flushed.
+
+
+class HadithPageItem(BaseModel):
+    """What the page pass actually asks Gemini for.
+
+    Field order here is not cosmetic: it becomes the JSON-schema property order,
+    and a model fills a structured response in schema order regardless of what
+    the prompt says to do first. `HadithExtraction` put `hadith`, `hadith_fa`
+    and `hadith_en` ahead of `mentions`, so on a six-hadith page the model wrote
+    six full Arabic matns and twelve translations before reaching the one field
+    that matters -- and arrived there with the budget spent, which is why
+    mentions kept coming back empty.
+
+    `hadith` is gone entirely. `_slice_from_item` takes the matn from the page
+    split (`body or item["hadith"]`, and body always wins), so echoing it back
+    was the single largest field in the response and was discarded on arrival.
+
+    The legacy `semantic_nodes` / `proposed_nodes` are gone too: offering them
+    gave the model a second place to put topics, and anything it put there was
+    dropped by the resolver.
+    """
+
+    marker: str = ""
+    mentions: list[Mention] = Field(default_factory=list)
+    ravis: list[str] = Field(default_factory=list)
+    quotes: list[QuotedSpan] = Field(default_factory=list)
+    hadith_fa: str = ""
+    hadith_en: str = ""
+
 
 class HadithPageExtraction(BaseModel):
     """Internal per-page Gemini extract; not the Phase 1 product."""
 
     page: str
-    hadiths: list[HadithExtraction] = Field(default_factory=list)
+    hadiths: list[HadithPageItem] = Field(default_factory=list)
+
+
+def _dedupe_mention_list(value: list[Mention]) -> list[Mention]:
+    cleaned: list[Mention] = []
+    seen: set[tuple[str, str]] = set()
+    for item in value or []:
+        key = (item.text, item.type)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(item)
+    return cleaned
 
 
 class HadithUnify(BaseModel):
-    """Fill translations / ravis / semantic_nodes when the page pass left them empty."""
+    """Fill translations / ravis / mentions when the page pass left gaps.
+
+    Soft by default: FA/ravis-only replies are valid when the assembled payload
+    already has topics. Use `HadithUnifyRequireTopics` when it does not.
+    """
 
     hadith_fa: str = ""
     hadith_en: str = ""
@@ -114,32 +163,52 @@ class HadithUnify(BaseModel):
     @field_validator("mentions")
     @classmethod
     def _dedupe_mentions(cls, value: list[Mention]) -> list[Mention]:
-        cleaned: list[Mention] = []
-        seen: set[tuple[str, str]] = set()
-        for item in value or []:
-            key = (item.text, item.type)
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(item)
-        return cleaned
+        return _dedupe_mention_list(value)
+
+
+class HadithUnifyRequireTopics(HadithUnify):
+    """Unify when the assembled narration still has no topics to resolve.
+
+    `min_length=2` becomes JSON-schema minItems so Gemini cannot emit [].
+    """
+
+    mentions: list[Mention] = Field(min_length=2)
+
+    @field_validator("mentions")
+    @classmethod
+    def _dedupe_mentions(cls, value: list[Mention]) -> list[Mention]:
+        return _dedupe_mention_list(value)
 
     @model_validator(mode="after")
-    def _must_say_something(self) -> "HadithUnify":
-        """Reject a hollow unify so the agent retries.
-
-        Unify only runs on narrations already known to be under-extracted, so an
-        answer carrying nothing to index is a failed call, not a valid result.
-        Either channel satisfies it: new extractions fill `mentions`, and
-        payloads from before the resolver still arrive as `semantic_nodes`.
-        """
-        # One is enough. Unify also runs when only a translation is missing,
-        # and demanding two there pressures the model into inventing a second
-        # observation for a narration that genuinely has one. Grounding would
-        # usually catch the invention, but not asking for it is better.
-        if len(self.mentions) + len(self.semantic_nodes) < 1:
-            raise ValueError("need at least 1 mention (or legacy semantic_node)")
+    def _must_say_something(self) -> "HadithUnifyRequireTopics":
+        # Mentions only -- legacy semantic_nodes used to satisfy this gate, then
+        # enforce_node_policy dropped them and the payload was saved with FA/ravis
+        # and empty mentions. resolve-nodes then had nothing to do.
+        if len(self.mentions) < 2:
+            raise ValueError(
+                "need at least 2 mentions with text/type/salience/evidence"
+            )
         return self
+
+
+class MentionsFill(BaseModel):
+    """Mentions-only recovery when the page pass left topics empty.
+
+    Separate from unify so the model cannot burn the whole budget on FA/ravis
+    and return mentions: []. minItems is enforced in the response schema.
+    """
+
+    mentions: list[Mention] = Field(min_length=2, max_length=12)
+
+    @field_validator("mentions")
+    @classmethod
+    def _dedupe_mentions(cls, value: list[Mention]) -> list[Mention]:
+        cleaned = _dedupe_mention_list(value)
+        if len(cleaned) < 2:
+            raise ValueError(
+                "need at least 2 mentions with text/type/salience/evidence"
+            )
+        return cleaned
 
 
 class TafsirExtraction(BaseModel):

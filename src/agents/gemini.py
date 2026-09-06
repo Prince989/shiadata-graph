@@ -37,12 +37,29 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 COMPACT_JSON_RETRY = (
-    "\n\nYour previous JSON was truncated or invalid. Emit COMPLETE valid JSON only. "
+    "\n\nYour previous JSON failed validation. Emit COMPLETE valid JSON only.\n"
+    "CRITICAL: every numbered hadith MUST include a non-empty `mentions` array "
+    "(at least 1 object, prefer 3-8). Each mention is "
+    "{text, type, salience, evidence}. type is one of "
+    "concept|person|place|group|event|work. evidence is a verbatim matn span.\n"
+    "Do NOT leave mentions as []. Continuations may omit mentions; numbered "
+    "markers (1-, 2-, 3 -, …) may not.\n"
     "Copy each Arabic hadith once. Keep Persian and English faithful and concise. "
-    "Do not repeat sentences or pad fields. "
-    "semantic_nodes must list 2-6 objects, each {node, type, role}; never return an empty array. "
-    "node is 1-3 fusha words, no أهمية / فضيلة / تعريف / حقيقة prefix, no sentences."
+    "Do not pad or repeat sentences."
 )
+
+MENTIONS_FILL_RETRY = (
+    "\n\nYour previous JSON failed validation. Return ONLY "
+    '{"mentions":[...]} with at least 2 objects. Each object MUST have '
+    "text, type (concept|person|place|group|event|work), salience (0-1), "
+    "and evidence (verbatim matn span). Do NOT return mentions:[]. "
+    "Do NOT return hadith_fa/hadith_en/ravis on this call."
+)
+
+
+# Brief pause before trying the next model on 503/5xx so a demand spike is not
+# burned through the whole fallback list in under a second.
+SERVER_ERROR_FALLBACK_SLEEP_S = 5.0
 
 
 def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int | None]:
@@ -113,14 +130,28 @@ class GeminiAgent:
         self._generate_fn = generate_fn
         self._last_call_at: float | None = None
         self._skip_min_interval = False
+        self._preferred_model: str | None = None
 
-    def _models_for_call(self, model: str | None) -> list[str]:
-        if model:
-            return [model]
+    def _configured_models(self) -> list[str]:
         models = [m for m in (self.settings.gemini_models or []) if m]
         if not models and self.settings.gemini_model:
             models = [self.settings.gemini_model]
         return models or ["gemini-3.6-flash"]
+
+    def _models_for_call(self, model: str | None) -> list[str]:
+        if model:
+            return [model]
+        models = self._configured_models()
+        preferred = self._preferred_model
+        if preferred and preferred in models:
+            return [preferred] + [m for m in models if m != preferred]
+        return models
+
+    def _retry_addon(self, schema: type[BaseModel] | None) -> str:
+        name = getattr(schema, "__name__", "") if schema is not None else ""
+        if name == "MentionsFill":
+            return MENTIONS_FILL_RETRY
+        return COMPACT_JSON_RETRY
 
     def complete(
         self,
@@ -177,7 +208,14 @@ class GeminiAgent:
             current_model = remaining[0]
             sys = system
             if attempt and schema is not None:
-                sys = (system or "") + COMPACT_JSON_RETRY
+                sys = (system or "") + self._retry_addon(schema)
+                if last_error is not None:
+                    # Feed the exact schema failure back so the model fixes
+                    # missing mentions instead of re-emitting the same hollow JSON.
+                    sys = (
+                        f"{sys}\n\nPrevious attempt failed validation:\n"
+                        f"{last_error}\nFix every listed error in this reply."
+                    )
             self._wait_min_interval()
             try:
                 logger.info("Gemini model %s on %s", current_model, key.id)
@@ -192,6 +230,15 @@ class GeminiAgent:
                     schema.model_validate(data)
                     if not isinstance(text, str):
                         text = json.dumps(data, ensure_ascii=False)
+                # Prefer a fallback model that just succeeded (demand spike).
+                configured = self._configured_models()
+                if configured and current_model != configured[0]:
+                    if self._preferred_model != current_model:
+                        logger.info(
+                            "Preferring Gemini model %s after successful fallback",
+                            current_model,
+                        )
+                    self._preferred_model = current_model
                 self.pool.report_success(key)
                 return text
             except (StructuredOutputError, json.JSONDecodeError, ValidationError) as exc:
@@ -213,7 +260,31 @@ class GeminiAgent:
                     unavailable.add(current_model)
                     still = [m for m in models if m not in unavailable]
                     if still:
-                        logger.warning("Falling back to Gemini model %s", still[0])
+                        # Demand spikes (503) need a pause; retired-model 404s do not.
+                        msg = str(exc).lower()
+                        is_demand = (
+                            "503" in msg
+                            or "unavailable" in msg
+                            or "high demand" in msg
+                            or "502" in msg
+                            or "504" in msg
+                        )
+                        if is_demand:
+                            wait_s = (
+                                (retry_ms / 1000.0)
+                                if retry_ms
+                                else SERVER_ERROR_FALLBACK_SLEEP_S
+                            )
+                            logger.warning(
+                                "Falling back to Gemini model %s after %.1fs",
+                                still[0],
+                                wait_s,
+                            )
+                            time.sleep(wait_s)
+                        else:
+                            logger.warning(
+                                "Falling back to Gemini model %s", still[0]
+                            )
                         self._skip_min_interval = True
                         continue
                     unavailable.clear()

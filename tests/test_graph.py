@@ -25,7 +25,15 @@ from src.extractors.classification import attach_sections, page_headings, sectio
 from src.extractors.epub_parser import ParsedUnit, parse_epub, strip_html
 from src.extractors.quran_refs import match_quran_phrases, page_quran_refs, parse_footnote_ref
 from src.extractors.txt_parser import parse_txt
-from src.models import HadithExtraction, HadithPageExtraction, HadithUnify, HistoryExtraction, TafsirExtraction
+from src.models import (
+    HadithExtraction,
+    HadithPageExtraction,
+    HadithUnify,
+    HadithUnifyRequireTopics,
+    HistoryExtraction,
+    MentionsFill,
+    TafsirExtraction,
+)
 from src.pipelines.hadith_accumulator import OpenHadith, consume_page
 from src.pipelines.llm_processor import (
     hadith_system_extra,
@@ -461,7 +469,7 @@ def test_gemini_503_falls_back_to_next_model(state: StateManager, monkeypatch: p
     )
     assert agent.complete("x") == "ok"
     assert seen == [("a", "hot-model"), ("a", "cool-model")]
-    assert slept == []
+    assert slept == [5.0]
     assert state.get_cooldown(key_id_for("a", 0)) is None
 
 
@@ -1148,7 +1156,7 @@ def test_remap_existing_concepts_without_gemini(tmp_path: Path, state: StateMana
     assert written["hadiths"][0]["semantic_nodes"][0]["node"] == "الانتحار"
 
 
-def test_process_unit_canonicalizes_alias_concept_nodes(tmp_path: Path, state: StateManager):
+def test_process_unit_keeps_mentions_verbatim_for_the_resolver(tmp_path: Path, state: StateManager):
     def fake_generate(*, key, prompt, system, model, schema):
         return json.dumps(
             {
@@ -1156,12 +1164,11 @@ def test_process_unit_canonicalizes_alias_concept_nodes(tmp_path: Path, state: S
                 "hadiths": [
                     {
                         "marker": "3 -",
-                        "hadith": "حديث ثلاثة بما يكفي",
                         "hadith_fa": "سه",
                         "hadith_en": "three",
-                        "semantic_nodes": [
-                            {"node": "قتل النفس", "type": "concept", "role": "primary"},
-                            {"node": "عذاب القبر", "type": "concept", "role": "secondary"},
+                        "mentions": [
+                            {"text": "قتل النفس", "type": "concept", "salience": 0.9},
+                            {"text": "عذاب القبر", "type": "concept", "salience": 0.5},
                         ],
                         "ravis": [],
                     }
@@ -1192,7 +1199,12 @@ def test_process_unit_canonicalizes_alias_concept_nodes(tmp_path: Path, state: S
     )
     written = tmp_path / "phase1" / "hadith" / phase1_filename(unit.source_path, unit.locator, "x")
     data = json.loads(written.read_text(encoding="utf-8"))
-    assert [n["node"] for n in data["hadiths"][0]["semantic_nodes"]] == ["الانتحار", "عذاب البرزخ"]
+    # Aliases are resolved corpus-wide now, so the page extract keeps the matn's
+    # own wording; resolve-nodes maps قتل النفس onto الانتحار.
+    assert [m["text"] for m in data["hadiths"][0]["mentions"]] == [
+        "قتل النفس",
+        "عذاب القبر",
+    ]
 
 
 def test_structured_output_retries_truncated_json(state: StateManager):
@@ -1287,7 +1299,27 @@ def test_hadith_limit_and_json_error_do_not_open_next_volume(
     page_calls: list[str] = []
 
     def fake_generate(*, key, prompt, system, model, schema):
-        if schema is HadithUnify:
+        if schema is MentionsFill:
+            return json.dumps(
+                {
+                    "mentions": [
+                        {
+                            "text": "العقل",
+                            "type": "concept",
+                            "salience": 0.9,
+                            "evidence": "متن حديث",
+                        },
+                        {
+                            "text": "الجنة",
+                            "type": "concept",
+                            "salience": 0.5,
+                            "evidence": "متن حديث",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if isinstance(schema, type) and issubclass(schema, HadithUnify):
             return json.dumps(
                 {
                     "semantic_nodes": _concept_nodes("العقل", "الجنة"),
@@ -1590,12 +1622,35 @@ def test_unify_only_when_multipage(state: StateManager):
 
 
 def test_unify_fills_hollow_single_page(state: StateManager):
+    calls: list[type] = []
+
     def fake_generate(*, key, prompt, system, model, schema):
+        calls.append(schema)
+        if schema is MentionsFill:
+            return json.dumps(
+                {
+                    "mentions": [
+                        {
+                            "text": "العقل",
+                            "type": "concept",
+                            "salience": 0.9,
+                            "evidence": "ما العقل",
+                        },
+                        {
+                            "text": "الجنة",
+                            "type": "concept",
+                            "salience": 0.5,
+                            "evidence": "الجنان",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {
                 "hadith_fa": "فارسی",
                 "hadith_en": "English",
-                "semantic_nodes": _concept_nodes("العقل", "الجنة"),
+                "mentions": [],
                 "ravis": ["أحمد بن إدريس"],
             },
             ensure_ascii=False,
@@ -1612,34 +1667,34 @@ def test_unify_fills_hollow_single_page(state: StateManager):
         "locator": "جلد 1 - صفحه 11",
         "page_start": "جلد 1 - صفحه 11",
         "page_end": "جلد 1 - صفحه 11",
-        "hadith": "3 - أَحْمَدُ بْنُ إِدْرِيسَ",
+        "hadith": "قُلْتُ مَا الْعَقْلُ قَالَ مَا عُبِدَ بِهِ الرَّحْمَنُ وَ اكْتُسِبَ بِهِ الْجِنَانُ",
         "hadith_fa": "",
         "hadith_en": "",
+        "mentions": [],
         "semantic_nodes": [],
         "ravis": [],
     }
     out = unify_assembled_hadith(agent, hollow)
+    assert calls == [MentionsFill, HadithUnify]
     assert out["hadith_fa"] == "فارسی"
     assert out["hadith_en"] == "English"
     assert out["ravis"] == ["أحمد بن إدريس"]
-    assert "العقل" in [n["node"] for n in out["semantic_nodes"]]
+    assert {m["text"] for m in out["mentions"]} >= {"العقل", "الجنة"}
 
 
-def test_unify_retries_when_semantic_nodes_empty(state: StateManager):
+def test_unify_accepts_translation_only_reply(state: StateManager):
+    """Empty mentions must not reject unify -- that crashed live Phase 1 runs."""
     n = {"i": 0}
 
     def fake_generate(*, key, prompt, system, model, schema):
         n["i"] += 1
-        if n["i"] == 1:
-            return json.dumps(
-                {"hadith_fa": "ف", "hadith_en": "e", "semantic_nodes": [], "ravis": ["زرارة"]},
-                ensure_ascii=False,
-            )
+        assert schema is HadithUnify
         return json.dumps(
             {
                 "hadith_fa": "ف",
                 "hadith_en": "e",
-                "semantic_nodes": _concept_nodes("العقل", "الجنة"),
+                "mentions": [],
+                "semantic_nodes": [],
                 "ravis": ["زرارة"],
             },
             ensure_ascii=False,
@@ -1656,13 +1711,172 @@ def test_unify_retries_when_semantic_nodes_empty(state: StateManager):
         "locator": "جلد 1 - صفحه 11",
         "page_start": "جلد 1 - صفحه 11",
         "page_end": "جلد 1 - صفحه 11",
-        "hadith": "متن",
-        "hadith_fa": "ف",
-        "hadith_en": "e",
+        "hadith": "متن عن العقل",
+        "hadith_fa": "",
+        "hadith_en": "",
+        "mentions": [
+            {"text": "العقل", "type": "concept", "salience": 0.9, "evidence": "العقل"}
+        ],
         "semantic_nodes": [],
         "ravis": ["زرارة"],
     }
     out = unify_assembled_hadith(agent, hollow)
-    assert n["i"] == 2
-    assert [n["node"] for n in out["semantic_nodes"]] == ["العقل", "الجنة"]
+    assert n["i"] == 1
+    assert out["hadith_fa"] == "ف"
+    assert out["hadith_en"] == "e"
+    assert [m["text"] for m in out["mentions"]] == ["العقل"]
 
+
+def test_unify_requires_topics_when_mentions_empty(state: StateManager):
+    n = {"i": 0}
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        n["i"] += 1
+        if schema is MentionsFill:
+            if n["i"] == 1:
+                return json.dumps({"mentions": []}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "mentions": [
+                        {
+                            "text": "العقل",
+                            "type": "concept",
+                            "salience": 0.9,
+                            "evidence": "ما العقل",
+                        },
+                        {
+                            "text": "معاوية",
+                            "type": "person",
+                            "salience": 0.4,
+                            "evidence": "معاوية",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        assert schema is HadithUnify
+        return json.dumps(
+            {
+                "hadith_fa": "ف",
+                "hadith_en": "e",
+                "mentions": [],
+                "ravis": ["ز"],
+            },
+            ensure_ascii=False,
+        )
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0, gemini_max_attempts=4),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    hollow = {
+        "marker": "3 -",
+        "locator": "جلد 1 - صفحه 11",
+        "page_start": "جلد 1 - صفحه 11",
+        "page_end": "جلد 1 - صفحه 11",
+        "hadith": "ما العقل قال ما عبد به الرحمن فالذي كان في معاوية",
+        "hadith_fa": "",
+        "hadith_en": "",
+        "mentions": [],
+        "ravis": [],
+    }
+    out = unify_assembled_hadith(agent, hollow)
+    assert n["i"] == 3  # MentionsFill fail, MentionsFill ok, soft HadithUnify
+    assert {m["text"] for m in out["mentions"]} >= {"العقل", "معاوية"}
+    assert out["hadith_fa"] == "ف"
+
+
+def test_unify_survives_structured_output_failure(state: StateManager):
+    def fake_generate(*, key, prompt, system, model, schema):
+        raise StructuredOutputError("forced")
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0, gemini_max_attempts=1),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    hollow = {
+        "marker": "7 -",
+        "locator": "جلد 1 - صفحه 11",
+        "page_start": "جلد 1 - صفحه 11",
+        "page_end": "جلد 1 - صفحه 11",
+        "hadith": "ما العقل قال ما عبد به الرحمن",
+        "hadith_fa": "",
+        "hadith_en": "",
+        "mentions": [
+            {
+                "text": "العقل",
+                "type": "concept",
+                "salience": 0.9,
+                "evidence": "ما العقل",
+            }
+        ],
+        "ravis": [],
+    }
+    out = unify_assembled_hadith(agent, hollow)
+    assert out["mentions"][0]["text"] == "العقل"
+    assert out["hadith_fa"] == ""
+
+
+def test_page_extract_allows_empty_mentions_unify_fills_them(state: StateManager):
+    """Page gate used to reject the whole extract; MentionsFill recovers."""
+    page = HadithExtraction(
+        marker="3 -",
+        hadith="ما العقل",
+        hadith_fa="ف",
+        hadith_en="e",
+        mentions=[],
+        ravis=["ز"],
+    )
+    assert page.mentions == []
+
+    n = {"i": 0}
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        n["i"] += 1
+        assert schema is MentionsFill
+        return json.dumps(
+            {
+                "mentions": [
+                    {
+                        "text": "العقل",
+                        "type": "concept",
+                        "salience": 0.9,
+                        "evidence": "ما العقل",
+                    },
+                    {
+                        "text": "العبادة",
+                        "type": "concept",
+                        "salience": 0.5,
+                        "evidence": "عبد به الرحمن",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0, gemini_max_attempts=2),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    out = unify_assembled_hadith(
+        agent,
+        {
+            "marker": "3 -",
+            "locator": "p",
+            "page_start": "p",
+            "page_end": "p",
+            "hadith": "ما العقل قال ما عبد به الرحمن",
+            "hadith_fa": "ف",
+            "hadith_en": "e",
+            "mentions": [],
+            "ravis": ["ز"],
+        },
+    )
+    assert n["i"] == 1
+    assert {m["text"] for m in out["mentions"]} >= {"العقل", "العبادة"}
