@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -14,6 +14,14 @@ class ParsedUnit:
     locator: str
     text: str
     source_path: str
+    # Qur'an citations read off the RAW page before footnotes were stripped,
+    # keyed by hadith start token. Defaulted and excluded from comparison so
+    # positional construction and hashing both keep working.
+    quran_refs: dict[str, list[str]] = field(default_factory=dict, compare=False)
+    # The book's own classification in force at this point. Filled by
+    # src/extractors/classification.py, never by a model.
+    kitab: str = field(default="", compare=False)
+    bab: str = field(default="", compare=False)
 
 
 def strip_html(html: str) -> str:

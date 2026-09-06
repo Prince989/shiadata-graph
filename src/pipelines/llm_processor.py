@@ -14,7 +14,17 @@ from src.agents.gemini import GeminiAgent
 from src.extractors.chunkers import split_hadith_page, strip_folklib_footnotes
 from src.extractors.epub_parser import ParsedUnit
 from src.models import HadithPageExtraction, HadithUnify, HistoryExtraction, TafsirExtraction
-from src.pipelines.ontology import grouping_prefs, remap_hadith_payload, remap_tag_list
+from src.pipelines.ontology import (
+    enforce_node_policy,
+    remap_hadith_payload,
+    semantic_nodes_of,
+)
+from src.pipelines.prompts import (
+    HISTORY_PROMPT,
+    TAFSIR_PROMPT,
+    hadith_prompt,
+    unify_prompt,
+)
 from src.state_manager import ChunkStatus, StateManager
 
 logger = logging.getLogger(__name__)
@@ -65,7 +75,10 @@ def hadith_system_extra(text: str) -> str:
     return (
         f"Detected numbered starts on this page: {listed}. "
         f"The hadiths array MUST include each of these {len(tokens)} numbered "
-        "narrations (plus a leading continuation item if the page starts mid-hadith)."
+        "narrations (plus a leading continuation item if the page starts mid-hadith). "
+        "Each numbered item is a SEPARATE claim. semantic_nodes for item N may use "
+        "only the matn of item N. Do not copy nodes from a neighbour or from a "
+        "kitab/bab heading."
     )
 
 
@@ -81,53 +94,15 @@ def schema_for(pipeline: str) -> type[BaseModel]:
 
 def system_prompt(pipeline: str, extra: str = "") -> str:
     if pipeline == "hadith":
-        examples = "، ".join(grouping_prefs())
-        return (
-            "You extract EVERY hadith on this printed page, not just the first. "
-            "Return JSON with page (copy the locator) and hadiths: an array with one "
-            "object per distinct narration. "
-            "If the page starts mid-hadith (no new number), include that fragment first "
-            "with marker 'continuation'. "
-            "Then include each numbered hadith (e.g. '3 -', '8-', '[ ١٥٤٩٥ ] ١ ـ'). "
-            "Ignore editor footnotes like [1] [2] at the bottom of the page. "
-            "For each item: original Arabic, fluent Persian, precise English, "
-            "narrators in chain order, and tags. "
-            "Tags are ontological concept IDs (semantic bridges), not keywords and not "
-            "kitāb/bāb titles. Assign 2–6 mid-grain fuṣḥā labels that name the "
-            "theological, legal, or ethical CLAIM of the matn. "
-            "Never tag instruments, props, proper names-as-topics, or a word merely "
-            "because it occurs. Never use a root heading (الإيمان، المعاد، الحرام، …) "
-            "unless the hadith is actually defining that heading. "
-            "Example: afterlife punishment for a man who killed himself with hot steel "
-            "→ [الانتحار, عذاب البرزخ, الجزاء الأخروي] — not حديد and not كتاب العقل. "
-            "Known grouping concepts (examples, not an exclusive menu): "
-            f"{examples}. "
-            "JSON must be complete and compact: copy each Arabic matn once, "
-            "do not repeat sentences, do not pad translations. "
-            "Never fabricate a hadith. "
-            f"{extra}"
-        )
+        return hadith_prompt(extra)
     if pipeline == "tafsir":
-        return (
-            "You extract one Al-Mizan tafsir unit anchored to a Qur'anic ayah range. "
-            "Copy ayah_anchor from the locator. Extract any quoted hadith. "
-            "Write a two-line Persian summary. Keep tafsir_chunk as the main Arabic/Persian text."
-        )
-    return (
-        "You extract historical events from a long classical Arabic narrative. "
-        "Split into distinct events with titles, characters, concepts, and the "
-        "paragraphs covering each event. Do not invent events absent from the text."
-    )
+        return TAFSIR_PROMPT
+    return HISTORY_PROMPT
 
 
 UNIFY_AR_HEAD = 4000
 UNIFY_BODY_BUDGET = 20_000
 
-UNIFY_SYSTEM = (
-    "From the assembled hadith, return only ravis (isnad chain in order, from the opening) "
-    "and mid-grain fuṣḥā concept tags for the CLAIM of the whole narration. "
-    "Do not retell the matn. Do not use kitāb titles or instruments as tags."
-)
 
 
 def extract_hadith_page(agent: GeminiAgent, unit: ParsedUnit) -> dict:
@@ -141,25 +116,97 @@ def extract_hadith_page(agent: GeminiAgent, unit: ParsedUnit) -> dict:
     return remap_hadith_payload(result.model_dump())
 
 
+def needs_enrichment(payload: dict) -> bool:
+    if payload.get("page_start") != payload.get("page_end"):
+        return True
+    if not str(payload.get("hadith_fa") or "").strip():
+        return True
+    if not str(payload.get("hadith_en") or "").strip():
+        return True
+    # Either channel counts. Keying on semantic_nodes alone made every payload
+    # extracted under the mention contract look hollow, so every one of them
+    # went to unify -- a second model call per hadith, for nothing.
+    if len(payload.get("mentions") or []) + len(semantic_nodes_of(payload)) < 2:
+        return True
+    if not payload.get("ravis"):
+        return True
+    return False
+
+
 def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
-    """Fill tags/ravis for multi-page hadiths. Does not re-translate."""
-    if payload.get("page_start") == payload.get("page_end"):
+    """Fill missing FA/EN/semantic_nodes/ravis; always refresh ravis on multi-page."""
+    payload = dict(payload)
+    payload["hadith"] = strip_folklib_footnotes(str(payload.get("hadith") or ""))
+    if not needs_enrichment(payload):
         return remap_hadith_payload(payload)
     arabic = str(payload.get("hadith") or "")
     head = arabic[:UNIFY_AR_HEAD]
     if len(arabic) <= UNIFY_BODY_BUDGET:
         body = arabic
     else:
-        body = str(payload.get("hadith_en") or payload.get("hadith_fa") or arabic[:UNIFY_BODY_BUDGET])
+        body = arabic[:UNIFY_BODY_BUDGET]
     result = agent.complete_structured(
-        f"Isnad / opening:\n{head}\n\nMatn (for tags):\n{body}",
+        f"Isnad / opening:\n{head}\n\nMatn:\n{body}",
         HadithUnify,
-        system=UNIFY_SYSTEM,
+        system=unify_prompt(),
     )
     out = dict(payload)
-    out["ravis"] = list(result.ravis or payload.get("ravis") or [])
-    out["tags"] = remap_tag_list(list(result.tags or []))
+    if result.ravis:
+        out["ravis"] = list(result.ravis)
+    # Mentions are the live channel: merge rather than replace-if-empty. Unify
+    # runs whenever a narration has fewer than two, so a single surviving
+    # mention would otherwise block the entire result and the call would be
+    # paid for and thrown away.
+    if result.mentions:
+        out["mentions"] = _merge_mentions(
+            payload.get("mentions"), [m.model_dump() for m in result.mentions]
+        )
+    if result.quotes:
+        out["quotes"] = _merge_quotes(
+            payload.get("quotes"), [q.model_dump() for q in result.quotes]
+        )
+    existing = semantic_nodes_of(payload)
+    if result.semantic_nodes and len(existing) < 2:
+        out["semantic_nodes"] = enforce_node_policy(
+            [n.model_dump() for n in result.semantic_nodes],
+            out.get("ravis"),
+        )
+    if result.hadith_fa and not str(payload.get("hadith_fa") or "").strip():
+        out["hadith_fa"] = result.hadith_fa
+    if result.hadith_en and not str(payload.get("hadith_en") or "").strip():
+        out["hadith_en"] = result.hadith_en
     return remap_hadith_payload(out)
+
+
+def _merge_mentions(existing, extra) -> list[dict]:
+    """Union by (text, type), keeping the better salience and any real evidence."""
+    merged: dict[tuple[str, str], dict] = {}
+    for item in list(existing or []) + list(extra or []):
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("text") or "").strip(), str(item.get("type") or "concept"))
+        if not key[0]:
+            continue
+        current = merged.get(key)
+        if current is None:
+            merged[key] = dict(item)
+            continue
+        if float(item.get("salience") or 0) > float(current.get("salience") or 0):
+            current["salience"] = item.get("salience")
+        if not str(current.get("evidence") or "").strip():
+            current["evidence"] = item.get("evidence") or ""
+    return list(merged.values())
+
+
+def _merge_quotes(existing, extra) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for item in list(existing or []) + list(extra or []):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text and text not in merged:
+            merged[text] = dict(item)
+    return list(merged.values())
 
 
 def persist_complete_hadith(
@@ -171,6 +218,7 @@ def persist_complete_hadith(
     output_dir: Path,
 ) -> str:
     """Write one complete narration and upsert it as an embeddable Phase 1 chunk."""
+    payload["hadith"] = strip_folklib_footnotes(str(payload.get("hadith") or ""))
     locator = str(payload.get("locator") or "")
     marker = str(payload.get("marker") or "")
     arabic = str(payload.get("hadith") or "")

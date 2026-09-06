@@ -142,7 +142,15 @@ def run_hadith_phase1(
                     stop = True
                     break
                 items = [it for it in (page_payload.get("hadiths") or []) if isinstance(it, dict)]
-                complete, buf = consume_page(unit.locator, unit.text, items, buf, next_text)
+                complete, buf = consume_page(
+                    unit.locator,
+                    unit.text,
+                    items,
+                    buf,
+                    next_text,
+                    unit.quran_refs,
+                    (unit.kitab, unit.bab),
+                )
                 last_buf = buf
                 for rec in complete:
                     rec = unify_assembled_hadith(agent, rec)

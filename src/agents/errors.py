@@ -2,7 +2,8 @@
 
 
 FREE_TIER_TODAY = (
-    "End of Gemini free tier for today. Progress is saved; try again tomorrow."
+    "End of Gemini free tier for today. Progress is saved; "
+    "try again after midnight Pacific (about 10:30 in Tehran)."
 )
 
 

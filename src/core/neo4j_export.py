@@ -6,8 +6,33 @@ import json
 from pathlib import Path
 
 from config.paths import OUTPUT_DIR
-from src.core.vector_engine import concepts_for_chunk, hadith_items
+from src.core.vector_engine import (
+    graph_nodes_for_chunk,
+    hadith_items,
+    section_nodes_for_chunk,
+)
 from src.state_manager import ChunkStatus, StateManager
+
+_EDGE_BY_TYPE = {
+    "concept": "HAS_CONCEPT",
+    "person": "MENTIONS",
+    "place": "MENTIONS",
+    "group": "MENTIONS",
+    "event": "MENTIONS",
+    "work": "MENTIONS",
+    "ayah": "CITES",
+}
+_LABEL_BY_TYPE = {
+    "concept": "Concept",
+    "person": "Person",
+    "place": "Place",
+    "group": "Group",
+    "event": "Event",
+    "work": "Work",
+    "ayah": "Ayah",
+    "kitab": "Kitab",
+    "bab": "Bab",
+}
 
 
 def export_neo4j(state: StateManager, dest: Path | None = None) -> Path:
@@ -27,7 +52,7 @@ def export_neo4j(state: StateManager, dest: Path | None = None) -> Path:
         "w", encoding="utf-8"
     ) as edges:
         books: set[str] = set()
-        concepts: set[str] = set()
+        nodes_seen: set[tuple[str, str]] = set()
         narrators: set[str] = set()
         for chunk in chunks:
             books.add(chunk.book_id)
@@ -66,14 +91,50 @@ def export_neo4j(state: StateManager, dest: Path | None = None) -> Path:
                     )
                     + "\n"
                 )
-            for tag in concepts_for_chunk(chunk):
-                concepts.add(tag)
+            for n in graph_nodes_for_chunk(chunk):
+                ntype = n["type"]
+                name = n["node"]
+                nodes_seen.add((ntype, name))
                 edges.write(
                     json.dumps(
                         {
-                            "type": "TAGGED",
+                            "type": _EDGE_BY_TYPE.get(ntype, "MENTIONS"),
                             "start": chunk.id,
-                            "end": f"concept:{tag}",
+                            "end": f"{ntype}:{name}",
+                            "role": n["role"],
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            for node in section_nodes_for_chunk(chunk):
+                nodes_seen.add((node["type"], node["node"]))
+                edges.write(
+                    json.dumps(
+                        {
+                            "type": "IN_KITAB" if node["type"] == "kitab" else "IN_BAB",
+                            "start": chunk.id,
+                            "end": f"{node['type']}:{node['node']}",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            # quran_refs is injected by the extractor, never by the model, and
+            # uses the same ayah: prefix the tafsir branch writes below, so a
+            # hadith and the tafsir of the verse it cites meet on one node.
+            cited: list[str] = []
+            for item in hadith_items(payload):
+                cited.extend(item.get("quran_refs") or [])
+            cited.extend(payload.get("quran_refs") or [])
+            for ref in dict.fromkeys(cited):
+                nodes_seen.add(("ayah", ref))
+                edges.write(
+                    json.dumps(
+                        {
+                            "type": "CITES",
+                            "start": chunk.id,
+                            "end": f"ayah:{ref}",
                         },
                         ensure_ascii=False,
                     )
@@ -114,9 +175,16 @@ def export_neo4j(state: StateManager, dest: Path | None = None) -> Path:
                 json.dumps({"id": f"book:{book_id}", "labels": ["Book"], "book_id": book_id})
                 + "\n"
             )
-        for tag in sorted(concepts):
+        for ntype, name in sorted(nodes_seen):
             nodes.write(
-                json.dumps({"id": f"concept:{tag}", "labels": ["Concept"], "name": tag})
+                json.dumps(
+                    {
+                        "id": f"{ntype}:{name}",
+                        "labels": [_LABEL_BY_TYPE.get(ntype, "Concept")],
+                        "name": name,
+                    },
+                    ensure_ascii=False,
+                )
                 + "\n"
             )
         for name in sorted(narrators):

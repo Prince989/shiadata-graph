@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -10,17 +11,39 @@ from pydantic import ValidationError
 from config.settings import Settings
 from src.agents.errors import AllKeysExhausted, RateLimited, StructuredOutputError
 from src.agents.gemini import GeminiAgent
-from src.agents.key_pool import FailureKind, KeyPool, LlmKey
-from src.core.edge_classifier import build_tag_buckets
-from src.core.phase2 import remap_existing_hadith_tags
-from src.core.vector_engine import concepts_for_chunk, cosine_similarity, pairs_above_threshold
+from src.agents.key_pool import FailureKind, KeyPool, LlmKey, key_id_for
+from src.core.edge_classifier import build_concept_buckets
+from src.core.phase2 import remap_existing_semantic_nodes
+from src.core.vector_engine import (
+    bucket_keys_for_chunk,
+    cosine_similarity,
+    pairs_above_threshold,
+    section_nodes_for_chunk,
+)
 from src.extractors.chunkers import hadith_units, page_prefix_and_starts, split_hadith_page, strip_folklib_footnotes
+from src.extractors.classification import attach_sections, page_headings, section_nodes
 from src.extractors.epub_parser import ParsedUnit, parse_epub, strip_html
+from src.extractors.quran_refs import match_quran_phrases, page_quran_refs, parse_footnote_ref
 from src.extractors.txt_parser import parse_txt
 from src.models import HadithExtraction, HadithPageExtraction, HadithUnify, HistoryExtraction, TafsirExtraction
 from src.pipelines.hadith_accumulator import OpenHadith, consume_page
-from src.pipelines.llm_processor import phase1_filename, process_unit, system_prompt, unify_assembled_hadith
-from src.pipelines.ontology import canonicalize_tag, is_grouping_label, remap_hadith_payload
+from src.pipelines.llm_processor import (
+    hadith_system_extra,
+    phase1_filename,
+    process_unit,
+    system_prompt,
+    unify_assembled_hadith,
+)
+from src.pipelines.ontology import (
+    broader_chain,
+    bucket_eligible,
+    canonicalize_concept,
+    enforce_node_policy,
+    normalize_ar,
+    remap_hadith_payload,
+    resolve_node,
+)
+from src.pipelines.proposals import apply_promotions, build_plan, collect, repair_map
 from src.pipelines.reset import reset_catalog_book
 from src.state_manager import ChunkRecord, ChunkStatus, StateManager
 
@@ -201,13 +224,18 @@ def test_key_rotation_on_429(state: StateManager):
                 "hadith": "x",
                 "hadith_fa": "ی",
                 "hadith_en": "x",
-                "tags": [],
+                "concept_nodes": [],
                 "ravis": [],
             },
             ensure_ascii=False,
         )
 
-    agent = GeminiAgent(state, key_pool=pool, generate_fn=fake_generate)
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0),
+        key_pool=pool,
+        generate_fn=fake_generate,
+    )
     result = agent.complete_structured("hi", HadithExtraction)
     assert result.hadith == "x"
     assert calls[0] == "key-a"
@@ -269,6 +297,19 @@ def test_classify_rpm_429_uses_retry_delay():
     assert 12_000 <= ms <= 14_000
 
 
+def test_classify_retired_model_404_is_server_error():
+    from src.agents.gemini import classify_provider_error
+
+    kind, ms = classify_provider_error(
+        Exception(
+            "404 NOT_FOUND. This model models/gemini-2.5-flash is no longer available "
+            "to new users. Please update your code to use models/gemini-3.6-flash."
+        )
+    )
+    assert kind == FailureKind.SERVER_ERROR
+    assert ms is None
+
+
 def test_acquire_waits_out_short_rate_limit(state: StateManager):
     settings = Settings(key_acquire_wait_max_ms=2_000, google_api_keys=["k"])
     pool = KeyPool(state, settings=settings, keys=["k"])
@@ -286,11 +327,61 @@ def test_acquire_does_not_wait_on_daily_quota(state: StateManager, monkeypatch):
     pool = KeyPool(state, keys=["k"])
     key = pool.acquire()
     pool.report_failure(key, FailureKind.QUOTA_EXHAUSTED)
-    with pytest.raises(AllKeysExhausted, match="tomorrow"):
+    with pytest.raises(AllKeysExhausted, match="free tier"):
         pool.acquire()
 
 
-def test_gemini_exits_on_daily_quota_without_retry_loop(state: StateManager):
+def test_quota_unlocks_after_pacific_midnight(state: StateManager, monkeypatch):
+    pool = KeyPool(state, keys=["k"])
+    key = pool.acquire()
+    today_mid = 1_800_000_000_000
+    lock = today_mid - 3_600_000
+    retry = lock + 86_400_000
+    now = today_mid + 60_000
+    state.set_cooldown(key.id, FailureKind.QUOTA_EXHAUSTED.value, 3, retry)
+    monkeypatch.setattr("src.agents.key_pool.time.time", lambda: now / 1000.0)
+    monkeypatch.setattr("src.agents.key_pool.pacific_day_start_ms", lambda _now: today_mid)
+    monkeypatch.setattr(
+        "src.agents.key_pool.next_pacific_midnight_ms",
+        lambda _now: today_mid + 86_400_000,
+    )
+    again = pool.acquire()
+    assert again.secret == "k"
+    assert state.get_cooldown(key.id) is None
+
+
+def test_quota_stays_locked_same_pacific_day(state: StateManager, monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.key_pool.time.sleep",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("slept")),
+    )
+    pool = KeyPool(state, keys=["k"])
+    key = pool.acquire()
+    today_mid = 1_800_000_000_000
+    lock = today_mid + 3_600_000
+    retry = lock + 86_400_000
+    now = lock + 5_000
+    state.set_cooldown(key.id, FailureKind.QUOTA_EXHAUSTED.value, 1, retry)
+    monkeypatch.setattr("src.agents.key_pool.time.time", lambda: now / 1000.0)
+    monkeypatch.setattr("src.agents.key_pool.pacific_day_start_ms", lambda _now: today_mid)
+    monkeypatch.setattr(
+        "src.agents.key_pool.next_pacific_midnight_ms",
+        lambda _now: today_mid + 86_400_000,
+    )
+    with pytest.raises(AllKeysExhausted, match="free tier"):
+        pool.acquire()
+
+
+def test_server_error_strikes_reset_after_cooldown_expires(state: StateManager):
+    import time as time_mod
+
+    pool = KeyPool(state, keys=["k"])
+    key = pool.acquire()
+    now = int(time_mod.time() * 1000)
+    state.set_cooldown(key.id, FailureKind.SERVER_ERROR.value, 5, now - 1_000)
+    pool.report_failure(key, FailureKind.SERVER_ERROR)
+    rec = state.get_cooldown(key.id)
+    assert rec["strikes"] == 1
     def fail(**_kwargs):
         raise RuntimeError(
             "429 RESOURCE_EXHAUSTED. quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
@@ -299,19 +390,112 @@ def test_gemini_exits_on_daily_quota_without_retry_loop(state: StateManager):
 
     agent = GeminiAgent(
         state,
-        settings=Settings(gemini_max_attempts=20),
+        settings=Settings(gemini_max_attempts=20, gemini_min_interval_ms=0),
         key_pool=KeyPool(state, keys=["a", "b"]),
         generate_fn=fail,
     )
-    with pytest.raises(AllKeysExhausted, match="tomorrow"):
+    with pytest.raises(AllKeysExhausted, match="free tier"):
         agent.complete("x")
+
+
+def test_gemini_waits_20s_between_calls(state: StateManager, monkeypatch: pytest.MonkeyPatch):
+    slept: list[float] = []
+    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: slept.append(s))
+
+    def fake_generate(**_kwargs):
+        return "ok"
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=20_000, gemini_max_attempts=1),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    assert agent.complete("a") == "ok"
+    assert slept == []
+    assert agent.complete("b") == "ok"
+    assert len(slept) == 1
+    assert slept[0] == pytest.approx(20.0, abs=0.05)
+
+
+def test_gemini_min_interval_actually_sleeps(state: StateManager):
+    import time as time_mod
+
+    def fake_generate(**_kwargs):
+        return "ok"
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=400, gemini_max_attempts=1),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    t0 = time_mod.monotonic()
+    agent.complete("a")
+    agent.complete("b")
+    elapsed = time_mod.monotonic() - t0
+    assert elapsed >= 0.35
+
+
+def test_gemini_503_falls_back_to_next_model(state: StateManager, monkeypatch: pytest.MonkeyPatch):
+    slept: list[float] = []
+    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: slept.append(s))
+    seen: list[tuple[str, str]] = []
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        seen.append((key.secret, model))
+        if model == "hot-model":
+            raise RuntimeError("503 UNAVAILABLE. high demand")
+        return "ok"
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(
+            gemini_min_interval_ms=20_000,
+            gemini_max_attempts=3,
+            gemini_models=["hot-model", "cool-model"],
+            gemini_model="hot-model",
+        ),
+        key_pool=KeyPool(state, keys=["a", "b"]),
+        generate_fn=fake_generate,
+    )
+    assert agent.complete("x") == "ok"
+    assert seen == [("a", "hot-model"), ("a", "cool-model")]
+    assert slept == []
+    assert state.get_cooldown(key_id_for("a", 0)) is None
+
+
+def test_gemini_404_retired_model_falls_back(state: StateManager):
+    seen: list[str] = []
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        seen.append(model)
+        if model == "gemini-2.5-flash":
+            raise RuntimeError(
+                "404 NOT_FOUND. This model models/gemini-2.5-flash is no longer available "
+                "to new users. Please update your code to use models/gemini-3.6-flash."
+            )
+        return "ok"
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(
+            gemini_min_interval_ms=0,
+            gemini_max_attempts=3,
+            gemini_models=["gemini-2.5-flash", "gemini-3.6-flash"],
+        ),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    assert agent.complete("x") == "ok"
+    assert seen == ["gemini-2.5-flash", "gemini-3.6-flash"]
 
 
 def test_all_keys_exhausted_leaves_chunks_pending(state: StateManager):
     pool = KeyPool(state, keys=["only"])
     k = pool.acquire()
     pool.report_failure(k, FailureKind.QUOTA_EXHAUSTED)
-    with pytest.raises(AllKeysExhausted):
+    with pytest.raises(AllKeysExhausted, match="free tier"):
         pool.acquire()
     state.upsert_chunks(
         [
@@ -328,17 +512,21 @@ def test_all_keys_exhausted_leaves_chunks_pending(state: StateManager):
     assert state.get_chunk("abc").status == ChunkStatus.PENDING
 
 
+def _concept_nodes(*labels: str, role: str = "primary") -> list[dict]:
+    return [{"node": label, "type": "concept", "role": role} for label in labels]
+
+
 def test_pydantic_hadith_schema():
     item = HadithExtraction.model_validate(
         {
             "hadith": "الرفق يمن",
             "hadith_fa": "مدارا مبارک است",
             "hadith_en": "Gentleness is blessed",
-            "tags": ["الرفق"],
+            "semantic_nodes": _concept_nodes("الرفق"),
             "ravis": ["زرارة"],
         }
     )
-    assert item.tags == ["الرفق"]
+    assert item.semantic_nodes[0].node == "الرفق"
     page = HadithPageExtraction.model_validate(
         {
             "page": "جلد 1 - صفحه 11",
@@ -348,7 +536,7 @@ def test_pydantic_hadith_schema():
                     "hadith": "أ",
                     "hadith_fa": "آ",
                     "hadith_en": "a",
-                    "tags": [],
+                    "semantic_nodes": [],
                     "ravis": [],
                 },
                 {
@@ -356,7 +544,7 @@ def test_pydantic_hadith_schema():
                     "hadith": "ب",
                     "hadith_fa": "ب",
                     "hadith_en": "b",
-                    "tags": ["العقل"],
+                    "semantic_nodes": _concept_nodes("العقل"),
                     "ravis": ["زرارة"],
                 },
             ],
@@ -381,7 +569,7 @@ def test_process_unit_writes_page_hadiths_array(tmp_path: Path, state: StateMana
                         "hadith": "حديث ثلاثة",
                         "hadith_fa": "سه",
                         "hadith_en": "three",
-                        "tags": ["العقل"],
+                        "semantic_nodes": _concept_nodes("العقل", "العبادة"),
                         "ravis": ["علي بن إبراهيم"],
                     },
                     {
@@ -389,7 +577,7 @@ def test_process_unit_writes_page_hadiths_array(tmp_path: Path, state: StateMana
                         "hadith": "حديث أربعة",
                         "hadith_fa": "چهار",
                         "hadith_en": "four",
-                        "tags": ["العلم"],
+                        "semantic_nodes": _concept_nodes("الجهل", "العبادة"),
                         "ravis": ["محمد بن يحيى"],
                     },
                 ],
@@ -397,7 +585,12 @@ def test_process_unit_writes_page_hadiths_array(tmp_path: Path, state: StateMana
             ensure_ascii=False,
         )
 
-    agent = GeminiAgent(state, key_pool=KeyPool(state, keys=["test-key"]), generate_fn=fake_generate)
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0),
+        key_pool=KeyPool(state, keys=["test-key"]),
+        generate_fn=fake_generate,
+    )
     unit = ParsedUnit(
         "جلد 1 - صفحه 11",
         "3 - حديث ثلاثة بما يكفي من الحروف.\n4 - حديث أربعة بما يكفي من الحروف.",
@@ -465,26 +658,390 @@ def test_cosine_keeps_pairs_above_half():
     assert cosine_similarity(vectors[0], vectors[2]) < 0.5
 
 
+def test_gate_rejects_real_bad_nodes():
+    # Whole clauses and two-idea labels are dropped outright.
+    assert resolve_node("العقل مناط التكليف والجزاء", "concept") is None
+    assert resolve_node("فضيلة العقل على العبادة", "concept") is None
+    assert resolve_node("الشيطنة والنكراء", "concept") is None
+    # A short variant of a known topic is repaired onto it rather than dropped:
+    # the output is always a vocabulary term, so it cannot fragment the graph.
+    assert resolve_node("حقيقة العقل", "concept") == "العقل"
+    assert resolve_node("ارتباط الثواب بالعقل", "concept") == "الثواب"
+
+
+def test_gate_keeps_and_canonicalizes_good_nodes():
+    assert resolve_node("الشيطنة", "concept") == "النكراء"
+    assert resolve_node("قتل النفس", "concept") == "الانتحار"
+    assert resolve_node("العقل", "concept") == "العقل"
+    assert resolve_node("أبو عبد الله", "person") == "الإمام الصادق"
+    assert resolve_node("أبو الحسن", "person") == "أبو الحسن"
+    assert resolve_node("59:2", "ayah") == "59:2"
+    assert resolve_node("أولي الأبصار", "ayah") is None
+
+
+def test_parent_concepts_are_bucket_eligible_again():
+    assert bucket_eligible("concept", "secondary") is True
+    for label in ("الصبر", "التقية", "الإيمان", "الموت"):
+        assert resolve_node(label, "concept") == label
+
+
+def test_person_secondary_excluded_from_buckets_but_kept_in_graph():
+    assert bucket_eligible("person", "secondary") is False
+    assert bucket_eligible("person", "primary") is True
+    assert bucket_eligible("ayah", "primary") is False
+
+
+def test_normalization_folds_harakat_honorifics_and_kunya_case():
+    # All four print the same man; only the last matches the gazetteer verbatim.
+    forms = ["أَبُو عَبْدِ اللَّهِ (ع)", "أبي عبد الله", "أبا عبد الله", "أبو عبد الله عليه السلام"]
+    assert {normalize_ar(f) for f in forms} == {normalize_ar("أبو عبد الله")}
+    for form in forms:
+        assert resolve_node(form, "person") == "الإمام الصادق"
+    # Superscript alef is a letter, not a mark: deleting it breaks Qur'anic spellings.
+    assert normalize_ar("ٱلْأَبْصَٰرِ") == normalize_ar("الأبصار")
+
+
+def test_narrator_is_dropped_but_the_matn_subject_survives():
+    """Verbatim hadith 3: the Imam asked is a narrator, معاوية is the topic."""
+    nodes = [
+        {"node": "العقل", "type": "concept", "role": "primary"},
+        {"node": "معاوية", "type": "person", "role": "primary"},
+        {"node": "أبي عبد الله", "type": "person", "role": "secondary"},
+        {"node": "النكراء", "type": "concept", "role": "secondary"},
+    ]
+    ravis = ["أَحْمَدُ بْنُ إِدْرِيسَ", "بَعْضُ أَصْحَابِنَا", "أَبُو عَبْدِ اللَّهِ (ع)"]
+    out = enforce_node_policy(nodes, ravis)
+    labels = {n["node"] for n in out}
+    assert "الإمام الصادق" not in labels and "أبي عبد الله" not in labels
+    assert "معاوية" in labels
+    # النكراء is what the matn defines, so it takes the primary slot.
+    roles = {n["node"]: n["role"] for n in out}
+    assert roles["النكراء"] == "primary"
+    assert roles["معاوية"] == "secondary"
+
+
+def test_participants_absent_from_the_isnad_are_kept_as_nodes():
+    """Hadith 2: آدم and جبرئيل are in the story, not in the chain.
+
+    They stay in the graph. They do not stay primary: primary slots decide
+    bucketing, and a person node buckets nothing useful while الحياء groups
+    every hadith on modesty across the corpus.
+    """
+    nodes = [
+        {"node": "العقل", "type": "concept", "role": "primary"},
+        {"node": "الحياء", "type": "concept", "role": "secondary"},
+        {"node": "آدم", "type": "person", "role": "primary"},
+        {"node": "جبرئيل", "type": "person", "role": "secondary"},
+    ]
+    out = enforce_node_policy(nodes, ["عَلِيُّ بْنُ مُحَمَّدٍ", "سَهْلُ بْنُ زِيَادٍ", "عَلِيٌّ"])
+    roles = {n["node"]: n["role"] for n in out}
+    assert set(roles) == {"العقل", "الحياء", "آدم", "جبرئيل"}
+    assert roles["العقل"] == "primary"
+    assert roles["الحياء"] == "primary"
+    assert roles["آدم"] == "secondary"
+
+
+def test_book_classification_is_inherited_by_every_page():
+    """Kulayni's own kitab/bab headings, read straight off the page."""
+    pages = [
+        ParsedUnit("ص 9", "خطبة المؤلف بلا عنوان هنا " * 3, "al-kafi-1.txt"),
+        ParsedUnit("ص 10", "كِتَابُ الْعَقْلِ وَ الْجَهْلِ\n\n1- أَخْبَرَنَا أَبُو جَعْفَرٍ قَالَ خَلَقَ اللَّهُ الْعَقْلَ.", "al-kafi-1.txt"),
+        ParsedUnit("ص 11", "2- عَلِيُّ بْنُ مُحَمَّدٍ عَنْ سَهْلٍ قَالَ هَبَطَ جَبْرَئِيلُ عَلَى آدَمَ.", "al-kafi-1.txt"),
+        ParsedUnit("ص 12", "بَابُ طِينَةِ\n\nالْمُؤْمِنِ وَ الْكَافِرِ\n\n3 - مُحَمَّدُ بْنُ يَحْيَى عَنْ أَحْمَدَ قَالَ.", "al-kafi-1.txt"),
+    ]
+    tagged = attach_sections(pages)
+    assert tagged[0].kitab == ""
+    assert tagged[1].kitab == "كِتَابُ الْعَقْلِ وَ الْجَهْلِ"
+    # A heading governs every later page until the next one, so hadith 2
+    # inherits it without the heading being reprinted.
+    assert tagged[2].kitab == "كِتَابُ الْعَقْلِ وَ الْجَهْلِ"
+    # Wrapped title reassembled from the line the typesetter split it onto.
+    assert tagged[3].bab == "بَابُ طِينَةِ الْمُؤْمِنِ وَ الْكَافِرِ"
+
+
+def test_prose_beginning_with_kitab_is_not_a_heading():
+    page = "كتاب الحجّة و إن لم نكمّله على استحقاقه، لأنّا كرهنا أن نبخس حظوظه كلّها."
+    assert page_headings(page) == []
+
+
+def test_miscellany_bab_is_not_a_bucket_key():
+    """Every volume has a بَابُ النَّوَادِرِ and they share no subject."""
+    assert section_nodes("كِتَابُ الْعَقْلِ", "بَابُ النَّوَادِرِ") == [
+        {"node": "كِتَابُ الْعَقْلِ", "type": "kitab"}
+    ]
+
+
+def test_vocabulary_is_closed_for_concepts_and_groups():
+    """The model can only choose; it cannot invent a concept or a group."""
+    assert resolve_node("اجتهاد المجتهدين", "concept") is None
+    assert resolve_node("عتاب الله", "concept") is None
+    assert resolve_node("أولي الأبصار", "group") is None
+    assert resolve_node("العقل", "concept") == "العقل"
+    assert resolve_node("بني إسرائيل", "group") == "بنو إسرائيل"
+    # person stays open: named individuals cannot be enumerated up front.
+    assert resolve_node("سلمان الفارسي", "person") == "سلمان الفارسي"
+    # Non-hadith pipelines keep their free-text concepts until they have a
+    # proposals channel of their own.
+    assert resolve_node("الحمد", "concept", strict=False) == "الحمد"
+
+
+def test_frequency_decides_which_proposals_become_terms():
+    """The whole point: measured df, not a hand-written rule.
+
+    خلق العقل and عقل المرء are indistinguishable as strings -- both are a noun
+    plus a genitive. Only the corpus separates them.
+    """
+    payloads = [
+        {"marker": "1", "locator": "p10", "proposed_nodes": ["خلق العقل", "عقل المرء"]},
+        {"marker": "14", "locator": "p14", "proposed_nodes": ["خلق العقل"]},
+        {"marker": "20", "locator": "p16", "proposed_nodes": ["اجتهاد المجتهدين"]},
+    ]
+    plan = build_plan(collect(payloads))
+    assert [p.term for p in plan.promote] == ["خلق العقل"]
+    assert repair_map(plan) == {"عقل المرء": "العقل"}
+    assert [p.term for p in plan.drop] == ["اجتهاد المجتهدين"]
+
+
+def test_promotion_appends_parseable_yaml_and_keeps_comments(tmp_path: Path):
+    catalog = tmp_path / "base_ontology.yaml"
+    catalog.write_text(
+        "concepts:\n  # a comment worth keeping\n  - {id: العقل, pref: العقل}\n",
+        encoding="utf-8",
+    )
+    payloads = [
+        {"marker": str(i), "locator": "p", "proposed_nodes": ["خلق العقل"]}
+        for i in range(3)
+    ]
+    plan = build_plan(collect(payloads))
+    assert apply_promotions(plan, catalog_path=catalog) == 1
+    text = catalog.read_text(encoding="utf-8")
+    assert "a comment worth keeping" in text
+    import yaml as _yaml
+
+    parsed = _yaml.safe_load(text)
+    assert {c["pref"] for c in parsed["concepts"]} == {"العقل", "خلق العقل"}
+
+
+def test_already_catalogued_terms_are_not_proposals():
+    payloads = [{"marker": "1", "locator": "p", "proposed_nodes": ["العقل", "الصبر"]}]
+    assert collect(payloads) == {}
+
+
+def test_qualified_compounds_reduce_to_the_shared_concept():
+    """Verbatim labels from a real run. Each was its own df=1 node.
+
+    Repair, not invention: every output here is already a vocabulary term.
+    """
+    assert resolve_node("عقل المرء", "concept") == "العقل"
+    assert resolve_node("جهل المرء", "concept") == "الجهل"
+    assert resolve_node("حساب العباد", "concept") == "الحساب"
+    assert resolve_node("كمال العقل", "concept") == "العقل"
+    assert resolve_node("قدر العقول", "concept") == "العقل"
+
+
+def test_unreducible_compounds_are_dropped_not_stored():
+    """Nothing else in the corpus will ever carry these, so they are noise."""
+    for label in ("اجتهاد المجتهدين", "عتاب الله", "التكليف الإلهي", "فرائض الله"):
+        assert resolve_node(label, "concept") is None
+    # A Qur'anic phrase the model retyped as a group to dodge the ayah ban.
+    assert resolve_node("أولي الأبصار", "group") is None
+    assert resolve_node("أولو الألباب", "concept") is None
+    # A gazetteer group still passes.
+    assert resolve_node("بني إسرائيل", "group") == "بنو إسرائيل"
+
+
+def test_reduction_never_rescues_a_two_idea_label():
+    # النكراء is a catalog concept, so reduction would happily keep it and
+    # silently discard الشيطنة. The و-check has to win first.
+    assert resolve_node("الشيطنة والنكراء", "concept") is None
+    assert resolve_node("العقل والجهل", "concept") is None
+
+
+def test_named_being_emitted_as_a_concept_is_retyped_and_demoted():
+    """Hadith 10: الشيطان held a primary concept slot; وسواس is the topic."""
+    out = enforce_node_policy(
+        [
+            {"node": "العقل", "type": "concept", "role": "primary"},
+            {"node": "الشيطان", "type": "concept", "role": "primary"},
+            {"node": "الوسواس", "type": "concept", "role": "secondary"},
+        ]
+    )
+    by_node = {n["node"]: n for n in out}
+    assert by_node["الشيطان"]["type"] == "person"
+    assert by_node["الشيطان"]["role"] == "secondary"
+    assert by_node["الوسواس"]["role"] == "primary"
+    # person/secondary is not a bucket key, so Satan stops joining every
+    # hadith that mentions him into one cluster.
+    assert bucket_eligible("person", "secondary") is False
+
+
+def test_over_marked_primaries_do_not_demote_the_curated_concept():
+    """The model marking everything primary must not hand the slot to list order.
+
+    Promote-then-truncate had this hole: with no secondaries to promote from,
+    the overflow cut kept the first two in emission order and demoted النكراء.
+    """
+    out = enforce_node_policy(
+        [
+            {"node": "معاوية", "type": "person", "role": "primary"},
+            {"node": "العقل", "type": "concept", "role": "primary"},
+            {"node": "النكراء", "type": "concept", "role": "primary"},
+        ],
+        ["أَحْمَدُ بْنُ إِدْرِيسَ", "أَبُو عَبْدِ اللَّهِ (ع)"],
+    )
+    roles = {n["node"]: n["role"] for n in out}
+    assert roles == {"معاوية": "secondary", "العقل": "primary", "النكراء": "primary"}
+
+
+def test_entity_holds_primary_only_when_no_concept_survives():
+    out = enforce_node_policy(
+        [
+            {"node": "معاوية", "type": "person", "role": "primary"},
+            {"node": "بني إسرائيل", "type": "group", "role": "secondary"},
+        ]
+    )
+    roles = {n["node"]: n["role"] for n in out}
+    assert roles["معاوية"] == "primary"
+    # A secondary entity is never promoted into a primary slot.
+    assert roles["بنو إسرائيل"] == "secondary"
+
+
+def test_repaired_and_dropped_terms_reach_the_proposals_channel():
+    """Promotion must not depend on the model choosing the right field.
+
+    خلق العقل written into semantic_nodes still repairs to العقل so the graph
+    stays connected, but the original has to survive as a proposal or it can
+    never accumulate the df that would promote it.
+    """
+    payload = remap_hadith_payload(
+        {
+            "hadiths": [
+                {
+                    "hadith": "x",
+                    "ravis": [],
+                    "semantic_nodes": [
+                        {"node": "خلق العقل", "type": "concept", "role": "primary"},
+                        {"node": "اجتهاد المجتهدين", "type": "concept", "role": "secondary"},
+                        {"node": "العقل", "type": "concept", "role": "secondary"},
+                    ],
+                }
+            ]
+        }
+    )
+    row = payload["hadiths"][0]
+    assert [n["node"] for n in row["semantic_nodes"]] == ["العقل"]
+    assert set(row["proposed_nodes"]) == {"خلق العقل", "اجتهاد المجتهدين"}
+
+
+def test_open_types_still_reject_descriptive_heads():
+    """The closed vocabulary covers concepts; person/place stay open and need this."""
+    assert resolve_node("فضيلة محمد", "person") is None
+    assert resolve_node("أهمية كربلاء", "place") is None
+    assert resolve_node("سلمان الفارسي", "person") == "سلمان الفارسي"
+
+
+def test_kitab_is_a_graph_edge_not_a_comparison_bucket():
+    """A kitab spans hundreds of narrations; pairwise comparison there is noise."""
+    base = _hadith_chunk("h1", "hadith", ["العقل"])
+    payload = json.loads(base.payload_json)
+    payload["hadiths"][0]["kitab"] = "كِتَابُ الْعَقْلِ وَ الْجَهْلِ"
+    payload["hadiths"][0]["bab"] = "بَابُ صِفَةِ الْعِلْمِ"
+    chunk = replace(base, payload_json=json.dumps(payload, ensure_ascii=False))
+    keys = bucket_keys_for_chunk(chunk)
+    assert "بَابُ صِفَةِ الْعِلْمِ" in keys
+    assert "كِتَابُ الْعَقْلِ وَ الْجَهْلِ" not in keys
+    # Both still reach the exported graph.
+    assert {n["type"] for n in section_nodes_for_chunk(chunk)} == {"kitab", "bab"}
+
+
+def test_curated_concept_takes_a_free_primary_slot():
+    """Hadith 3 re-run: معاوية arrived secondary, so there was nothing to trade."""
+    out = enforce_node_policy(
+        [
+            {"node": "العقل", "type": "concept", "role": "primary"},
+            {"node": "معاوية", "type": "person", "role": "secondary"},
+            {"node": "النكراء", "type": "concept", "role": "secondary"},
+        ],
+        ["أَحْمَدُ بْنُ إِدْرِيسَ", "أَبُو عَبْدِ اللَّهِ (ع)"],
+    )
+    roles = {n["node"]: n["role"] for n in out}
+    assert roles["النكراء"] == "primary"
+    assert roles["معاوية"] == "secondary"
+
+
+def test_generic_node_is_rejected_but_its_qualified_form_is_not():
+    assert resolve_node("محبة", "concept") is None
+    assert resolve_node("الأمر", "concept") is None
+    assert resolve_node("محبة أهل البيت", "concept") == "محبة أهل البيت"
+    assert resolve_node("الأمر بالمعروف", "concept") == "الأمر بالمعروف"
+
+
+def test_catalog_curated_label_is_retyped_to_concept():
+    """place:الجنة and event:يوم القيامة could never merge with their twins."""
+    out = enforce_node_policy(
+        [
+            {"node": "الجنة", "type": "place", "role": "secondary"},
+            {"node": "يوم القيامة", "type": "event", "role": "secondary"},
+        ]
+    )
+    assert [(n["node"], n["type"]) for n in out] == [
+        ("الجنة", "concept"),
+        ("القيامة", "concept"),
+    ]
+
+
+def test_policy_caps_primary_and_total():
+    vocab = ["الصبر", "التقوى", "الإيمان", "الكفر", "الموت", "القبر", "الدعاء", "التوبة"]
+    nodes = [{"node": label, "type": "concept", "role": "primary"} for label in vocab]
+    out = enforce_node_policy(nodes)
+    assert len(out) <= 6
+    assert sum(1 for n in out if n["role"] == "primary") == 2
+
+
 def test_canonicalize_alias_and_parent_not_grouping():
-    assert canonicalize_tag("قتل النفس") == "الانتحار"
-    assert canonicalize_tag("عذاب القبر") == "عذاب البرزخ"
-    assert is_grouping_label("الانتحار") is True
-    assert is_grouping_label("المعاد") is False
-    assert is_grouping_label("الإيمان") is False
-    old = remap_hadith_payload({"hadiths": [{"hadith": "x", "tags": ["الإيمان"]}]})
-    assert old["hadiths"][0]["tags"] == ["الإيمان"]
+    assert canonicalize_concept("قتل النفس") == "الانتحار"
+    assert canonicalize_concept("عذاب القبر") == "عذاب البرزخ"
+    old = remap_hadith_payload({"hadiths": [{"hadith": "x", "concept_nodes": ["الإيمان"]}]})
+    assert old["hadiths"][0]["semantic_nodes"][0]["node"] == "الإيمان"
+    assert "concept_nodes" not in old["hadiths"][0]
 
 
-def test_hadith_tag_prompt_is_claim_grain():
+def test_hadith_prompt_asks_for_mentions_not_nodes():
     text = system_prompt("hadith")
     assert "at most one extra tag" not in text
     assert "Base Ontology" not in text
-    assert "الانتحار" in text
-    assert "عذاب البرزخ" in text
-    assert "kitāb" in text.lower() or "kitab" in text.lower() or "bāb" in text or "باب" in text
+    # The contract is observations, resolved corpus-wide afterwards.
+    assert "WHAT A MENTION IS" in text
+    assert "salience" in text
+    assert "evidence" in text
+    # No vocabulary is imposed and none is listed.
+    assert "VOCABULARY" not in text
+    assert "CHOOSE, DO NOT INVENT" not in text
+    # Citations are still resolved against the mushaf, never asked for.
+    assert "verse number" in text
+    assert "59:2" not in text
+    assert "39:9" not in text
+    # The rules that kept being broken are stated as principles.
+    assert "معاوية" in text
+    assert "NARRATORS ARE NOT MENTIONS" in text
+    assert "WHAT IS ASSERTED" in text
+    extra = hadith_system_extra("3 - متن\n\n4 - متن آخر طويل بما يكفي للعد.")
+    assert "SEPARATE claim" in extra
 
 
-def _hadith_chunk(cid: str, book: str, tags: list[str]) -> ChunkRecord:
+def test_schema_forbids_the_model_from_inventing_an_ayah_node():
+    with pytest.raises(ValidationError):
+        HadithExtraction.model_validate(
+            {
+                "hadith": "متن",
+                "hadith_fa": "فا",
+                "hadith_en": "en",
+                "semantic_nodes": [{"node": "39:9", "type": "ayah", "role": "secondary"}],
+            }
+        )
+
+
+def _hadith_chunk(cid: str, book: str, nodes: list[str]) -> ChunkRecord:
     payload = {
         "page": "p",
         "hadiths": [
@@ -493,7 +1050,7 @@ def _hadith_chunk(cid: str, book: str, tags: list[str]) -> ChunkRecord:
                 "hadith": "متن",
                 "hadith_fa": "متن",
                 "hadith_en": "text",
-                "tags": tags,
+                "semantic_nodes": _concept_nodes(*nodes),
                 "ravis": [],
             }
         ],
@@ -510,38 +1067,59 @@ def _hadith_chunk(cid: str, book: str, tags: list[str]) -> ChunkRecord:
     )
 
 
-def test_tag_buckets_cross_book_and_keep_singleton():
+def test_concept_buckets_cross_book_and_keep_singleton():
     chunks = [
         _hadith_chunk("a", "hadith", ["الانتحار", "عذاب البرزخ"]),
         _hadith_chunk("b", "vasael-o-shia", ["قتل النفس"]),
-        _hadith_chunk("c", "hadith", ["موضوع فريد"]),
+        _hadith_chunk("c", "hadith", ["الزهد"]),
         _hadith_chunk("d", "hadith", ["الإيمان", "المعاد"]),
     ]
-    buckets = build_tag_buckets(chunks)
+    buckets = build_concept_buckets(chunks)
     assert set(buckets["الانتحار"]) == {"a", "b"}
-    assert "c" in buckets["موضوع فريد"]
-    assert "الإيمان" not in buckets
-    assert "المعاد" not in buckets
-    assert concepts_for_chunk(chunks[3]) == []
+    assert "c" in buckets["الزهد"]
+    assert set(buckets["الإيمان"]) == {"d"}
+    assert "الإيمان" in bucket_keys_for_chunk(chunks[3])
+    # "a" carries عذاب البرزخ, whose parent is المعاد, so it joins d's bucket
+    # without either chunk having emitted المعاد as a node.
+    assert set(buckets["المعاد"]) == {"a", "d"}
+    assert "المعاد" in bucket_keys_for_chunk(chunks[0])
+    assert "عذاب البرزخ" in bucket_keys_for_chunk(chunks[0])
+
+
+def test_recompense_siblings_share_one_bucket_but_stay_distinct_nodes():
+    """Hadiths 7, 8 and 9 name الحساب / الثواب / الجزاء and share no node."""
+    chunks = [
+        _hadith_chunk("h7", "hadith", ["الحساب"]),
+        _hadith_chunk("h8", "hadith", ["الثواب"]),
+        _hadith_chunk("h9", "hadith", ["الجزاء"]),
+    ]
+    buckets = build_concept_buckets(chunks)
+    assert set(buckets["الجزاء الأخروي"]) == {"h7", "h8", "h9"}
+    # Still three separate nodes -- reckoning is not reward.
+    assert set(buckets["الحساب"]) == {"h7"}
+    assert set(buckets["الثواب"]) == {"h8"}
+    assert set(buckets["الجزاء"]) == {"h9"}
+    # الحساب keeps its second parent as well as the new one.
+    assert set(broader_chain("الحساب")) >= {"الجزاء الأخروي", "القيامة", "المعاد"}
 
 
 def test_extreme_df_skipped_on_large_set_only():
     popular = [_hadith_chunk(f"p{i}", "hadith", ["الانتحار"]) for i in range(8)]
-    rare = [_hadith_chunk("r0", "hadith", ["موضوع فريد"])]
+    rare = [_hadith_chunk("r0", "hadith", ["الزهد"])]
     hesab = [_hadith_chunk(f"h{i}", "hadith", ["الحساب"]) for i in range(2)]
     other = [_hadith_chunk(f"z{i}", "hadith", [f"موضوع-{i}"]) for i in range(10)]
-    buckets = build_tag_buckets(
+    buckets = build_concept_buckets(
         popular + rare + hesab + other, max_df_ratio=0.15, min_chunks_for_df=20
     )
     assert "الانتحار" not in buckets
-    assert "موضوع فريد" in buckets
+    assert "الزهد" in buckets
     assert "الحساب" in buckets
 
 
-def test_remap_existing_tags_without_gemini(tmp_path: Path, state: StateManager):
+def test_remap_existing_concepts_without_gemini(tmp_path: Path, state: StateManager):
     payload = {
         "page": "جلد 1 - صفحه 1",
-        "hadiths": [{"hadith": "x", "hadith_fa": "x", "hadith_en": "x", "tags": ["قتل النفس"], "ravis": []}],
+        "hadiths": [{"hadith": "x", "hadith_fa": "x", "hadith_en": "x", "concept_nodes": ["قتل النفس"], "ravis": []}],
     }
     cid = "chunk-remap-1"
     state.upsert_chunks(
@@ -562,15 +1140,15 @@ def test_remap_existing_tags_without_gemini(tmp_path: Path, state: StateManager)
     dest.mkdir(parents=True)
     path = dest / phase1_filename(str(tmp_path / "al-kafi-1.txt"), "جلد 1 - صفحه 1", cid)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    n = remap_existing_hadith_tags(state, output_dir=out)
+    n = remap_existing_semantic_nodes(state, output_dir=out)
     assert n == 1
     stored = state.get_chunk(cid).payload()
-    assert stored["hadiths"][0]["tags"] == ["الانتحار"]
+    assert stored["hadiths"][0]["semantic_nodes"][0]["node"] == "الانتحار"
     written = json.loads(path.read_text(encoding="utf-8"))
-    assert written["hadiths"][0]["tags"] == ["الانتحار"]
+    assert written["hadiths"][0]["semantic_nodes"][0]["node"] == "الانتحار"
 
 
-def test_process_unit_canonicalizes_alias_tags(tmp_path: Path, state: StateManager):
+def test_process_unit_canonicalizes_alias_concept_nodes(tmp_path: Path, state: StateManager):
     def fake_generate(*, key, prompt, system, model, schema):
         return json.dumps(
             {
@@ -581,7 +1159,10 @@ def test_process_unit_canonicalizes_alias_tags(tmp_path: Path, state: StateManag
                         "hadith": "حديث ثلاثة بما يكفي",
                         "hadith_fa": "سه",
                         "hadith_en": "three",
-                        "tags": ["قتل النفس", "عذاب القبر"],
+                        "semantic_nodes": [
+                            {"node": "قتل النفس", "type": "concept", "role": "primary"},
+                            {"node": "عذاب القبر", "type": "concept", "role": "secondary"},
+                        ],
                         "ravis": [],
                     }
                 ],
@@ -589,7 +1170,12 @@ def test_process_unit_canonicalizes_alias_tags(tmp_path: Path, state: StateManag
             ensure_ascii=False,
         )
 
-    agent = GeminiAgent(state, key_pool=KeyPool(state, keys=["test-key"]), generate_fn=fake_generate)
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0),
+        key_pool=KeyPool(state, keys=["test-key"]),
+        generate_fn=fake_generate,
+    )
     unit = ParsedUnit(
         "جلد 1 - صفحه 11",
         "3 - حديث ثلاثة بما يكفي من الحروف للتجاوز.",
@@ -606,7 +1192,7 @@ def test_process_unit_canonicalizes_alias_tags(tmp_path: Path, state: StateManag
     )
     written = tmp_path / "phase1" / "hadith" / phase1_filename(unit.source_path, unit.locator, "x")
     data = json.loads(written.read_text(encoding="utf-8"))
-    assert data["hadiths"][0]["tags"] == ["الانتحار", "عذاب البرزخ"]
+    assert [n["node"] for n in data["hadiths"][0]["semantic_nodes"]] == ["الانتحار", "عذاب البرزخ"]
 
 
 def test_structured_output_retries_truncated_json(state: StateManager):
@@ -621,13 +1207,13 @@ def test_structured_output_retries_truncated_json(state: StateManager):
                 "hadith": "x",
                 "hadith_fa": "ی",
                 "hadith_en": "x",
-                "tags": [],
+                "concept_nodes": [],
                 "ravis": [],
             },
             ensure_ascii=False,
         )
 
-    settings = Settings(gemini_max_attempts=3, google_api_keys=["k"])
+    settings = Settings(gemini_max_attempts=3, google_api_keys=["k"], gemini_min_interval_ms=0)
     agent = GeminiAgent(
         state,
         settings=settings,
@@ -657,7 +1243,9 @@ def test_run_phase1_records_truncated_page_error(
     def fake_generate(*, key, prompt, system, model, schema):
         return '{"page": "p", "hadiths": [{"hadith": "cut'
 
-    settings = Settings(gemini_max_attempts=2, google_api_keys=["k"], skip_min_chars=10)
+    settings = Settings(
+        gemini_max_attempts=2, google_api_keys=["k"], skip_min_chars=10, gemini_min_interval_ms=0
+    )
     agent = GeminiAgent(
         state,
         settings=settings,
@@ -700,7 +1288,12 @@ def test_hadith_limit_and_json_error_do_not_open_next_volume(
 
     def fake_generate(*, key, prompt, system, model, schema):
         if schema is HadithUnify:
-            return json.dumps({"tags": [], "ravis": []})
+            return json.dumps(
+                {
+                    "semantic_nodes": _concept_nodes("العقل", "الجنة"),
+                    "ravis": ["هشام"],
+                }
+            )
         page_calls.append(prompt.split("Locator:", 1)[-1][:80])
         marker = "10 -"
         for n in range(10, 16):
@@ -716,7 +1309,7 @@ def test_hadith_limit_and_json_error_do_not_open_next_volume(
                         "hadith": long,
                         "hadith_fa": "ی",
                         "hadith_en": "x",
-                        "tags": [],
+                        "semantic_nodes": _concept_nodes("العقل", "الجنة"),
                         "ravis": [],
                     }
                 ],
@@ -724,7 +1317,9 @@ def test_hadith_limit_and_json_error_do_not_open_next_volume(
             ensure_ascii=False,
         )
 
-    settings = Settings(gemini_max_attempts=2, google_api_keys=["k"], skip_min_chars=10)
+    settings = Settings(
+        gemini_max_attempts=2, google_api_keys=["k"], skip_min_chars=10, gemini_min_interval_ms=0
+    )
     agent = GeminiAgent(
         state,
         settings=settings,
@@ -794,6 +1389,135 @@ def test_strip_folklib_footnotes_drops_editor_notes_keeps_matn():
     assert "سَهَرِ الْجَاهِلِ" in flushed[0]["hadith"]
 
 
+def test_strip_folklib_bottom_notes_do_not_leak_into_hadith_eight():
+    page11 = """8- عَلِيُّ
+بْنُ مُحَمَّدِ بْنِ عَبْدِ اللَّهِ‌ [6] عَنْ
+إِبْرَاهِيمَ بْنِ إِسْحَاقَ الْأَحْمَرِ عَنْ مُحَمَّدِ بْنِ‌
+
+[1] الشأن بالهمزة: الامر و الحال أي الزما شأنكما أو شأنكما
+معكما و يحتمل أن يكون الإشارة تمثيلية و ان اللّه تعالى خلق صورة مناسبة لكل واحد
+منها و بعثها مع جبرئيل عليه السلام( آت)
+
+[6] الظاهر أنّه ابن بندار او عليّ بن محمّد بن عبد اللّه
+القمّيّ كما أن الظاهر اتّحاد الرجلين. و قال الفيض- رحمه اللّه- كانه ابن أذينة
+الذي هو من مشايخ الكليني و يحتمل ابن عمران البرقي.
+"""
+    page12 = """سُلَيْمَانَ الدَّيْلَمِيِّ عَنْ أَبِيهِ
+قَالَ: قُلْتُ لِأَبِي عَبْدِ اللَّهِ ع فُلَانٌ مِنْ عِبَادَتِهِ.
+
+9 - عَلِيُّ بْنُ إِبْرَاهِيمَ عَنْ أَبِيهِ قَالَ قَالَ رَسُولُ اللَّهِ ص‌ إِذَا بَلَغَكُمْ.
+"""
+    clean11 = strip_folklib_footnotes(page11)
+    assert "يحتمل" not in clean11
+    assert "تمثيلية" not in clean11
+    assert "القمّيّ" not in clean11
+    assert "( آت)" not in clean11
+    assert "إِبْرَاهِيمَ" in clean11
+    flushed, buf = consume_page("جلد 1 - صفحه 11", clean11, [], None, page12)
+    assert [r["marker"] for r in flushed] == []
+    assert buf is not None and buf.marker.startswith("8")
+    flushed2, buf = consume_page("جلد 1 - صفحه 12", page12, [], buf, None)
+    assert any(r["marker"].startswith("8") for r in flushed2)
+    eight = next(r for r in flushed2 if r["marker"].startswith("8"))
+    assert "يحتمل" not in eight["hadith"]
+    assert "سُلَيْمَانَ" in eight["hadith"] or "سليمان" in eight["hadith"]
+
+
+def test_footnote_refs_parse_every_format_this_edition_prints():
+    assert parse_footnote_ref("البقرة: 269 و فيها « وَ ما يَذَّكَّرُ") == "2:269"
+    assert parse_footnote_ref("الرعد 41.") == "13:41"          # no colon
+    assert parse_footnote_ref("يونس، 39.") == "10:39"          # Arabic comma
+    assert parse_footnote_ref("الحجّ: 12.") == "22:12"          # shadda in the name
+    assert parse_footnote_ref("الصافّات: 138.") == "37:138"
+    assert parse_footnote_ref("ص: 28.") == "38:28"             # one-letter sura
+    assert parse_footnote_ref("آل عمران: 7.") == "3:7"         # multi-word
+    assert parse_footnote_ref("المؤمن: 70.") == "40:70"        # classical name for غافر
+    assert parse_footnote_ref("سورة البقرة: 1") == "2:1"
+
+
+def test_footnote_refs_reject_commentary_and_cross_references():
+    # "ص 321" would read as Sad:321 without the verse-count check.
+    assert parse_footnote_ref("قد مر الحديث ص 321 فراجعه") is None
+    assert parse_footnote_ref("و يأتي في ج 5 ص 87 و فيه: عن ابن أبي عمير") is None
+    assert parse_footnote_ref("أي: يجازى على اعماله بقدر عقله") is None
+    assert parse_footnote_ref("") is None
+    # Real sura, impossible ayah.
+    assert parse_footnote_ref("الفاتحة: 99") is None
+
+
+def test_phrase_matcher_finds_unfootnoted_quotations():
+    """Hadith 5 quotes 59:2 with no [n] marker anywhere on the page."""
+    assert match_quran_phrases("إِنَّمَا قَالَ اللَّهُ‌ فَاعْتَبِرُوا يا أُولِي الْأَبْصارِ .") == ["59:2"]
+    # أولوا الألباب closes both 2:269 and 3:7; both loci are real.
+    assert set(match_quran_phrases("وَ مَا يَتَذَكَّرُ إِلَّا أُولُوا الْأَلْبابِ‌")) == {"2:269", "3:7"}
+    # A hadith with no scripture in it must stay empty.
+    assert match_quran_phrases("صَدِيقُ كُلِّ امْرِئٍ عَقْلُهُ وَ عَدُوُّهُ جَهْلُهُ.") == []
+
+
+def test_page_refs_ignore_scripture_quoted_by_the_editor():
+    """Page 12's note [3] quotes Surat al-Nas as commentary, not as a citation.
+
+    The hadith never quotes it, so no CITES edge may be produced.
+    """
+    page = """11 - عِدَّةٌ مِنْ أَصْحَابِنَا عَنْ أَحْمَدَ بْنِ مُحَمَّدٍ رَفَعَهُ قَالَ قَالَ رَسُولُ اللَّهِ ص‌ مَا قَسَمَ اللَّهُ لِلْعِبَادِ شَيْئاً أَفْضَلَ مِنَ الْعَقْلِ.
+
+[3] فهو يعلم ان الوسوسة من عمل الشيطان لما في قوله تعالى‌ « مِنْ
+
+شَرِّ الْوَسْواسِ الْخَنَّاسِ الَّذِي يُوَسْوِسُ فِي صُدُورِ النَّاسِ» و
+
+لكنه لا يتمكن من طرده حين العمل.
+"""
+    assert page_quran_refs(page) == {}
+
+
+def test_page_refs_attribute_a_footnote_to_the_hadith_that_carries_its_marker():
+    page = """5 - قَالَ: قُلْتُ لِأَبِي الْحَسَنِ ع إِنَّ عِنْدَنَا قَوْماً لَهُمْ مَحَبَّةٌ [4] .
+
+6 - أَحْمَدُ بْنُ إِدْرِيسَ قَالَ قَالَ أَبُو عَبْدِ اللَّهِ ع‌ مَنْ كَانَ عَاقِلًا كَانَ لَهُ دِينٌ.
+
+[4] البقرة: 269.
+"""
+    refs = page_quran_refs(page)
+    assert refs.get("5 -") == ["2:269"]
+    assert "6 -" not in refs
+
+
+def test_footnote_quoting_vocalized_quran_does_not_reopen_the_matn():
+    """Verbatim page 12 of al-Kafi 1: note [3] quotes Surat al-Nas.
+
+    The quoted verse carries 27 harakat, which used to satisfy the
+    "matn resumed" heuristic and let both the rest of the verse and the
+    editor's next sentence leak into hadith 11.
+    """
+    page = """11 - عِدَّةٌ
+مِنْ أَصْحَابِنَا عَنْ أَحْمَدَ بْنِ مُحَمَّدِ بْنِ خَالِدٍ عَنْ بَعْضِ أَصْحَابِهِ
+رَفَعَهُ قَالَ قَالَ رَسُولُ اللَّهِ ص‌ مَا قَسَمَ اللَّهُ لِلْعِبَادِ
+شَيْئاً أَفْضَلَ مِنَ الْعَقْلِ فَنَوْمُ الْعَاقِلِ‌
+
+[3] فهو يعلم ان الوسوسة من عمل الشيطان لما في قوله تعالى‌ « مِنْ
+شَرِّ الْوَسْواسِ الْخَنَّاسِ الَّذِي يُوَسْوِسُ فِي صُدُورِ النَّاسِ» و
+لكنه لا يتمكن من طرده حين العمل.
+"""
+    clean = strip_folklib_footnotes(page)
+    assert "الْخَنَّاسِ" not in clean
+    assert "طرده" not in clean
+    assert "الوسوسة من عمل الشيطان" not in clean
+    # The hadith itself must survive intact.
+    assert "مَا قَسَمَ اللَّهُ لِلْعِبَادِ" in clean
+    assert "فَنَوْمُ الْعَاقِلِ" in clean
+
+
+def test_unclosed_guillemet_cannot_swallow_the_next_hadith():
+    page = """[2] قال تعالى « إن الله
+لا يظلم الناس شيئا
+
+3 - أَحْمَدُ بْنُ إِدْرِيسَ عَنْ مُحَمَّدِ بْنِ عَبْدِ الْجَبَّارِ قَالَ: قُلْتُ لَهُ مَا الْعَقْلُ.
+"""
+    clean = strip_folklib_footnotes(page)
+    assert "لا يظلم الناس" not in clean
+    assert clean.lstrip().startswith("3 -")
+
+
 def test_accumulator_merges_cross_page_hadiths_and_holds_buffer(state: StateManager):
     p1 = """كتاب العقل
 
@@ -828,10 +1552,17 @@ def test_unify_only_when_multipage(state: StateManager):
 
     def fake_generate(*, key, prompt, system, model, schema):
         calls.append(schema)
-        return json.dumps({"tags": ["العقل"], "ravis": ["هشام بن الحكم"]}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "semantic_nodes": _concept_nodes("العقل", "الجنة"),
+                "ravis": ["هشام بن الحكم"],
+            },
+            ensure_ascii=False,
+        )
 
     agent = GeminiAgent(
         state,
+        settings=Settings(gemini_min_interval_ms=0),
         key_pool=KeyPool(state, keys=["k"]),
         generate_fn=fake_generate,
     )
@@ -843,7 +1574,7 @@ def test_unify_only_when_multipage(state: StateManager):
         "hadith": "متن",
         "hadith_fa": "متن",
         "hadith_en": "text",
-        "tags": ["الجهل"],
+        "semantic_nodes": _concept_nodes("الجهل", "العبادة"),
         "ravis": ["زرارة"],
     }
     out = unify_assembled_hadith(agent, single)
@@ -855,5 +1586,83 @@ def test_unify_only_when_multipage(state: StateManager):
     out = unify_assembled_hadith(agent, multi)
     assert calls == [HadithUnify]
     assert out["ravis"] == ["هشام بن الحكم"]
-    assert "العقل" in out["tags"]
+    assert "الجهل" in [n["node"] for n in out["semantic_nodes"]]
+
+
+def test_unify_fills_hollow_single_page(state: StateManager):
+    def fake_generate(*, key, prompt, system, model, schema):
+        return json.dumps(
+            {
+                "hadith_fa": "فارسی",
+                "hadith_en": "English",
+                "semantic_nodes": _concept_nodes("العقل", "الجنة"),
+                "ravis": ["أحمد بن إدريس"],
+            },
+            ensure_ascii=False,
+        )
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    hollow = {
+        "marker": "3 -",
+        "locator": "جلد 1 - صفحه 11",
+        "page_start": "جلد 1 - صفحه 11",
+        "page_end": "جلد 1 - صفحه 11",
+        "hadith": "3 - أَحْمَدُ بْنُ إِدْرِيسَ",
+        "hadith_fa": "",
+        "hadith_en": "",
+        "semantic_nodes": [],
+        "ravis": [],
+    }
+    out = unify_assembled_hadith(agent, hollow)
+    assert out["hadith_fa"] == "فارسی"
+    assert out["hadith_en"] == "English"
+    assert out["ravis"] == ["أحمد بن إدريس"]
+    assert "العقل" in [n["node"] for n in out["semantic_nodes"]]
+
+
+def test_unify_retries_when_semantic_nodes_empty(state: StateManager):
+    n = {"i": 0}
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        n["i"] += 1
+        if n["i"] == 1:
+            return json.dumps(
+                {"hadith_fa": "ف", "hadith_en": "e", "semantic_nodes": [], "ravis": ["زرارة"]},
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "hadith_fa": "ف",
+                "hadith_en": "e",
+                "semantic_nodes": _concept_nodes("العقل", "الجنة"),
+                "ravis": ["زرارة"],
+            },
+            ensure_ascii=False,
+        )
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0, gemini_max_attempts=4),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    hollow = {
+        "marker": "6 -",
+        "locator": "جلد 1 - صفحه 11",
+        "page_start": "جلد 1 - صفحه 11",
+        "page_end": "جلد 1 - صفحه 11",
+        "hadith": "متن",
+        "hadith_fa": "ف",
+        "hadith_en": "e",
+        "semantic_nodes": [],
+        "ravis": ["زرارة"],
+    }
+    out = unify_assembled_hadith(agent, hollow)
+    assert n["i"] == 2
+    assert [n["node"] for n in out["semantic_nodes"]] == ["العقل", "الجنة"]
 

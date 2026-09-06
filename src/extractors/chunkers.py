@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 
 from src.extractors.epub_parser import ParsedUnit
 from src.extractors.txt_parser import is_ayah_locator
@@ -20,12 +21,21 @@ HADITH_START_RE = re.compile(
 _MIN_HADITH_CHARS = 20
 
 # Folklib editor notes: ASCII [1] at line start. Do not touch Wasa'il "[ ١٥٤٩٥ ]".
-_FOOTNOTE_LINE = re.compile(r"^[ \t]*\[\d{1,3}\]")
+_FOOTNOTE_LINE = re.compile(r"^[ \t]*\[(\d{1,3})\]")
 _INLINE_FOOTNOTE_REF = re.compile(r"\[\d{1,3}\]")
 _HARKAT = re.compile(r"[\u064B-\u0652]")
 _NOTE_CONTINUATION = re.compile(
     r"^(أي|اى|في بعض|مضمون|و السبب|والسبب|أي خروجه|و في بعض)",
 )
+_EDITOR_ASIDE = re.compile(
+    r"(يحتمل|تمثيلية|رحمه الل|رضوان الل|الظاهر أنّ?ه|في بعض النسخ|"
+    r"يعني الرسوخ|المداقة|الشأن بالهمزة|قال الفيض|اتّحاد الرجلين|"
+    r"ابن بندار|\( ?آت\))"
+)
+
+
+def _harakat_count(text: str) -> int:
+    return len(_HARKAT.findall(text or ""))
 
 
 def _looks_like_matn_resume(stripped: str) -> bool:
@@ -35,30 +45,86 @@ def _looks_like_matn_resume(stripped: str) -> bool:
         return True
     if _FOOTNOTE_LINE.match(stripped) or _NOTE_CONTINUATION.match(stripped):
         return False
-    if re.match(r"^[\u0600-\u06FF]", stripped) and _HARKAT.search(stripped):
+    if _EDITOR_ASIDE.search(stripped):
+        return False
+    # One shadda on اللّه is not enough — folklib asides mention Allah constantly.
+    if re.match(r"^[\u0600-\u06FF]", stripped) and _harakat_count(stripped) >= 4:
         return True
     return False
 
 
-def strip_folklib_footnotes(text: str) -> str:
-    """Drop editor footnotes ([1] أي …) and leftover inline [n] markers from matn."""
-    out: list[str] = []
-    in_note = False
+def _drop_editor_aside_lines(text: str) -> str:
+    kept: list[str] = []
     for line in (text or "").splitlines():
         stripped = line.strip()
-        if _FOOTNOTE_LINE.match(line) or _FOOTNOTE_LINE.match(stripped):
+        if stripped and _EDITOR_ASIDE.search(stripped) and _harakat_count(stripped) < 4:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _quote_delta(text: str) -> int:
+    return text.count("«") - text.count("»")
+
+
+def iter_line_roles(text: str) -> Iterator[tuple[str, str, str | None]]:
+    """Yield (line, role, note_number) for every line, role in {"matn", "note"}.
+
+    Single source of truth for where an editor footnote starts and stops. Both
+    the stripper and the Qur'an-reference reader consume this, so they can never
+    disagree about which lines are matn -- a disagreement is exactly how footnote
+    text reached the citation scanner and produced a verse attributed to a
+    hadith that never quoted it.
+
+    Guillemet balance is tracked across a note because the harakat heuristic
+    cannot survive a footnote that quotes vocalized Qur'an. Page 12 of al-Kafi 1
+    has one: note [3] quotes «مِنْ شَرِّ الْوَسْواسِ الْخَنَّاسِ…», whose 27
+    harakat sail past the threshold, so the note was declared finished mid-quote
+    and both the rest of the verse and the editor's following sentence were
+    appended to hadith 11's matn.
+
+    Blank lines never end a note: this corpus double-spaces every line, so a
+    note's own body is always separated from its opening by one.
+    """
+    in_note = False
+    note_number: str | None = None
+    quote_depth = 0
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        opener = _FOOTNOTE_LINE.match(line) or _FOOTNOTE_LINE.match(stripped)
+        if opener:
             in_note = True
+            note_number = opener.group(1)
+            quote_depth = max(0, _quote_delta(stripped))
+            yield line, "note", note_number
             continue
         if in_note:
             if not stripped:
+                yield line, "note", note_number
                 continue
-            if _looks_like_matn_resume(stripped):
+            if HADITH_START_RE.match(stripped):
                 in_note = False
-                out.append(line)
+                note_number = None
+                quote_depth = 0
+                yield line, "matn", None
+                continue
+            if quote_depth <= 0 and _looks_like_matn_resume(stripped):
+                in_note = False
+                note_number = None
+                yield line, "matn", None
+                continue
+            quote_depth = max(0, quote_depth + _quote_delta(stripped))
+            yield line, "note", note_number
             continue
-        out.append(line)
-    joined = "\n".join(out)
+        yield line, "matn", None
+
+
+def strip_folklib_footnotes(text: str) -> str:
+    """Drop editor footnotes ([1] أي …) and leftover inline [n] markers from matn."""
+    out = [line for line, role, _ in iter_line_roles(text) if role == "matn"]
+    joined = _drop_editor_aside_lines("\n".join(out))
     joined = _INLINE_FOOTNOTE_REF.sub("", joined)
+    joined = re.sub(r"\s*\( ?آت\)", "", joined)
     return re.sub(r"\n{3,}", "\n\n", joined).strip()
 
 
@@ -111,22 +177,51 @@ def hadith_units(units: list[ParsedUnit]) -> list[ParsedUnit]:
     """One Gemini unit per printed page. Intro pages before the first numbered
     hadith are skipped; continuation pages after that stay their own units.
     """
+    # Local imports: both modules read HADITH_START_RE / iter_line_roles from
+    # here, so importing them at module scope would be circular.
+    from src.extractors.classification import attach_sections
+    from src.extractors.quran_refs import page_quran_refs
+
+    # Sections are resolved over the unfiltered volume, in reading order: a
+    # heading can sit on a page this function is about to drop, and the bab it
+    # opens still governs every page after it.
+    units = attach_sections(units)
+
     refined: list[ParsedUnit] = []
     started = False
     for unit in units:
-        text = strip_folklib_footnotes(unit.text.strip())
+        raw = unit.text.strip()
+        text = strip_folklib_footnotes(raw)
         if not text or _is_footnote_page(text):
             continue
+        # Read citations off the raw page: this is the only place that still has
+        # both the footnote bodies and the inline [n] markers linking them to a
+        # hadith. `text` has had both deleted.
+        refs = page_quran_refs(raw)
         pieces = split_hadith_page(text)
         if pieces:
             started = True
             refined.append(
-                ParsedUnit(locator=unit.locator, text=text, source_path=unit.source_path)
+                ParsedUnit(
+                    locator=unit.locator,
+                    text=text,
+                    source_path=unit.source_path,
+                    quran_refs=refs,
+                    kitab=unit.kitab,
+                    bab=unit.bab,
+                )
             )
             continue
         if started and len(text) >= _MIN_HADITH_CHARS:
             refined.append(
-                ParsedUnit(locator=unit.locator, text=text, source_path=unit.source_path)
+                ParsedUnit(
+                    locator=unit.locator,
+                    text=text,
+                    source_path=unit.source_path,
+                    quran_refs=refs,
+                    kitab=unit.kitab,
+                    bab=unit.bab,
+                )
             )
     return refined
 

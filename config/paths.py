@@ -12,5 +12,19 @@ OUTPUT_DIR = DATA_DIR / "output"
 STATE_DB_PATH = DATA_DIR / "state.db"
 BOOKS_YAML = CONFIG_DIR / "books.yaml"
 ONTOLOGY_YAML = CONFIG_DIR / "base_ontology.yaml"
+ENTITIES_YAML = CONFIG_DIR / "entities.yaml"
 LOCAL_ENV = PROJECT_ROOT / ".env"
 DEFAULT_RAG_ENV = PROJECT_ROOT.parent / "shiadata-rag" / ".env"
+
+# The 6236-ayah corpus. data/ is gitignored, so the sibling shiadata-rag
+# checkout is the usual source; a local copy wins when present. Absence is not
+# fatal -- footnote-derived citations keep working, only phrase matching stops.
+QURAN_JSON = DATA_DIR / "quran.json"
+RAG_QURAN_JSON = PROJECT_ROOT.parent / "shiadata-rag" / "data" / "quran.json"
+
+
+def quran_corpus_path() -> Path | None:
+    for candidate in (QURAN_JSON, RAG_QURAN_JSON):
+        if candidate.exists():
+            return candidate
+    return None

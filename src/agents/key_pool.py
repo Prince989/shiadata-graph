@@ -12,6 +12,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from config.settings import Settings, get_settings
@@ -50,6 +51,30 @@ def key_id_for(secret: str, index: int) -> str:
     return f"gemini-{index}-{digest}"
 
 
+def _pacific_tz():
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo("America/Los_Angeles")
+    except Exception:  # noqa: BLE001 — Windows may lack tzdata
+        return timezone(timedelta(hours=-7))
+
+
+def pacific_day_start_ms(now_ms: int) -> int:
+    """Unix ms of the most recent midnight in America/Los_Angeles."""
+    local = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(_pacific_tz())
+    start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000)
+
+
+def next_pacific_midnight_ms(now_ms: int) -> int:
+    """Unix ms of the next midnight in America/Los_Angeles (Gemini free-tier RPD reset)."""
+    local = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(_pacific_tz())
+    start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    nxt = start + timedelta(days=1)
+    return int(nxt.timestamp() * 1000)
+
+
 class KeyPool:
     def __init__(
         self,
@@ -81,7 +106,7 @@ class KeyPool:
         n = len(self._keys)
         if n == 0:
             raise AllKeysExhausted("No Gemini API keys configured.")
-        max_wait = int(getattr(self.settings, "key_acquire_wait_max_ms", 120_000))
+        max_wait = int(getattr(self.settings, "key_acquire_wait_max_ms", 300_000))
         deadline = int(time.time() * 1000) + max_wait
         while True:
             now = int(time.time() * 1000)
@@ -91,6 +116,9 @@ class KeyPool:
                 candidate = self._keys[self._rr % n]
                 self._rr += 1
                 if self._is_healthy(candidate.id, now):
+                    stale = self.state.get_cooldown(candidate.id)
+                    if stale:
+                        self.state.clear_cooldown(candidate.id)
                     logger.info(
                         "Using Gemini key %d/%d (%s)",
                         candidate.index + 1,
@@ -118,11 +146,9 @@ class KeyPool:
             return False
         for key in self._keys:
             record = self.state.get_cooldown(key.id)
-            if not record:
+            if not record or record["reason"] != FailureKind.QUOTA_EXHAUSTED.value:
                 return False
-            if record["reason"] != FailureKind.QUOTA_EXHAUSTED.value:
-                return False
-            if int(record["retry_at_ms"]) <= now:
+            if not self._quota_still_locked(record, now):
                 return False
         return True
 
@@ -149,8 +175,12 @@ class KeyPool:
     ) -> None:
         if kind not in COOLING_KINDS:
             return
+        now = int(time.time() * 1000)
         previous = self.state.get_cooldown(key.id)
-        strikes = int(previous["strikes"]) + 1 if previous else 1
+        if previous and not self._is_healthy(key.id, now):
+            strikes = int(previous["strikes"]) + 1
+        else:
+            strikes = 1
         cooldown = self._cooldown_ms(kind, strikes, retry_after_ms)
         retry_at = int(time.time() * 1000) + cooldown
         self.state.set_cooldown(key.id, kind.value, strikes, retry_at)
@@ -166,7 +196,24 @@ class KeyPool:
         record = self.state.get_cooldown(key_id)
         if not record:
             return True
+        if record["reason"] == FailureKind.QUOTA_EXHAUSTED.value:
+            return not self._quota_still_locked(record, now_ms)
         return int(record["retry_at_ms"]) <= now_ms
+
+    def _quota_still_locked(self, record: dict, now_ms: int) -> bool:
+        """True until the next Pacific midnight after the original daily-quota 429.
+
+        Google free-tier RPD resets at midnight America/Los_Angeles, not 24h
+        after the error. Older rows stored lock+24h; those unlock at PT midnight too.
+        """
+        retry_at = int(record["retry_at_ms"])
+        if retry_at <= now_ms:
+            return False
+        quota_ms = int(self.settings.key_quota_cooldown_ms)
+        assumed_lock = retry_at - quota_ms
+        if assumed_lock < pacific_day_start_ms(now_ms):
+            return False
+        return now_ms < next_pacific_midnight_ms(now_ms)
 
     def _cooldown_ms(
         self,
@@ -178,7 +225,8 @@ class KeyPool:
         if kind == FailureKind.RATE_LIMITED and retry_after_ms:
             return min(max(int(retry_after_ms), 1_000), cfg.key_cooldown_max_ms)
         if kind == FailureKind.QUOTA_EXHAUSTED:
-            return cfg.key_quota_cooldown_ms
+            now = int(time.time() * 1000)
+            return max(60_000, next_pacific_midnight_ms(now) - now)
         if kind == FailureKind.AUTH_INVALID:
             return cfg.key_quota_cooldown_ms * 4
         exponential = cfg.key_cooldown_base_ms * (2 ** (strikes - 1))

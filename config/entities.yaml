@@ -1,0 +1,36 @@
+# Entity gazetteer for semantic_nodes of type person/place/group/event/work.
+# ambiguous: true = surface form we deliberately do NOT resolve yet.
+persons:
+  - {id: محمد, pref: النبي محمد, aliases: [رسول الله, النبي, محمد بن عبد الله]}
+  - {id: علي, pref: الإمام علي, aliases: [أمير المؤمنين, علي بن أبي طالب]}
+  - {id: فاطمة, pref: فاطمة الزهراء, aliases: [الزهراء, فاطمة بنت رسول الله]}
+  - {id: الحسن, pref: الإمام الحسن, aliases: [الحسن بن علي, أبو محمد الحسن]}
+  - {id: الحسين, pref: الإمام الحسين, aliases: [الحسين بن علي, سيد الشهداء, أبو عبد الله الحسين]}
+  - {id: الباقر, pref: الإمام الباقر, aliases: [محمد بن علي الباقر, أبو جعفر الباقر, أبو جعفر الأول]}
+  # أبو عبد الله in al-Kafi isnads is al-Sadiq in practice; documented assumption.
+  - {id: الصادق, pref: الإمام الصادق, aliases: [جعفر بن محمد, أبو عبد الله الصادق, أبو عبد الله]}
+  - {id: الكاظم, pref: الإمام الكاظم, aliases: [موسى بن جعفر, أبو إبراهيم, العبد الصالح, أبو الحسن الأول, أبو الحسن الماضي]}
+  - {id: الرضا, pref: الإمام الرضا, aliases: [علي بن موسى, أبو الحسن الرضا, أبو الحسن الثاني]}
+  - {id: الجواد, pref: الإمام الجواد, aliases: [محمد بن علي الجواد, أبو جعفر الثاني]}
+  - {id: الهادي, pref: الإمام الهادي, aliases: [علي بن محمد الهادي, أبو الحسن الثالث]}
+  - {id: العسكري, pref: الإمام العسكري, aliases: [الحسن بن علي العسكري, أبو محمد العسكري]}
+  - {id: المهدي, pref: الإمام المهدي, aliases: [الحجة, القائم, صاحب الزمان]}
+  - {id: أبو الحسن, pref: أبو الحسن, ambiguous: true}
+  - {id: أبو جعفر, pref: أبو جعفر, ambiguous: true}
+  # Named beings the model keeps emitting as type concept. Listing them here
+  # retypes them to person, which keeps them out of concept buckets unless they
+  # are primary -- الشيطان as a primary concept made hadith 10 look like a
+  # hadith about Satan rather than about وسواس.
+  - {id: الشيطان, pref: الشيطان, aliases: [إبليس, الشيطان الرجيم]}
+  - {id: جبرئيل, pref: جبرئيل, aliases: [جبريل, الروح الأمين]}
+  - {id: آدم, pref: آدم, aliases: [أبو البشر]}
+  - {id: معاوية, pref: معاوية, aliases: [معاوية بن أبي سفيان]}
+places: []
+groups:
+  - {id: بنو إسرائيل, pref: بنو إسرائيل, aliases: [بني إسرائيل, بنى اسرائيل]}
+  - {id: أهل البيت, pref: أهل البيت, aliases: [آل محمد, العترة]}
+  - {id: الشيعة, pref: الشيعة, aliases: [شيعتنا, أصحابنا]}
+  - {id: الخوارج, pref: الخوارج, aliases: [المارقين]}
+  - {id: المستضعفون, pref: المستضعفون}
+events: []
+works: []

@@ -93,26 +93,153 @@ def embed_text_for_chunk(chunk: ChunkRecord) -> str:
     return chunk.text
 
 
-def concepts_for_chunk(chunk: ChunkRecord) -> list[str]:
-    from src.pipelines.ontology import is_grouping_label, remap_tag_list
+def resolved_nodes_for_chunk(chunk: ChunkRecord) -> list[dict]:
+    """Nodes written by `main.py resolve-nodes`, or [] if it has not run.
+
+    This is the identity system. Anything else in this module is the pre-resolver
+    fallback, kept only so a corpus part-extracted under the old contract still
+    exports; it must not be consulted when resolved nodes exist, or the graph
+    carries two incompatible sets of identities at once.
+    """
+    payload = chunk.payload() or {}
+    found: list[dict] = []
+    seen: set[str] = set()
+    for item in payload.get("nodes") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append(
+            {
+                "node": str(item.get("label") or key),
+                "key": key,
+                "type": str(item.get("type") or "concept"),
+                "weight": float(item.get("weight") or 0.0),
+                # Role is derived, not stored: IDF and weight drive ranking now,
+                # but the export edge shape still wants a role.
+                "role": "primary" if float(item.get("weight") or 0.0) >= 0.6 else "secondary",
+                "parent": item.get("parent"),
+                "broader": list(item.get("broader") or []),
+            }
+        )
+    return found
+
+
+def graph_nodes_for_chunk(chunk: ChunkRecord) -> list[dict]:
+    """Every semantic node with type and role. Feeds export and search."""
+    from src.pipelines.ontology import enforce_node_policy, semantic_nodes_of
+
+    resolved = resolved_nodes_for_chunk(chunk)
+    if resolved:
+        return resolved
 
     payload = chunk.payload() or {}
     if chunk.pipeline == "hadith":
-        tags: list[str] = []
+        nodes: list[dict] = []
+        ravis: list[str] = []
         for item in hadith_items(payload):
-            tags.extend(item.get("tags") or [])
-        if not tags:
-            tags = list(payload.get("tags") or [])
-        return [t for t in remap_tag_list(tags) if is_grouping_label(t)]
+            nodes.extend(semantic_nodes_of(item))
+            ravis.extend(item.get("ravis") or [])
+        if not nodes:
+            nodes = semantic_nodes_of(payload)
+        if not ravis:
+            ravis = list(payload.get("ravis") or [])
+        return enforce_node_policy(nodes, ravis)
     if chunk.pipeline == "tafsir":
-        return list(payload.get("core_concepts") or [])
+        # strict=False: tafsir has no proposals channel yet, and closing its
+        # vocabulary would silently empty every tafsir chunk.
+        return enforce_node_policy(
+            [
+                {"node": str(c), "type": "concept", "role": "primary"}
+                for c in (payload.get("core_concepts") or [])
+            ],
+            strict=False,
+        )
     if chunk.pipeline == "history":
-        tags: list[str] = []
+        nodes = []
         for event in payload.get("events") or []:
             if isinstance(event, dict):
-                tags.extend(event.get("historical_concepts") or [])
-        return tags
+                for c in event.get("historical_concepts") or []:
+                    nodes.append({"node": str(c), "type": "concept", "role": "primary"})
+        return enforce_node_policy(nodes, strict=False)
     return []
+
+
+def bucket_keys_for_chunk(chunk: ChunkRecord) -> list[str]:
+    """Edge-eligible node strings, plus every ancestor of each.
+
+    Ancestors are what let sibling concepts meet: hadith 7 (الحساب), 8 (الثواب)
+    and 9 (الجزاء) share no node at all, but all three sit under
+    الجزاء الأخروي, so that bucket is where they get compared. The nodes
+    themselves stay distinct for search.
+    """
+    from src.pipelines.ontology import broader_chain, bucket_eligible
+
+    resolved = resolved_nodes_for_chunk(chunk)
+    if resolved:
+        # Resolver keys are already canonical identities, so no role gate: a node
+        # reached this chunk because a mention resolved onto it, which is the
+        # whole membership test. Ancestors are still expanded -- a child like
+        # خلق العقل must reach العقل, and الحساب / الثواب / الجزاء must meet
+        # under الجزاء الأخروي, neither of which happens on the leaf key alone.
+        keys: list[str] = []
+        for node in resolved:
+            keys.append(node["key"])
+            if node.get("parent"):
+                keys.append(node["parent"])
+            keys.extend(node.get("broader") or [])
+        keys.extend(
+            n["node"] for n in section_nodes_for_chunk(chunk) if n["type"] == "bab"
+        )
+        return list(dict.fromkeys(keys))
+
+    keys: list[str] = []
+    for n in graph_nodes_for_chunk(chunk):
+        if not bucket_eligible(n["type"], n["role"]):
+            continue
+        keys.append(n["node"])
+        keys.extend(broader_chain(n["node"]))
+    # Bab only. A kitab spans hundreds of narrations, so as a bucket key it is
+    # both useless for comparison and liable to trip the extreme-df cutoff, which
+    # would silently drop it anyway. The kitab still reaches the graph as an
+    # IN_KITAB edge; it just is not a unit of pairwise comparison.
+    keys.extend(
+        n["node"] for n in section_nodes_for_chunk(chunk) if n["type"] == "bab"
+    )
+    return list(dict.fromkeys(keys))
+
+
+def section_nodes_for_chunk(chunk: ChunkRecord) -> list[dict]:
+    """The kitab/bab this chunk was printed under.
+
+    Kept separate from semantic_nodes because it is not an inference: the
+    heading is printed above the narration, so this is the one grouping that
+    holds no matter how the extraction went.
+    """
+    from src.extractors.classification import section_nodes
+
+    payload = chunk.payload() or {}
+    if chunk.pipeline != "hadith":
+        return []
+    found: list[dict] = []
+    for item in hadith_items(payload) or [payload]:
+        found.extend(
+            section_nodes(str(item.get("kitab") or ""), str(item.get("bab") or ""))
+        )
+    if not found:
+        found = section_nodes(
+            str(payload.get("kitab") or ""), str(payload.get("bab") or "")
+        )
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict] = []
+    for node in found:
+        key = (node["type"], node["node"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(node)
+    return unique
 
 
 def embed_pending_chunks(

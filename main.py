@@ -21,6 +21,14 @@ from src.agents.gemini import GeminiAgent
 from src.core.neo4j_export import export_neo4j
 from src.core.phase2 import run_phase2
 from src.pipelines.catalog import load_book_catalog, resolve_book
+from src.pipelines.proposals import (
+    DEFAULT_THRESHOLD,
+    apply_promotions,
+    build_plan,
+    collect,
+    report,
+    scan_output_dir,
+)
 from src.pipelines.reset import reset_catalog_book
 from src.pipelines.runner import run_phase1
 from src.state_manager import StateManager
@@ -102,7 +110,10 @@ def status(
     settings = get_settings()
     state = StateManager(settings.state_db)
     typer.echo(state.counts(book))
-    typer.echo(f"gemini_keys={len(settings.google_api_keys)} model={settings.gemini_model}")
+    typer.echo(
+        f"gemini_keys={len(settings.google_api_keys)} "
+        f"models={','.join(settings.gemini_models)}"
+    )
     typer.echo(f"embed_model={settings.embedding_model}")
     typer.echo(f"raw_data={settings.raw_data_dir}")
     state.close()
@@ -154,6 +165,61 @@ def list_books() -> None:
             typer.echo(f"{book_id}\t{entry['pipeline']}\t{len(spec.files)} files")
         except FileNotFoundError:
             typer.echo(f"{book_id}\t{entry['pipeline']}\tMISSING")
+
+
+@app.command("resolve-nodes")
+def resolve_nodes(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report without writing nodes back into payloads"
+    ),
+) -> None:
+    """Resolve every mention in the corpus into canonical graph nodes.
+
+    Runs between phase 1 and phase 2. Identity is a property of the whole
+    corpus -- knowing that عقل المرء is العقل needs العقل to have been seen
+    somewhere else -- so it cannot be settled while extracting one page.
+    """
+    _setup_logging()
+    from src.pipelines import resolve_pass
+
+    stats = resolve_pass.run(write=not dry_run)
+    if not stats.get("mentions"):
+        typer.echo("no mentions found; run run-phase1 first")
+        raise typer.Exit(code=1)
+    for name, value in stats.items():
+        typer.echo(f"{name:<12} {value}")
+    if dry_run:
+        typer.echo("(dry run: nothing written)")
+
+
+@app.command("proposals")
+def proposals(
+    threshold: int = typer.Option(
+        DEFAULT_THRESHOLD,
+        "--threshold",
+        help="Distinct hadiths that must propose a term before it is promoted",
+    ),
+    promote: bool = typer.Option(
+        False, "--promote", help="Write promoted terms into the concept catalog"
+    ),
+) -> None:
+    """Review what the model asked for that the vocabulary could not express.
+
+    Terms several narrations independently propose are real topics; terms only
+    one narration wanted are that narration's phrasing. Run without --promote to
+    see the plan, then again with it to apply.
+    """
+    _setup_logging()
+    payloads = scan_output_dir()
+    if not payloads:
+        typer.echo("no phase-1 payloads found; run run-phase1 first")
+        raise typer.Exit(code=1)
+    plan = build_plan(collect(payloads), threshold=threshold)
+    typer.echo(report(plan))
+    if promote:
+        added = apply_promotions(plan, threshold=threshold)
+        typer.echo(f"\npromoted {added} terms into the catalog")
+        typer.echo("re-run run-phase1 so extraction can select them")
 
 
 if __name__ == "__main__":
