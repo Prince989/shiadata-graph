@@ -12,6 +12,7 @@ and the model's echo of it usually is not.
 from __future__ import annotations
 
 import logging
+import re
 
 from src.pipelines.morphology import fold
 
@@ -69,11 +70,47 @@ def check_mention(
     return None
 
 
+def _in_a_quote(text: str, quotes: list | None) -> bool:
+    """True when a MULTI-WORD mention repeats wording the hadith is quoting.
+
+    A narration that quotes scripture is not thereby about the scripture's
+    phrasing. Hadith 11 quotes «وما يتذكر إلا أولوا الألباب» and the extractor
+    turned أولو الألباب into a group node -- a Qur'anic epithet standing beside
+    the real topic, العقل, duplicating a link the 2:269 citation edge already
+    carries better, since that edge also reaches the tafsir of the verse.
+
+    Single words are deliberately exempt. A hadith about الصبر that quotes a
+    verse mentioning الصبر is still about الصبر, and dropping it there would cost
+    far more than the occasional stray epithet.
+    """
+    if len(fold(text).split()) < 2:
+        return False
+    needle = _quote_key(text)
+    if not needle:
+        return False
+    for quote in quotes or []:
+        span = quote.get("text") if isinstance(quote, dict) else quote
+        if needle in _quote_key(str(span or "")):
+            return True
+    return False
+
+
+# A word-final alef after waw is orthographic, not phonemic -- the ألف فارقة of
+# قالوا / كتبوا. The quote writes أُولُوا where the mention writes أولو, and
+# without folding it away no letter comparison between the two can ever match.
+_OTIOSE_ALEF = re.compile(r"وا(?=\s|$)")
+
+
+def _quote_key(text: str) -> str:
+    return _OTIOSE_ALEF.sub("و", fold(text)).replace(" ", "")
+
+
 def ground_mentions(
     mentions: list,
     matn: str,
     ravis: list[str] | None = None,
     require_evidence: bool = REQUIRE_EVIDENCE,
+    quotes: list | None = None,
 ) -> tuple[list, list[tuple[str, str]]]:
     """Split mentions into (kept, [(text, reason), ...]).
 
@@ -114,6 +151,10 @@ def ground_mentions(
                 rejected.append((text, "narrator, not a subject"))
                 logger.info("drop narrator-as-mention %r", text)
                 continue
+        if _in_a_quote(text, quotes):
+            rejected.append((text, "quoted scripture, not a topic"))
+            logger.info("drop quoted-phrase mention %r", text)
+            continue
         reason = check_mention(mention, matn, require_evidence) if matn else None
         if reason:
             rejected.append((text, reason))

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from config.paths import ENTITIES_YAML, ONTOLOGY_YAML
+from config.paths import DERIVED_ONTOLOGY_YAML, ENTITIES_YAML, ONTOLOGY_YAML
 
 logger = logging.getLogger(__name__)
 
@@ -139,18 +139,37 @@ def _parse_concept(raw) -> Concept | None:
     return Concept(id=cid, pref=pref, aliases=aliases, broader=parents, group=group)
 
 
+def _read_concepts(path: Path) -> list:
+    if not path.exists():
+        return []
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data.get("concepts") or []
+
+
 @lru_cache(maxsize=1)
 def load_concept_catalog() -> tuple[Concept, ...]:
-    data = yaml.safe_load(ONTOLOGY_YAML.read_text(encoding="utf-8")) or {}
-    items = data.get("concepts") or []
+    """Hand-written catalog first, then the harvested one.
+
+    Two files on purpose. `base_ontology.yaml` holds judgement calls nothing can
+    derive -- قتل النفس and الانتحار share no root, no wording and no chapter, so
+    only a human joins them. `derived_ontology.yaml` holds thousands of terms
+    mined from the books' own headings and is regenerated wholesale.
+
+    Base is loaded first and wins on conflict, so re-harvesting can never
+    overrule a curation decision.
+    """
     out: list[Concept] = []
     seen: set[str] = set()
-    for raw in items:
-        concept = _parse_concept(raw)
-        if concept is None or concept.id in seen:
-            continue
-        seen.add(concept.id)
-        out.append(concept)
+    for path in (ONTOLOGY_YAML, DERIVED_ONTOLOGY_YAML):
+        for raw in _read_concepts(path):
+            concept = _parse_concept(raw)
+            if concept is None or concept.id in seen:
+                continue
+            folded = normalize_ar(concept.pref)
+            if any(folded == normalize_ar(c.pref) for c in out):
+                continue
+            seen.add(concept.id)
+            out.append(concept)
     return tuple(out)
 
 
@@ -641,7 +660,10 @@ def _ground_row(row: dict) -> None:
     from src.pipelines.grounding import ground_mentions
 
     kept, rejected = ground_mentions(
-        mentions, str(row.get("hadith") or ""), row.get("ravis")
+        mentions,
+        str(row.get("hadith") or ""),
+        row.get("ravis"),
+        quotes=row.get("quotes"),
     )
     if rejected:
         logger.info(

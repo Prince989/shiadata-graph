@@ -198,7 +198,9 @@ class OpenHadith:
         # Ground against the ASSEMBLED matn, not the page fragment. A mention
         # taken from page 2 of a two-page hadith is not in page 1's text, so
         # checking per fragment would reject half of a spanning narration.
-        mentions, _ = ground_mentions(self.mentions_seed, matn, self.ravis_seed)
+        mentions, _ = ground_mentions(
+            self.mentions_seed, matn, self.ravis_seed, quotes=self.quotes_seed
+        )
         refs = _resolve_quotes(self.quotes_seed, self.quran_refs_seed)
         return {
             "marker": self.marker,

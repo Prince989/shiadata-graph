@@ -126,7 +126,51 @@ def _seed_key(text: str, node_type: str) -> tuple[str, str, str] | None:
     return None
 
 
-def _topic_parent(text: str, node_type: str) -> tuple[str, str, bool] | None:
+def decompose(text: str) -> list[tuple[str, str]]:
+    """Every catalog concept named by a constituent of a multi-word label.
+
+    Replaces splitting on و, which was operating on a token rather than on
+    meaning and corrupted real words: `ولاة العدل` lost its و and became
+    `لاة العدل`. Here the label's structure is irrelevant. Each word is simply
+    looked up, and `في` / `على` / `قدر` contribute nothing because they name
+    nothing -- no rule has to mention them.
+
+        الوسواس في الوضوء والصلاة  ->  الوسواس + الوضوء + الصلاة
+        الجزاء على قدر العقل        ->  الجزاء + العقل
+
+    Concepts only. A bare word inside a phrase must never hit the gazetteer:
+    `على` folds to `علي` and became the Imam, and `الحجة` in الحجة الباطنة --
+    the intellect as God's inner proof -- collapsed onto الإمام المهدي, taking
+    الحجة الظاهرة with it. Entities need the whole label to be safe.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for word in (text or "").split():
+        for candidate in _clitic_forms(word):
+            hit = lookup_concept(candidate)
+            if hit is None:
+                continue
+            key = f"concept:{normalize_ar(hit.pref)}"
+            if key not in seen:
+                seen.add(key)
+                found.append((key, hit.pref))
+            break
+    return found
+
+
+def _clitic_forms(word: str) -> tuple[str, ...]:
+    """The word, and the word minus a leading conjunction.
+
+    Self-validating rather than guessed: the caller only accepts a stripped form
+    if it actually resolves, so `والصلاة` yields الصلاة while `ولاة` yields
+    nothing and keeps its و. No length heuristic, which is what mangled ولاة.
+    """
+    if len(word) > 1 and word.startswith("و"):
+        return (word, word[1:])
+    return (word,)
+
+
+def _topic_parent(text: str, node_type: str) -> tuple[str, str, bool, str] | None:
     """Key of the constituent that carries the topic of a compound.
 
     Not simply the head. Arabic iḍāfa puts the topic on either side: in
@@ -139,13 +183,21 @@ def _topic_parent(text: str, node_type: str) -> tuple[str, str, bool] | None:
     for word in (text or "").split():
         seed = _seed_key(word, node_type)
         if seed:
-            key, label, _ = seed
-            return key, label, True
+            key, label, parent_type = seed
+            # A concept must never anchor to an entity. Allowing it was tried on
+            # real data and collapsed إكمال الحجة, الحجة الباطنة and الحجة الظاهرة
+            # -- three distinct kalam concepts -- onto الإمام المهدي, because
+            # الحجة is one of his gazetteer aliases.
+            if node_type == CONCEPT_TYPE and parent_type != CONCEPT_TYPE:
+                continue
+            return key, label, True, parent_type
     head = head_root(text)
-    return (f"{node_type}:@{head}", text, False) if head else None
+    return (f"{node_type}:@{head}", text, False, node_type) if head else None
 
 
-def _morph_key(text: str, node_type: str) -> tuple[str, tuple[str, str, bool] | None]:
+def _morph_key(
+    text: str, node_type: str
+) -> tuple[str, tuple[str, str, bool, str] | None]:
     """Identity from morphology: single words key on their root, compounds on all of them."""
     signature = [r for r in root_signature(text) if r]
     if not signature:
@@ -268,7 +320,7 @@ def resolve_with_assignments(
     mentions: list[Mention],
     compound_min_df: int | None = None,
     entity_merge_max_df: int = ENTITY_MERGE_MAX_DF,
-) -> tuple[dict[str, Node], list[str | None]]:
+) -> tuple[dict[str, Node], list[list[str]]]:
     """Cluster mentions into nodes, and say which node each mention landed on.
 
     The assignment list is produced HERE rather than re-derived afterwards from
@@ -286,9 +338,14 @@ def resolve_with_assignments(
     nodes, redirect, initial = _cluster(
         mentions, compound_min_df, entity_merge_max_df
     )
-    assignments: list[str | None] = []
-    for key in initial:
-        assignments.append(_follow(key, redirect, nodes))
+    assignments: list[list[str]] = []
+    for keys in initial:
+        resolved: list[str] = []
+        for key in keys:
+            final = _follow(key, redirect, nodes)
+            if final and final not in resolved:
+                resolved.append(final)
+        assignments.append(resolved)
     return nodes, assignments
 
 
@@ -321,56 +378,93 @@ def _cluster(
     if compound_min_df is None:
         compound_min_df = compound_threshold(len({m.doc_id for m in mentions}))
     nodes: dict[str, Node] = {}
-    compound_children: dict[str, tuple[str, str, bool]] = {}
+    compound_children: dict[str, tuple[str, str, bool, str]] = {}
     redirect: dict[str, str] = {}
-    initial: list[str | None] = []
+    initial: list[list[str]] = []
 
     for mention in mentions:
         text = (mention.text or "").strip()
         if not text:
-            initial.append(None)
-            continue
-        # A phrase that repeats one root says the same thing twice; it describes
-        # this sentence and can never be shared. اجتهاد المجتهدين is the case.
-        if is_tautology(text):
-            logger.debug("drop tautology %s", text)
-            initial.append(None)
+            initial.append([])
             continue
 
-        seed = _seed_key(text, mention.type)
-        if seed:
-            key, label, node_type = seed
-            if node_type != mention.type:
-                logger.info(
-                    "retype %s from %s to %s (catalog)", text, mention.type, node_type
+        keys: list[str] = []
+        # A multi-word concept the catalog does not know as a whole also names
+        # its constituents. The mention reaches all of them directly, so nothing
+        # is lost when the compound itself turns out to be a one-off; and when
+        # the compound recurs it survives alongside them, giving the narration
+        # both the specific topic and the general ones.
+        constituents: list[tuple[str, str]] = []
+        if (
+            mention.type == CONCEPT_TYPE
+            and len(text.split()) > 1
+            and not _seed_key(text, mention.type)
+        ):
+            constituents = decompose(text)
+            for part_key, part_label in constituents:
+                node = nodes.setdefault(
+                    part_key,
+                    Node(key=part_key, label=part_label, type=CONCEPT_TYPE, curated=True),
                 )
-            node = nodes.setdefault(
-                key, Node(key=key, label=label, type=node_type, curated=True)
-            )
-        else:
-            if mention.type == CONCEPT_TYPE:
-                key, parent = _morph_key(text, mention.type)
-                if parent and parent[0] != key:
-                    compound_children[key] = parent
+                node.surfaces.add(part_label)
+                node.docs.add(mention.doc_id)
+                if part_key not in keys:
+                    keys.append(part_key)
+
+        for part in [text]:
+            part = part.strip()
+            if not part:
+                continue
+            # A phrase that repeats one root says the same thing twice; it
+            # describes this sentence and can never be shared.
+            if is_tautology(part):
+                logger.debug("drop tautology %s", part)
+                continue
+            seed = _seed_key(part, mention.type)
+            if seed:
+                key, label, node_type = seed
+                if node_type != mention.type:
+                    logger.info(
+                        "retype %s from %s to %s (catalog)", part, mention.type, node_type
+                    )
+                node = nodes.setdefault(
+                    key, Node(key=key, label=label, type=node_type, curated=True)
+                )
             else:
-                # Entities key on the whole name; identity is settled afterwards
-                # by prefix merging, not by folding compounds into a head.
-                key = f"{mention.type}:{normalize_ar(text)}"
-            node = nodes.setdefault(key, Node(key=key, label=text, type=mention.type))
-        node.surfaces.add(text)
-        node.docs.add(mention.doc_id)
-        initial.append(key)
+                if mention.type == CONCEPT_TYPE:
+                    key, parent = _morph_key(part, mention.type)
+                    if constituents:
+                        # Decomposition already gave the mention its parents, so
+                        # the compound only has to justify its OWN existence.
+                        first_key, first_label = constituents[0]
+                        parent = (first_key, first_label, True, CONCEPT_TYPE)
+                    if parent and parent[0] != key:
+                        compound_children[key] = parent
+                else:
+                    # Entities key on the whole name; identity is settled
+                    # afterwards by prefix merging, not by folding into a head.
+                    key = f"{mention.type}:{normalize_ar(part)}"
+                node = nodes.setdefault(
+                    key, Node(key=key, label=part, type=mention.type)
+                )
+            node.surfaces.add(part)
+            node.docs.add(mention.doc_id)
+            if key not in keys:
+                keys.append(key)
+        initial.append(keys)
 
     # A compound that never recurred is this narration's phrasing, not a topic.
-    for key, (parent_key, parent_label, parent_curated) in compound_children.items():
+    for key, (parent_key, parent_label, parent_curated, parent_type) in compound_children.items():
         node = nodes.get(key)
         if node is None or node.curated:
             continue
         if parent_curated and parent_key not in nodes:
             # The catalog knows this parent even though nothing has mentioned it
             # on its own yet. حساب العباد must still reach الحساب, so create it.
+            # The parent's OWN type, never the child's: taking the child's put a
+            # node under a person: key while typing it concept.
             nodes[parent_key] = Node(
-                key=parent_key, label=parent_label, type=node.type, curated=True
+                key=parent_key, label=parent_label, type=parent_type, curated=True
             )
         if node.df >= compound_min_df:
             # The corpus reached for it more than once, so it is a real topic.

@@ -158,12 +158,14 @@ def run(root: Path | None = None, write: bool = True) -> dict:
     # showed the right label and the right df.
     nodes, assignments = resolve_with_assignments(mentions)
 
+    # One mention can now resolve onto more than one node: a coordinated label
+    # like الوضوء والصلاة names two topics, and collapsing it to one lost the
+    # other without a trace.
     per_doc: dict[str, dict[str, float]] = {}
-    for mention, key in zip(mentions, assignments):
-        if not key:
-            continue
-        bucket = per_doc.setdefault(mention.doc_id, {})
-        bucket[key] = max(bucket.get(key, 0.0), mention.salience)
+    for mention, keys in zip(mentions, assignments):
+        for key in keys:
+            bucket = per_doc.setdefault(mention.doc_id, {})
+            bucket[key] = max(bucket.get(key, 0.0), mention.salience)
 
     if write:
         for doc_id, path in sources.items():

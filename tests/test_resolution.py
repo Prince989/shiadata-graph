@@ -502,6 +502,100 @@ def test_summary_separates_what_proposed_a_pair_from_what_scored_it():
     assert "proposed by:" in text and "also scored on" in text
 
 
+# ------------------------------------------------ structural, not exceptions
+def test_a_compound_names_every_topic_in_it():
+    """Structure is irrelevant; only which words name known concepts.
+
+    Splitting on و was tried and corrupted real words -- `ولاة العدل` lost its
+    conjunction and became `لاة العدل`. Here `في`, `على` and `قدر` contribute
+    nothing simply because they name nothing.
+    """
+    from src.pipelines.resolver import decompose
+
+    labels = lambda t: [pref for _, pref in decompose(t)]
+    assert labels("الوسواس في الوضوء والصلاة") == ["الوسواس", "الوضوء", "الصلاة"]
+    assert labels("الجزاء على قدر العقل") == ["الجزاء", "العقل"]
+    assert labels("خلق العقل") == ["العقل"]
+    # ولاة is a word, not a conjunction plus لاة. Stripping is only accepted
+    # when what remains actually resolves, so no length heuristic can mangle it.
+    assert labels("ولاة العدل") == ["العدل"]
+    # A concept constituent must never reach the gazetteer: الحجة is an alias of
+    # الإمام المهدي, and letting it through collapsed three kalam concepts onto him.
+    assert labels("الحجة الباطنة") == []
+
+
+def test_a_coordinated_mention_reaches_both_nodes(tmp_path: Path):
+    from src.pipelines import resolve_pass
+
+    (tmp_path / "a.json").write_text(
+        json.dumps(
+            {
+                "marker": "10 -",
+                "locator": "p12",
+                "hadith": "مُبْتَلًى بِالْوُضُوءِ وَ الصَّلَاةِ",
+                "mentions": [
+                    {"text": "الوضوء والصلاة", "type": "concept", "salience": 0.8}
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    resolve_pass.run(root=tmp_path)
+    written = json.loads((tmp_path / "a.json").read_text(encoding="utf-8"))
+    labels = {n["label"] for n in written["nodes"]}
+    assert labels == {"الوضوء", "الصلاة"}
+
+
+def test_a_curated_coordination_is_not_taken_apart():
+    """الثواب والعقاب is a catalog alias of الجزاء الأخروي and stays whole."""
+    nodes = resolve([_m("h1", "الثواب والعقاب")])
+    assert [n.label for n in nodes.values()] == ["الجزاء الأخروي"]
+
+
+def test_a_quoted_phrase_is_not_a_topic():
+    """The 2:269 citation edge already carries it, and reaches the tafsir too."""
+    from src.pipelines.grounding import ground_mentions
+
+    matn = "وَالْعُقَلَاءُ هُمْ أُولُو الْأَلْبَابِ وَ الصَّبْرُ خَيْرٌ"
+    quotes = [{"text": "وَمَا يَتَذَكَّرُ إِلَّا أُولُوا الْأَلْبَابِ", "kind": "quran"}]
+    kept, rejected = ground_mentions(
+        [
+            {"text": "أولو الألباب", "type": "group", "evidence": "هُمْ أُولُو الْأَلْبَابِ"},
+            # A single word is exempt: a hadith about الصبر that quotes a verse
+            # mentioning الصبر is still about الصبر.
+            {"text": "الصبر", "type": "concept", "evidence": "وَ الصَّبْرُ خَيْرٌ"},
+        ],
+        matn,
+        quotes=quotes,
+    )
+    assert [m["text"] for m in kept] == ["الصبر"]
+    assert rejected == [("أولو الألباب", "quoted scripture, not a topic")]
+
+
+def test_a_node_key_and_its_type_always_agree():
+    """A parent takes its own type, never the type of the child that reached it."""
+    nodes = resolve(
+        [_m("h1", "الوسواس في الوضوء"), _m("h2", "معاوية", "person"), _m("h3", "العقل")]
+    )
+    assert nodes
+    for node in nodes.values():
+        assert node.key.split(":", 1)[0] == node.type
+
+
+def test_a_concept_never_collapses_onto_a_person():
+    """الحجة is an alias of الإمام المهدي; three kalam concepts fell into him."""
+    nodes = resolve(
+        [
+            _m("h1", "الحجة الباطنة"),
+            _m("h2", "الحجة الظاهرة"),
+            _m("h3", "إكمال الحجة"),
+        ]
+    )
+    assert "الإمام المهدي" not in {n.label for n in nodes.values()}
+    assert all(n.type == "concept" for n in nodes.values())
+
+
 # ------------------------------------------------------ cross-page coverage
 def test_continuation_page_contributes_its_own_mentions():
     """Page 2 of a spanning hadith sees matn page 1 never contained.

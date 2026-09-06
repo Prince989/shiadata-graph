@@ -22,15 +22,28 @@ from src.extractors.epub_parser import ParsedUnit
 
 logger = logging.getLogger(__name__)
 
-_KITAB = re.compile(r"^(?:كِتَابُ|كتاب)\s")
-_BAB = re.compile(r"^(?:بَابُ|باب)\s")
+# Wasa'il numbers every bab and closes the line with a colon:
+#     ١ ـ باب وجوب العبادات الخمس :
+# Requiring the line to START with باب, and rejecting any line containing a
+# colon, made all 11,805 of its headings invisible -- the single richest topical
+# index in the corpus, silently skipped by two characters of regex.
+_NUMBER_PREFIX = r"(?:[٠-٩0-9]{1,4}\s*[ـ\-–—]\s*)?"
+_KITAB = re.compile(rf"^{_NUMBER_PREFIX}(?:كِتَابُ|كتاب)\s")
+_BAB = re.compile(rf"^{_NUMBER_PREFIX}(?:بَابُ|باب)\s")
+# The separator is optional here: `clean_heading` strips tatweel, so by the time
+# a title reaches `heading_topic` the `١ ـ باب` has already become `١ باب`.
+_HEADING_PREFIX = re.compile(
+    r"^(?:[٠-٩0-9]{1,4}\s*[ـ\-–—]?\s*)?(?:كِتَابُ|كتاب|بَابُ|باب)\s+"
+)
 
 # Prose that merely begins with the word "kitab" is not a heading. Real headings
 # are bare noun phrases: no sentence punctuation, and short. The preface line
 # "كتاب الحجّة و إن لم نكمّله على استحقاقه، لأنّا كرهنا..." is the case this
 # rejects, along with footnote glosses like "باب منع أي مشى. و يطلق على...".
-_SENTENCE_PUNCT = re.compile(r"[،.:؛!؟]")
-_MAX_HEADING_CHARS = 90
+# A TRAILING colon is punctuation of the heading itself, not of a sentence.
+_SENTENCE_PUNCT = re.compile(r"[،.؛!؟:]")
+_TRAILING_COLON = re.compile(r"\s*:\s*$")
+_MAX_HEADING_CHARS = 120
 
 # Footnote markers ride along on heading lines ("بَابُ النَّوَادِرِ [1]"), and an
 # unterminated one can survive the line break.
@@ -59,7 +72,17 @@ def _looks_like_heading(text: str) -> bool:
         return False
     if not (_KITAB.match(text) or _BAB.match(text)):
         return False
-    return not _SENTENCE_PUNCT.search(text)
+    return not _SENTENCE_PUNCT.search(_TRAILING_COLON.sub("", text))
+
+
+def heading_topic(title: str) -> str:
+    """The heading with its number, its كتاب/باب word and its colon removed.
+
+    `١ ـ باب وجوب العبادات الخمس :` becomes `وجوب العبادات الخمس`, which is the
+    part that names a subject.
+    """
+    text = _TRAILING_COLON.sub("", clean_heading(title))
+    return _HEADING_PREFIX.sub("", text).strip()
 
 
 def is_empty_topic(heading: str) -> bool:
