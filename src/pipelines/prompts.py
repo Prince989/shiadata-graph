@@ -52,6 +52,10 @@ STRIP sentence grammar only:
   - حساب العباد → الحساب
 Never emit a bare verb like خلق as a mention by itself.
 
+When a type-noun is qualified by a relative clause (or similar
+attribute) that carries the claim, that qualifier is the high-salience
+mention; the bare type-noun is secondary.
+
 Other rules (short):
 - person/place/group/event/work must appear in the matn; evidence is their words
 - concepts may be inferred from what THIS matn asserts (not the chapter title)
@@ -71,6 +75,10 @@ EXAMPLES
 "لما خلق الله العقل استنطقه ثم قال له أقبل فأقبل"
   mentions: خلق العقل/0.9, العقل/0.7
   NOT: خلق as a standalone mention
+
+"مؤمن يخالط الناس ويصبر على أذاهم أفضل من مؤمن لا يخالط الناس ولا يصبر"
+  mentions: مخالطة الناس مع الصبر/0.95, المؤمن/0.5
+  NOT: المؤمن alone as the top subject (the relative clause carries the claim)
 
 "إن عندنا قوما لهم محبة ... فاعتبروا يا أولي الأبصار"
   mentions: محبة أهل البيت/0.8, العزيمة/0.6
@@ -122,6 +130,8 @@ evidence: short verbatim span from the matn
 KEEP compounds that are the subject (خلق العقل). STRIP grammar possessors
 (عقل المرء → العقل). Do NOT emit bare خلق. Do NOT put narrators or the Imam
 speaker in mentions -- only subjects discussed in the matn.
+If a type-noun is qualified by a relative clause that carries the claim,
+prefer that qualifier over the bare type as the top mention.
 Prefer 3-6 mentions. Never return mentions: [].
 """
 
