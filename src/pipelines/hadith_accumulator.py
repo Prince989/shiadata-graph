@@ -345,3 +345,36 @@ def consume_page(
         buf = None
 
     return flushed, buf
+
+
+def close_open_hadith_with_page(
+    locator: str,
+    text: str,
+    gemini_items: list[dict],
+    buffer: OpenHadith,
+    quran_refs: dict[str, list[str]] | None = None,
+) -> tuple[dict | None, OpenHadith | None]:
+    """Append only the leading continuation of `text` and close `buffer`.
+
+    Used by targeted `--page` runs: the next printed page is fetched solely to
+    finish a spanning hadith, without flushing that page's new numbered markers.
+    """
+    refs = quran_refs or {}
+    text = strip_folklib_footnotes(text)
+    leading, starts = page_prefix_and_starts(text)
+    buf = buffer
+    if leading:
+        item = match_gemini_item(gemini_items, "continuation")
+        buf.append_slice(
+            locator,
+            leading,
+            str(item.get("hadith_fa") or ""),
+            str(item.get("hadith_en") or ""),
+            ravis=list(item.get("ravis") or []),
+            quran_refs=refs.get("continuation"),
+            mentions=[m for m in (item.get("mentions") or []) if isinstance(m, dict)],
+            quotes=[q for q in (item.get("quotes") or []) if isinstance(q, dict)],
+        )
+    # A numbered start on the next page means our open hadith ended before it.
+    # Always assemble here: this helper exists to finish the buffer, not hold it.
+    return buf.assemble(), None

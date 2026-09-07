@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from config.paths import DERIVED_ONTOLOGY_YAML, ENTITIES_YAML, ONTOLOGY_YAML
+from config.paths import DERIVED_ALIASES_YAML, DERIVED_ONTOLOGY_YAML, ENTITIES_YAML, ONTOLOGY_YAML
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,12 @@ _HONORIFIC = re.compile(
 # same man as أبو عبد الله, which is the form the gazetteer indexes. Without this
 # hadith 3 stored a raw أبي عبد الله while hadith 6 resolved to الإمام الصادق.
 _KUNYA = re.compile(r"^(?:ابي|ابا)(?=\s)")
+
+# Whether the typesetter set the conjunction close or loose is not a difference
+# in the word: the corpus prints both `القضايا والأحكام` and `القضاء و الأحكام`,
+# and they were two concepts. Folding it here fixes the catalog's own duplicates
+# and, more importantly, lets a mention match whichever way it was written.
+_LOOSE_WAW = re.compile(r"\s+و\s+")
 
 # Descriptive heads. The closed vocabulary makes these unreachable for concepts
 # and groups, but person/place/event/work stay open, so they still need the
@@ -107,6 +113,7 @@ def normalize_ar(text: str) -> str:
     s = _ALEF.sub("ا", s)
     s = s.replace("ى", "ي").replace("ؤ", "و").replace("ئ", "ي").replace("ة", "ه")
     s = _KUNYA.sub("ابو", s)
+    s = _LOOSE_WAW.sub(" و", s)
     if s.startswith("ال") and len(s) > 3:
         s = s[2:]
     return s.strip()
@@ -170,7 +177,57 @@ def load_concept_catalog() -> tuple[Concept, ...]:
                 continue
             seen.add(concept.id)
             out.append(concept)
+    return _with_derived_aliases(tuple(out))
+
+
+def _with_derived_aliases(concepts: tuple[Concept, ...]) -> tuple[Concept, ...]:
+    """Attach the generated aliases, which live in their own file.
+
+    Not in `derived_ontology.yaml`, because the harvest rewrites that wholesale
+    and would drop them; not in `base_ontology.yaml`, because they are generated
+    and that file is the human's. Hand-written aliases already on a concept are
+    kept -- these are added to them, never over them.
+    """
+    extra = _read_aliases(DERIVED_ALIASES_YAML)
+    if not extra:
+        return concepts
+    out = []
+    for concept in concepts:
+        more = extra.get(normalize_ar(concept.pref), ())
+        if not more:
+            out.append(concept)
+            continue
+        have = {normalize_ar(a) for a in concept.aliases}
+        add = tuple(a for a in more if normalize_ar(a) not in have)
+        out.append(
+            Concept(
+                id=concept.id,
+                pref=concept.pref,
+                aliases=concept.aliases + add,
+                broader=concept.broader,
+                group=concept.group,
+            )
+        )
     return tuple(out)
+
+
+def _read_aliases(path) -> dict[str, tuple[str, ...]]:
+    if not path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("unreadable alias file %s: %s", path, exc)
+        return {}
+    out: dict[str, tuple[str, ...]] = {}
+    for row in raw.get("aliases") or []:
+        if not isinstance(row, dict):
+            continue
+        pref = str(row.get("pref") or "").strip()
+        forms = tuple(str(a).strip() for a in (row.get("aliases") or []) if str(a).strip())
+        if pref and forms:
+            out[normalize_ar(pref)] = forms
+    return out
 
 
 def load_ontology() -> list[str]:

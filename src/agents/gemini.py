@@ -1,8 +1,8 @@
-"""Reusable Gemini agent with key rotation and model fallback.
+"""Reusable Gemini agent with key rotation and same-model retry.
 
 Every later phase should call `complete()` or `complete_structured()` on this
-class. Key rotation, 429/quota handling, 503 model fallback, and
-AllKeysExhausted live here so pipelines stay free of provider details.
+class. Key rotation, 429/quota handling, 503 retry on the configured model(s),
+and AllKeysExhausted live here so pipelines stay free of provider details.
 """
 
 from __future__ import annotations
@@ -57,9 +57,9 @@ MENTIONS_FILL_RETRY = (
 )
 
 
-# Brief pause before trying the next model on 503/5xx so a demand spike is not
-# burned through the whole fallback list in under a second.
-SERVER_ERROR_FALLBACK_SLEEP_S = 5.0
+# Brief pause before retrying the same (or next) model on 503/5xx so a demand
+# spike is not burned through attempts in under a second.
+SERVER_ERROR_RETRY_SLEEP_S = 5.0
 
 
 def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int | None]:
@@ -130,7 +130,6 @@ class GeminiAgent:
         self._generate_fn = generate_fn
         self._last_call_at: float | None = None
         self._skip_min_interval = False
-        self._preferred_model: str | None = None
 
     def _configured_models(self) -> list[str]:
         models = [m for m in (self.settings.gemini_models or []) if m]
@@ -141,11 +140,7 @@ class GeminiAgent:
     def _models_for_call(self, model: str | None) -> list[str]:
         if model:
             return [model]
-        models = self._configured_models()
-        preferred = self._preferred_model
-        if preferred and preferred in models:
-            return [preferred] + [m for m in models if m != preferred]
-        return models
+        return self._configured_models()
 
     def _retry_addon(self, schema: type[BaseModel] | None) -> str:
         name = getattr(schema, "__name__", "") if schema is not None else ""
@@ -230,15 +225,6 @@ class GeminiAgent:
                     schema.model_validate(data)
                     if not isinstance(text, str):
                         text = json.dumps(data, ensure_ascii=False)
-                # Prefer a fallback model that just succeeded (demand spike).
-                configured = self._configured_models()
-                if configured and current_model != configured[0]:
-                    if self._preferred_model != current_model:
-                        logger.info(
-                            "Preferring Gemini model %s after successful fallback",
-                            current_model,
-                        )
-                    self._preferred_model = current_model
                 self.pool.report_success(key)
                 return text
             except (StructuredOutputError, json.JSONDecodeError, ValidationError) as exc:
@@ -257,37 +243,36 @@ class GeminiAgent:
                     raise
                 logger.warning("Gemini call failed on %s (%s): %s", key.id, current_model, exc)
                 if kind == FailureKind.SERVER_ERROR:
+                    # With a single configured model (3.6-flash), retry the same
+                    # model after a pause. Multi-model lists still rotate if set.
                     unavailable.add(current_model)
                     still = [m for m in models if m not in unavailable]
-                    if still:
-                        # Demand spikes (503) need a pause; retired-model 404s do not.
-                        msg = str(exc).lower()
-                        is_demand = (
-                            "503" in msg
-                            or "unavailable" in msg
-                            or "high demand" in msg
-                            or "502" in msg
-                            or "504" in msg
+                    msg = str(exc).lower()
+                    is_demand = (
+                        "503" in msg
+                        or "unavailable" in msg
+                        or "high demand" in msg
+                        or "502" in msg
+                        or "504" in msg
+                    )
+                    if not still:
+                        unavailable.clear()
+                        still = [current_model]
+                    wait_s = 0.0
+                    if is_demand:
+                        wait_s = (
+                            (retry_ms / 1000.0)
+                            if retry_ms
+                            else SERVER_ERROR_RETRY_SLEEP_S
                         )
-                        if is_demand:
-                            wait_s = (
-                                (retry_ms / 1000.0)
-                                if retry_ms
-                                else SERVER_ERROR_FALLBACK_SLEEP_S
-                            )
-                            logger.warning(
-                                "Falling back to Gemini model %s after %.1fs",
-                                still[0],
-                                wait_s,
-                            )
-                            time.sleep(wait_s)
-                        else:
-                            logger.warning(
-                                "Falling back to Gemini model %s", still[0]
-                            )
-                        self._skip_min_interval = True
-                        continue
-                    unavailable.clear()
+                        time.sleep(wait_s)
+                    logger.warning(
+                        "Retrying Gemini model %s%s",
+                        still[0],
+                        f" after {wait_s:.1f}s" if wait_s else "",
+                    )
+                    self._skip_min_interval = True
+                    continue
                 self.pool.report_failure(key, kind, retry_ms)
                 key = None
                 if kind == FailureKind.QUOTA_EXHAUSTED and self.pool.all_daily_quota_locked():

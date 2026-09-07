@@ -27,8 +27,11 @@ it wastes the whole response. Return only:
   2. mentions    REQUIRED for every numbered hadith -- prefer 3-8, never []
   3. ravis       isnad order
   4. quotes      Qur'anic spans only (kind "quran"), no sura/verse numbers
-  5. hadith_fa   fluent Persian
-  6. hadith_en   precise English
+  5. hadith_fa   fluent Persian of the FULL matn on this page (no `...`, no summary)
+  6. hadith_en   precise English of the FULL matn on this page (no `...`, no summary)
+Translate every sentence of the matn present on the page. Never truncate with
+ellipsis, never write "ادامه" / "Continuation of", never paraphrase half and drop
+the rest. If the page is only isnad with no matn yet, leave fa/en empty.
 
 WHAT A MENTION IS
 
@@ -81,6 +84,11 @@ UNIFY_PROMPT = """\
 From THIS assembled Arabic hadith only (ignore chapter titles and other narrations),
 return Persian (hadith_fa), English (hadith_en), ravis, mentions, and quotes.
 
+hadith_fa / hadith_en MUST cover the entire assembled matn end-to-end.
+Forbidden: ellipsis (`...`), "ادامه روایت", "Continuation of the previous",
+summaries that skip dialogue, or translating only the opening line.
+If earlier page fragments left a stub translation, replace it with a complete one.
+
 Mentions = what the matn is ABOUT: {text, type, salience, evidence}.
 type is concept|person|place|group|event|work. Prefer plain forms (العقل not عقل المرء)
 but KEEP real compounds (خلق العقل). Narrators and the speaker go in ravis only.
@@ -99,7 +107,8 @@ Do not use semantic_nodes. Example shape:
 
 UNIFY_TOPICS_OPTIONAL = """\
 Mentions are already present. You may add better ones; empty mentions is OK when
-you are only filling translations or ravis.
+you are only filling translations or ravis. Still return complete hadith_fa and
+hadith_en for the full Arabic — replace any truncated stubs.
 """
 
 MENTIONS_FILL_PROMPT = """\

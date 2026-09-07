@@ -123,12 +123,28 @@ def extract_hadith_page(agent: GeminiAgent, unit: ParsedUnit) -> dict:
     return remap_hadith_payload(result.model_dump())
 
 
+_INCOMPLETE_TRANSLATION = re.compile(
+    r"(?:\.\.\.|…|ادامه\s+روایت|ادامه\s+سفارش|Continuation\s+of|"
+    r"\[\s*بهتر\s+از\s*\]|"
+    r"narrated\s*\.\.\.|روایت\s*کرده‌اند\s*که\s*\.\.\.)",
+    re.IGNORECASE,
+)
+
+
+def translation_incomplete(text: str) -> bool:
+    """Page fragments often land as summaries ending in `...` / ادامه."""
+    value = str(text or "").strip()
+    if not value:
+        return True
+    return bool(_INCOMPLETE_TRANSLATION.search(value))
+
+
 def needs_enrichment(payload: dict) -> bool:
     if payload.get("page_start") != payload.get("page_end"):
         return True
-    if not str(payload.get("hadith_fa") or "").strip():
+    if translation_incomplete(str(payload.get("hadith_fa") or "")):
         return True
-    if not str(payload.get("hadith_en") or "").strip():
+    if translation_incomplete(str(payload.get("hadith_en") or "")):
         return True
     # Either channel counts. Keying on semantic_nodes alone made every payload
     # extracted under the mention contract look hollow, so every one of them
@@ -141,13 +157,13 @@ def needs_enrichment(payload: dict) -> bool:
 
 
 def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
-    """Fill missing FA/EN/mentions/ravis; always refresh ravis on multi-page.
+    """Fill/repair FA/EN/mentions/ravis; always refresh ravis on multi-page.
 
-    When topics are missing, a dedicated MentionsFill call runs first so the
-    model cannot return FA/ravis with mentions:[]. Soft unify then fills
-    translations. When topics are already present, a failed unify keeps the
-    assembled payload. When topics stay missing after MentionsFill, failure is
-    raised so the runner marks ERROR instead of writing hollow PROCESSED files.
+    Truncated page translations (`...` / ادامه) and multi-page stubs are
+    replaced by unify's full translation of the assembled Arabic. When topics
+    are missing, MentionsFill runs first. Soft unify then fills the rest.
+    When topics stay missing after MentionsFill, failure is raised so the
+    runner marks ERROR instead of writing hollow PROCESSED files.
     """
     from src.agents.errors import ProviderServerError, StructuredOutputError
 
@@ -225,9 +241,19 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
             [n.model_dump() for n in result.semantic_nodes],
             out.get("ravis"),
         )
-    if result.hadith_fa and not str(payload.get("hadith_fa") or "").strip():
+    # Page extract often leaves truncated FA/EN (`...` / ادامه). Multi-page
+    # assemble joins those fragments; unify must replace them with a full
+    # translation of the assembled Arabic — never keep the stub.
+    multi_page = payload.get("page_start") != payload.get("page_end")
+    if result.hadith_fa and (
+        multi_page
+        or translation_incomplete(str(payload.get("hadith_fa") or ""))
+    ):
         out["hadith_fa"] = result.hadith_fa
-    if result.hadith_en and not str(payload.get("hadith_en") or "").strip():
+    if result.hadith_en and (
+        multi_page
+        or translation_incomplete(str(payload.get("hadith_en") or ""))
+    ):
         out["hadith_en"] = result.hadith_en
     out = remap_hadith_payload(out)
     if need_topics and not (out.get("mentions") or []):
@@ -277,20 +303,32 @@ def persist_complete_hadith(
     output_dir: Path,
     status: ChunkStatus = ChunkStatus.PROCESSED_PHASE1,
     error: str | None = None,
+    force: bool = False,
 ) -> str:
-    """Write one complete narration and upsert it as an embeddable Phase 1 chunk."""
+    """Write one complete narration and upsert it as an embeddable Phase 1 chunk.
+
+    When `force` is true (targeted --page debug), always rewrite the JSON and
+    refresh the stored payload. Otherwise skip only if the chunk is already
+    processed *and* the output file is still on disk — so deleting JSON for
+    debugging still recreates files on the next run.
+    """
     payload["hadith"] = strip_folklib_footnotes(str(payload.get("hadith") or ""))
     locator = str(payload.get("locator") or "")
     marker = str(payload.get("marker") or "")
     arabic = str(payload.get("hadith") or "")
     cid = chunk_id(book_id, f"{marker}|{locator}", arabic)
-    existing = state.get_chunk(cid)
-    if existing and existing.status not in {ChunkStatus.PENDING, ChunkStatus.ERROR}:
-        if status == ChunkStatus.PROCESSED_PHASE1:
-            return cid
     dest = output_dir / book_id
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / phase1_filename(source_path, locator, cid, marker=marker)
+    existing = state.get_chunk(cid)
+    if (
+        not force
+        and existing
+        and existing.status not in {ChunkStatus.PENDING, ChunkStatus.ERROR}
+        and status == ChunkStatus.PROCESSED_PHASE1
+        and path.exists()
+    ):
+        return cid
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     if not existing:
         state.upsert_chunks(

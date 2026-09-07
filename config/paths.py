@@ -16,6 +16,7 @@ ONTOLOGY_YAML = CONFIG_DIR / "base_ontology.yaml"
 # apart from the hand-written catalog so a re-harvest can never overwrite a
 # curation decision.
 DERIVED_ONTOLOGY_YAML = CONFIG_DIR / "derived_ontology.yaml"
+DERIVED_ALIASES_YAML = CONFIG_DIR / "derived_aliases.yaml"
 # Cached answers from the offline adjudicator, so no label is ever paid for twice.
 ADJUDICATED_JSON = CONFIG_DIR / "adjudicated.json"
 ENTITIES_YAML = CONFIG_DIR / "entities.yaml"

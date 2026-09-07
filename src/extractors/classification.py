@@ -28,8 +28,14 @@ logger = logging.getLogger(__name__)
 # colon, made all 11,805 of its headings invisible -- the single richest topical
 # index in the corpus, silently skipped by two characters of regex.
 _NUMBER_PREFIX = r"(?:[٠-٩0-9]{1,4}\s*[ـ\-–—]\s*)?"
-_KITAB = re.compile(rf"^{_NUMBER_PREFIX}(?:كِتَابُ|كتاب)\s")
-_BAB = re.compile(rf"^{_NUMBER_PREFIX}(?:بَابُ|باب)\s")
+# The keyword may be the whole line. al-Kafi's typesetter prints `بَابُ` alone
+# and the subject on the next line, which `_join_wrapped` is built to reassemble
+# -- but it never ran, because requiring whitespace after the keyword meant the
+# first line did not look like a heading in the first place. Volume 1 yielded 65
+# headings instead of roughly 200, and `باب فرض العلم و وجوب طلبه` -- the chapter
+# that gives the corpus طلب العلم at all -- was among the invisible ones.
+_KITAB = re.compile(rf"^{_NUMBER_PREFIX}(?:كِتَابُ|كتاب)(?:\s|$)")
+_BAB = re.compile(rf"^{_NUMBER_PREFIX}(?:بَابُ|باب)(?:\s|$)")
 # The separator is optional here: `clean_heading` strips tatweel, so by the time
 # a title reaches `heading_topic` the `١ ـ باب` has already become `١ باب`.
 _HEADING_PREFIX = re.compile(

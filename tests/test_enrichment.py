@@ -10,6 +10,7 @@ import pytest
 from src.extractors.classification import heading_topic, page_headings
 from src.pipelines import adjudicate as adj
 from src.pipelines import harvest
+from src.pipelines.ontology import normalize_ar
 
 
 # ------------------------------------------------------------- layer 1 parse
@@ -115,10 +116,107 @@ def test_scan_reads_headings_into_terms_with_parents(tmp_path: Path):
     )
     found = harvest.scan(tmp_path)
     assert "الإخلاص" in found.terms
+    # scan only records the vote; settle_parents decides. See the comment above
+    # `_PARENT_MAJORITY` for why the decision has to wait for the whole corpus.
+    assert found.votes["الإخلاص"] == {"الإيمان و الكفر": 1}
+    harvest.settle_parents(found)
     assert found.terms["الإخلاص"] == "الإيمان و الكفر"
     # The propositional bab was counted and skipped, not turned into a term.
     assert found.skipped_propositional >= 1
     assert not any("يكذب" in term for term in found.terms)
+
+
+def test_a_parent_must_win_a_majority_of_a_terms_printings():
+    """`broader` means IS-A, but a heading only tells us WAS-PRINTED-UNDER.
+
+    The two coincide for a title specific to its book and part company for a
+    cross-cutting one: باب الأطفال sits in كتاب الجنائز because of the funeral
+    prayer for children, but children are not a kind of funeral. Reading
+    location as taxonomy put الميراث under النكاح and الشهادة under الجهاد.
+    """
+    found = harvest.Harvest()
+    for term in ("الطواف", "الأطفال"):
+        found.terms[term] = ""
+        found.standalone.add(term)
+    # Specific to one book.
+    for _ in range(9):
+        found.vote("الطواف", "الحج")
+    found.vote("الطواف", "الصلاة")
+    # Printed all over the corpus.
+    for kitab in ("الجنائز", "النكاح", "المواريث", "العقيقة", "الديات"):
+        found.vote("الأطفال", kitab)
+
+    stats = harvest.settle_parents(found)
+    assert found.terms["الطواف"] == "الحج"
+    assert found.terms["الأطفال"] == ""
+    assert stats["cross_cutting"] == 1
+
+
+def test_a_book_is_never_a_subtopic_of_another_book():
+    """كتاب الصيام is named inside كتاب الطهارة's chapters. That is a reference,
+    not parentage -- it had الصيام coming out as `broader: الطهارة`."""
+    found = harvest.Harvest()
+    found.terms["الصيام"] = ""
+    found.standalone.add("الصيام")
+    found.kitabs.add(normalize_ar("الصيام"))
+    for _ in range(5):
+        found.vote("الصيام", "الطهارة")
+    stats = harvest.settle_parents(found)
+    assert found.terms["الصيام"] == ""
+    assert stats["is_a_kitab"] == 1
+
+
+def test_a_fragment_that_was_never_a_chapter_gets_no_parent():
+    """Majority is blind to a term printed under exactly one book: it scores
+    100% however generic it is. التوحيد came out as a subtopic of الصلاة that
+    way, القيامة of معاني الأخبار. What those share is that no book ever made
+    them a chapter -- they exist only as fragments layer 2 pulled out of longer
+    titles, which is the least reliable parentage evidence there is.
+    """
+    found = harvest.Harvest()
+    for term in ("الطواف", "التوحيد"):
+        found.terms[term] = ""
+        for _ in range(6):
+            found.vote(term, "الحج" if term == "الطواف" else "الصلاة")
+    # Only الطواف was ever printed as a chapter subject in its own right.
+    found.standalone.add("الطواف")
+
+    stats = harvest.settle_parents(found)
+    assert found.terms["الطواف"] == "الحج"
+    assert found.terms["التوحيد"] == ""
+    assert stats["never_a_chapter"] == 1
+
+
+def test_one_book_printed_several_ways_is_one_parent():
+    """كتاب الفرائض, كتاب المواريث and كتاب الفرائض والمواريث are one book.
+
+    Left as three parents they split its children three ways, and worse, they
+    split the VOTE -- no spelling reached the majority on its own, so children
+    that plainly belonged to it came out unparented. Aliasing therefore has to
+    happen before the majority is counted, not after.
+
+    Each merge in `_KITAB_ALIASES` was checked against the corpus the same way:
+    two titles naming the same book never open in the same volume. الأطعمة and
+    الأشربة do (al-Kafi 6), so they are left alone.
+    """
+    found = harvest.Harvest()
+    found.terms["ميراث الإخوة"] = ""
+    found.standalone.add("ميراث الإخوة")
+    for kitab in ("الفرائض", "الفرائض", "المواريث", "الفرائض و المواريث"):
+        found.vote("ميراث الإخوة", kitab)
+    harvest.settle_parents(found)
+    # No single spelling holds 65% -- but they are one book, so it wins outright.
+    assert found.terms["ميراث الإخوة"] == "المواريث"
+
+
+def test_distinct_books_are_not_merged_however_similar():
+    """al-Kafi 6 opens كتاب الأطعمة and كتاب الأشربة as separate books, so the
+    two are a real division the compilers made, not a spelling variant."""
+    assert harvest._alias("الأطعمة") != harvest._alias("الأشربة")
+    assert harvest._alias("الصيد") != harvest._alias("الذبائح")
+    # And the verified-same ones do collapse.
+    assert harvest._alias("الصوم") == harvest._alias("الصيام")
+    assert harvest._alias("الوصايا") == harvest._alias("الوصية")
 
 
 def test_prose_never_becomes_a_broader_parent(tmp_path: Path):

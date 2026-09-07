@@ -473,6 +473,34 @@ def test_gemini_503_falls_back_to_next_model(state: StateManager, monkeypatch: p
     assert state.get_cooldown(key_id_for("a", 0)) is None
 
 
+def test_gemini_503_retries_same_model_when_alone(
+    state: StateManager, monkeypatch: pytest.MonkeyPatch
+):
+    slept: list[float] = []
+    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: slept.append(s))
+    seen: list[str] = []
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        seen.append(model)
+        if len(seen) == 1:
+            raise RuntimeError("503 UNAVAILABLE. high demand")
+        return "ok"
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(
+            gemini_min_interval_ms=0,
+            gemini_max_attempts=3,
+            gemini_models=["gemini-3.6-flash"],
+        ),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    assert agent.complete("x") == "ok"
+    assert seen == ["gemini-3.6-flash", "gemini-3.6-flash"]
+    assert slept == [5.0]
+
+
 def test_gemini_404_retired_model_falls_back(state: StateManager):
     seen: list[str] = []
 
@@ -866,7 +894,18 @@ def test_reduction_never_rescues_a_two_idea_label():
     # النكراء is a catalog concept, so reduction would happily keep it and
     # silently discard الشيطنة. The و-check has to win first.
     assert resolve_node("الشيطنة والنكراء", "concept") is None
-    assert resolve_node("العقل والجهل", "concept") is None
+
+
+def test_a_two_idea_label_the_catalog_itself_carries_is_matched_whole():
+    """كتاب العقل و الجهل is one of al-Kafi's books, so it is one concept.
+
+    The rule above is about reduction discarding half a label. Matching the
+    whole of it against a catalog entry that happens to name two ideas is not
+    that -- nothing is dropped. Only the typesetter's spacing around the
+    conjunction differs, which `normalize_ar` folds.
+    """
+    assert resolve_node("العقل والجهل", "concept") == "العقل و الجهل"
+    assert resolve_node("العقل و الجهل", "concept") == "العقل و الجهل"
 
 
 def test_named_being_emitted_as_a_concept_is_retyped_and_demoted():
@@ -1391,6 +1430,120 @@ def test_hadith_limit_and_json_error_do_not_open_next_volume(
     assert state.get_hadith_progress("hadith", str(v3)) is None
 
 
+def test_locator_matches_page_number_and_volume():
+    from src.pipelines.runner import locator_matches_page
+
+    loc = "جلد 1 - صفحه 30"
+    assert locator_matches_page(loc, "30")
+    assert locator_matches_page(loc, "30", volume=1)
+    assert locator_matches_page(loc, "جلد 1 - صفحه 30")
+    assert not locator_matches_page(loc, "300")
+    assert not locator_matches_page(loc, "30", volume=2)
+    assert not locator_matches_page("جلد 1 - صفحه 3", "30")
+
+
+def test_hadith_phase1_page_filter_only_that_page(
+    tmp_path: Path, state: StateManager, monkeypatch: pytest.MonkeyPatch
+):
+    from src.pipelines import runner as runner_mod
+    from src.pipelines.catalog import BookSpec
+
+    raw = tmp_path / "hadith"
+    raw.mkdir()
+    long = "متن حديث طويل بما يكفي. " * 8
+    path = raw / "al-kafi-1.txt"
+    pages = "\n".join(
+        f"--- [جلد 1 - صفحه {n}] ---\n\n{n}- {long}\n" for n in range(29, 32)
+    )
+    path.write_text(pages, encoding="utf-8")
+    page_calls: list[str] = []
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        if schema is MentionsFill:
+            return json.dumps(
+                {
+                    "mentions": [
+                        {
+                            "text": "العقل",
+                            "type": "concept",
+                            "salience": 0.9,
+                            "evidence": "متن حديث",
+                        },
+                        {
+                            "text": "الجنة",
+                            "type": "concept",
+                            "salience": 0.5,
+                            "evidence": "متن حديث",
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if isinstance(schema, type) and issubclass(schema, HadithUnify):
+            return json.dumps(
+                {
+                    "semantic_nodes": _concept_nodes("العقل", "الجنة"),
+                    "ravis": ["هشام"],
+                    "hadith_fa": "ف",
+                    "hadith_en": "e",
+                }
+            )
+        page_calls.append(prompt)
+        return json.dumps(
+            {
+                "page": "جلد 1 - صفحه 30",
+                "hadiths": [
+                    {
+                        "marker": "30 -",
+                        "mentions": [
+                            {
+                                "text": "العقل",
+                                "type": "concept",
+                                "salience": 0.9,
+                                "evidence": "متن حديث",
+                            }
+                        ],
+                        "ravis": ["هشام"],
+                        "quotes": [],
+                        "hadith_fa": "ف",
+                        "hadith_en": "e",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    settings = Settings(
+        gemini_max_attempts=2,
+        google_api_keys=["k"],
+        skip_min_chars=10,
+        gemini_min_interval_ms=0,
+    )
+    agent = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    # Pretend a full run already progressed past page 30 — page filter must
+    # still hit 30 and must not rewrite that resume cursor.
+    state.set_hadith_progress("hadith", str(path), "جلد 1 - صفحه 100")
+    monkeypatch.setattr(runner_mod, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(
+        runner_mod,
+        "resolve_book",
+        lambda *a, **k: BookSpec("hadith", "hadith", "", [path]),
+    )
+    stats = runner_mod.run_phase1(
+        "hadith", state, agent, settings=settings, page="30", volume=1
+    )
+    assert stats["pages"] == 1
+    assert stats["errors"] == 0
+    assert len(page_calls) == 1
+    assert "صفحه 30" in page_calls[0]
+    assert state.get_hadith_progress("hadith", str(path)) == "جلد 1 - صفحه 100"
+
+
 def test_page_prefix_keeps_continuation_before_new_marker():
     page = """تتمة الحديث السابق من دون رقم.
 
@@ -1729,6 +1882,78 @@ def test_unify_accepts_translation_only_reply(state: StateManager):
     assert out["hadith_fa"] == "ف"
     assert out["hadith_en"] == "e"
     assert [m["text"] for m in out["mentions"]] == ["العقل"]
+
+
+def test_unify_overwrites_truncated_translations(state: StateManager):
+    """Multi-page stubs ending in `...` must not block a full re-translation."""
+    from src.pipelines.llm_processor import needs_enrichment, translation_incomplete
+
+    assert translation_incomplete("به اهل دینی که عقل ندارند اعتنایی نمی‌شود...")
+    assert translation_incomplete(
+        "Imam said: no importance...\nContinuation of the previous narration: ..."
+    )
+    assert not translation_incomplete("امام رضا فرمود: عقل را آفرید و گفت اقبال کن.")
+
+    n = {"i": 0}
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        n["i"] += 1
+        assert schema is HadithUnify
+        return json.dumps(
+            {
+                "hadith_fa": (
+                    "امام رضا (ع) فرمود: به اهل دینی که عقل ندارند اعتنایی نمی‌شود. "
+                    "گفتم: فدایت شوم، از کسانی که این امر را توصیف می‌کنند قومی نزد ما "
+                    "بی‌اشکال‌اند ولی آن عقول را ندارند. فرمود: اینان از کسانی نیستند "
+                    "که خدا خطابشان کرده؛ خدا عقل را آفرید و گفت پیش آی، پیش آمد، "
+                    "بازگرد، بازگشت، و فرمود چیزی نیکوتر یا محبوب‌تر از تو نیافریدم."
+                ),
+                "hadith_en": (
+                    "Imam al-Rida (as) said: No importance is given to people of "
+                    "religion who have no intellect. I said: May I be your ransom, "
+                    "some who describe this matter seem fine to us yet lack those "
+                    "intellects. He said: Those are not whom God addressed; God "
+                    "created the intellect and said come forward, it came, go back, "
+                    "it went back, and said I created nothing better or dearer than you."
+                ),
+                "mentions": [],
+                "semantic_nodes": [],
+                "ravis": ["الحسن بن الجهم", "أبو الحسن الرضا ع"],
+            },
+            ensure_ascii=False,
+        )
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0, gemini_max_attempts=4),
+        key_pool=KeyPool(state, keys=["k"]),
+        generate_fn=fake_generate,
+    )
+    stub = {
+        "marker": "32 -",
+        "locator": "جلد 1 - صفحه 27 تا 28",
+        "page_start": "جلد 1 - صفحه 27",
+        "page_end": "جلد 1 - صفحه 28",
+        "hadith": "ذُكِرَ عِنْدَهُ أَصْحَابُنَا وَ ذُكِرَ الْعَقْلُ ... بِكَ آخُذُ وَ بِكَ أُعْطِي.",
+        "hadith_fa": "امام رضا (ع) فرمودند: به اهل دینی که عقل ندارند اعتنایی نمی‌شود...",
+        "hadith_en": (
+            "Imam al-Rida (as) said when our companions and the intellect were "
+            "mentioned: 'No importance is given to the people of religion who "
+            "have no intellect...'"
+        ),
+        "mentions": [
+            {"text": "العقل", "type": "concept", "salience": 0.95, "evidence": "الْعَقْلُ"}
+        ],
+        "semantic_nodes": [],
+        "ravis": ["الحسن بن الجهم"],
+    }
+    assert needs_enrichment(stub) is True
+    out = unify_assembled_hadith(agent, stub)
+    assert n["i"] == 1
+    assert "پیش آی" in out["hadith_fa"]
+    assert "come forward" in out["hadith_en"]
+    assert "..." not in out["hadith_fa"]
+    assert out["ravis"] == ["الحسن بن الجهم", "أبو الحسن الرضا ع"]
 
 
 def test_unify_requires_topics_when_mentions_empty(state: StateManager):

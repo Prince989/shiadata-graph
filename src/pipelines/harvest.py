@@ -114,6 +114,18 @@ class Harvest:
     sources: Counter = field(default_factory=Counter)        # term -> heading count
     skipped_propositional: int = 0
     long_titles: list[tuple[str, str]] = field(default_factory=list)
+    # term -> {kitab it was printed under: how often}. `broader` is settled from
+    # this once the whole corpus has voted; see `settle_parents`.
+    votes: dict[str, Counter] = field(default_factory=dict)
+    # Normalised titles of every book the corpus opens. A book is top level, so
+    # it can never be a subtopic of another one.
+    kitabs: set[str] = field(default_factory=set)
+    # Terms the books made a chapter subject in their own right, as opposed to
+    # ones only ever pulled out of a longer title by layer 2.
+    standalone: set[str] = field(default_factory=set)
+
+    def vote(self, term: str, kitab: str) -> None:
+        self.votes.setdefault(term, Counter())[kitab] += 1
 
     def summary(self) -> dict[str, int]:
         return {
@@ -254,7 +266,9 @@ def _flush_span(out: Harvest, kitab: str, span: list[tuple[bool, str, int]]) -> 
     for position, (is_term, label, _) in enumerate(span):
         parent = "" if cut is not None and position >= cut else kitab
         if is_term:
-            out.terms.setdefault(label, parent if parent != label else "")
+            out.terms.setdefault(label, "")
+            out.standalone.add(label)
+            out.vote(label, parent if parent != label else "")
             out.sources[label] += 1
         else:
             out.long_titles.append((label, parent))
@@ -317,6 +331,7 @@ def scan(root: Path | None = None, pattern: str = "*.txt") -> Harvest:
                     kitab = candidate if _is_term(candidate) else ""
                     if kitab:
                         out.terms.setdefault(kitab, "")
+                        out.kitabs.add(normalize_ar(kitab))
                         out.sources[kitab] += 1
                     else:
                         logger.info("kitab heading not usable as a parent: %r", topic)
@@ -352,14 +367,17 @@ def mine_long_titles(harvest: Harvest, rounds: int = 3) -> int:
         for title, kitab in harvest.long_titles:
             for _key, pref in decompose(title):
                 if pref not in harvest.terms:
-                    harvest.terms[pref] = kitab if kitab != pref else ""
+                    harvest.terms[pref] = ""
                     added += 1
+                harvest.vote(pref, kitab if kitab != pref else "")
                 harvest.sources[pref] += 1
             # Any short residue the meta-head strip left behind is itself a term.
             residue = _strip_meta_head(title)
-            if _is_term(residue) and residue not in harvest.terms:
-                harvest.terms[residue] = kitab if kitab != residue else ""
-                added += 1
+            if _is_term(residue):
+                if residue not in harvest.terms:
+                    harvest.terms[residue] = ""
+                    added += 1
+                harvest.vote(residue, kitab if kitab != residue else "")
         if added == before:
             break
         _reload_catalog()
@@ -415,6 +433,141 @@ def _reload_catalog() -> None:
 
 def _yaml_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# `broader` is a SKOS hierarchy edge: the child must be a KIND OF the parent.
+# What a heading gives us is weaker -- where the chapter was PRINTED -- and the
+# two only coincide for titles specific to their book. `طواف النساء` is printed
+# under كتاب الحج and is genuinely a part of Hajj. `الأطفال` is printed under
+# كتاب الجنائز because of the funeral prayer for children, but children are not
+# a kind of funeral. Reading location as taxonomy put الميراث under النكاح,
+# الشهادة under الجهاد and القبر under الحجة.
+#
+# What separates them is spread. A term specific to one book is printed only in
+# that book; a cross-cutting one turns up all over the corpus. So a parent has
+# to be earned by a clear majority of a term's printings, and a term that never
+# settles on one book gets no parent -- it is a concept in its own right, not a
+# subtopic of wherever it was first seen.
+#
+# Books with no kitab structure (al-Khisal, Tuhaf al-'Uqul, the amali) abstain
+# rather than vote: they are no evidence either way about hierarchy.
+# Measured, not guessed. Against twenty edges known to be right (الطواف→الحج,
+# التيمم→الطهارة, سجود→الصلاة, الشهادة→الشهادات ...) and nineteen known to be
+# wrong: 0.60 keeps all twenty but also all nineteen; 0.65 keeps all twenty and
+# drops four of the wrong ones; 0.70 starts costing real edges (رمي→الحج,
+# مسح→الطهارة) to gain one. So 0.65, and the rest is not a threshold problem.
+_PARENT_MAJORITY = 0.65
+
+# Majority is blind to a term printed under exactly one book, which scores 100%
+# however generic it is -- التوحيد came out as a subtopic of الصلاة, الجهل of
+# الحج, القيامة of معاني الأخبار. What those share is that no book ever made
+# them a chapter subject: they exist only as fragments layer 2 pulled out of
+# longer titles, so their parent is the least reliable evidence there is.
+#
+# A concept earns a parent by having been a chapter in its own right somewhere.
+# This costs التوكل→الإيمان و الكفر, which was correct -- but an unparented
+# التوكل is a gap, not a claim, and the same trade is made everywhere else here.
+_REQUIRE_STANDALONE_FOR_PARENT = True
+_MIN_PARENT_OBSERVATIONS = 1
+
+# One book, several printed titles. Curated, because no rule derives it -- but
+# not guessed either: two titles naming the SAME book never open in the same
+# volume, and that is checkable against the corpus. Every merge below was
+# verified to have no co-occurrence; every cluster that did co-occur was left
+# alone, which is why الأطعمة/الأشربة, الصيد/الذبائح and البيوع/المكاسب are
+# absent -- al-Kafi 6 and al-Istibsar 3 open both halves of each as their own
+# books, so they are genuinely distinct and merging them would lose a real
+# division the compilers made.
+#
+# Aliasing has to happen before the majority is counted, not after: split across
+# four spellings, كتاب الفرائض's children reached no threshold at all and came
+# out unparented.
+#
+# The one co-occurrence inside the inheritance cluster (Faqih 4 opening both
+# فرايض and فرايض و المواريث) is the truncated-heading bug, §7 defect 3 -- the
+# short form there is `كتاب الفرائض و` with its المواريث lost to a page number.
+_KITAB_ALIASES = {
+    "صوم": "الصيام",                      # كتاب الصوم / كتاب الصيام
+    "صيام": "الصيام",
+    "وصيه": "الوصية",                     # كتاب الوصية / كتاب الوصايا
+    "وصايا": "الوصية",
+    "حدود": "الحدود",                     # كتاب الحدود / كتاب الحدود والتعزيرات
+    "حدود والتعزيرات": "الحدود",
+    "قضاء": "القضاء",                     # كتاب القضاء / القضاء و الأحكام / القضايا والأحكام
+    "قضاء و الاحكام": "القضاء",
+    "قضايا والاحكام": "القضاء",
+    "فرايض": "المواريث",                  # كتاب الفرائض / المواريث / الفرائض والمواريث
+    "مواريث": "المواريث",
+    "فرايض و المواريث": "المواريث",
+    "فرايض والمواريث": "المواريث",
+    "عتق": "العتق",                       # كتاب العتق / العتق وكيفيته
+    "عتق وكيفيته": "العتق",
+}
+
+
+def _alias(kitab: str) -> str:
+    """The normalised key a kitab votes under, after merging its printed names."""
+    folded = normalize_ar(kitab)
+    canonical = _KITAB_ALIASES.get(folded)
+    return normalize_ar(canonical) if canonical else folded
+
+
+def _canonical_parents(harvest: Harvest) -> dict[str, str]:
+    """One surface spelling per kitab, so variants do not split the hierarchy.
+
+    Two sources of variance. Pure spelling -- harakat, hamza seat -- which
+    `normalize_ar` folds and where the most-printed surface form wins. And the
+    same book printed under different titles, which only `_KITAB_ALIASES` knows.
+    """
+    spellings: dict[str, Counter] = {}
+    for tally in harvest.votes.values():
+        for kitab, count in tally.items():
+            if kitab:
+                spellings.setdefault(_alias(kitab), Counter())[kitab] += count
+    out = {}
+    for folded, tally in spellings.items():
+        named = _KITAB_ALIASES.get(folded)
+        out[folded] = named or tally.most_common(1)[0][0]
+    return out
+
+
+def settle_parents(harvest: Harvest) -> dict[str, int]:
+    """Decide every `broader` from the corpus-wide vote. Run before `write`."""
+    canonical = _canonical_parents(harvest)
+    stats = Counter()
+    for term, tally in harvest.votes.items():
+        # A book is top level. When its name also turns up inside another book's
+        # chapters -- كتاب الصيام mentioned across كتاب الطهارة, كتاب النكاح
+        # inside the diyat chapters -- those are references, not parentage.
+        if _alias(term) in harvest.kitabs:
+            stats["is_a_kitab"] += 1
+            harvest.terms[term] = ""
+            continue
+        if _REQUIRE_STANDALONE_FOR_PARENT and term not in harvest.standalone:
+            stats["never_a_chapter"] += 1
+            harvest.terms[term] = ""
+            continue
+        grouped: Counter = Counter()
+        for kitab, count in tally.items():
+            if kitab:
+                grouped[_alias(kitab)] += count
+        total = sum(grouped.values())
+        if not total:
+            stats["no_kitab_evidence"] += 1
+            harvest.terms[term] = ""
+            continue
+        folded, top = grouped.most_common(1)[0]
+        if total < _MIN_PARENT_OBSERVATIONS:
+            stats["too_few_printings"] += 1
+            harvest.terms[term] = ""
+            continue
+        if top / total < _PARENT_MAJORITY or _alias(term) == folded:
+            stats["cross_cutting"] += 1
+            harvest.terms[term] = ""
+            continue
+        stats["settled"] += 1
+        harvest.terms[term] = canonical.get(folded, folded)
+    return dict(stats)
 
 
 def write(harvest: Harvest, path: Path | None = None, min_sources: int = 1) -> int:

@@ -253,6 +253,21 @@ class AdjudicationBatch(BaseModel):
     verdicts: list[Adjudication] = Field(default_factory=list)
 
 
+class AliasProposal(BaseModel):
+    """Other wordings one concept is written in.
+
+    Proposals only. Nothing here reaches the catalog until the corpus is checked
+    for the wording -- see `src.pipelines.aliases.ground`.
+    """
+
+    concept: str
+    aliases: list[str] = Field(default_factory=list)
+
+
+class AliasBatch(BaseModel):
+    entries: list[AliasProposal] = Field(default_factory=list)
+
+
 class DuplicateVerdict(BaseModel):
     duplicate: bool
     reason: str = ""

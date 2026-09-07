@@ -60,12 +60,32 @@ def phase1(
         "--limit",
         help="Max pages/chunks this run across all volume files (not per file)",
     ),
+    page: str | None = typer.Option(
+        None,
+        "--page",
+        help=(
+            "Only process this print page (debug). "
+            "Bare number like 30, or locator fragment like 'جلد 1 - صفحه 30'. "
+            "Does not advance resume progress."
+        ),
+    ),
+    volume: str | None = typer.Option(
+        None,
+        "--volume",
+        help="With --page, restrict to جلد N (e.g. --volume 1)",
+    ),
 ) -> None:
     """Parse a book and run Gemini structured extraction."""
     _setup_logging()
     state, gemini, _ = _stack()
     try:
-        stats = run_phase1(book, state, gemini, limit=limit)
+        stats = run_phase1(book, state, gemini, limit=limit, page=page, volume=volume)
+    except FileNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     except AllKeysExhausted as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
@@ -213,6 +233,12 @@ def harvest_ontology(
     typer.echo(f"layer 2 (decomposed)   +{mined}")
     promoted = harvester.promote_recurring(found, min_df=min_df)
     typer.echo(f"layer 3 (recurring)    +{promoted}")
+    # Only now has every layer voted, so only now can `broader` be settled.
+    # Deciding it while scanning made it first-write-wins, which is filename
+    # order: الميراث was printed 150 times, mostly under كتاب الفرائض, and got
+    # النكاح because al-Kafi 5 sorts before Faqih 4.
+    settled = harvester.settle_parents(found)
+    typer.echo(f"parents (majority vote) {settled}")
     if dry_run:
         typer.echo(harvester.report(found))
         typer.echo("(dry run: nothing written)")
@@ -254,6 +280,48 @@ def adjudicate_cmd(
     if apply:
         rows = adj.apply_plan(plan)
         typer.echo(f"appended {rows} adjudicated concepts; re-run resolve-nodes")
+
+
+@app.command("enrich-aliases")
+def enrich_aliases(
+    apply: bool = typer.Option(False, "--apply", help="Write config/derived_aliases.yaml"),
+    limit: int | None = typer.Option(None, "--limit", help="Max concepts to ask about"),
+    ask: bool = typer.Option(False, "--ask/--no-ask", help="Call Gemini for uncached concepts"),
+) -> None:
+    """Find the other wordings each concept is written in.
+
+    The catalog knows a concept by its chapter title only, so a narration that
+    phrases the topic any other way misses it. Synonymy is the one thing these
+    books did not write down -- string similarity pairs الزاني with الزانية, and
+    the corpus's own glosses cannot be parsed reliably -- so this asks a model.
+
+    It does not trust the answer. A proposal is kept only where the corpus
+    actually uses that wording, and only if no other concept already claims it.
+    Cached per concept, so a re-run spends nothing. Default is --no-ask: replay
+    the cache and see the plan for free.
+    """
+    _setup_logging()
+    from src.pipelines import aliases as al
+
+    concepts = al.catalog_concepts()
+    cache = al.load_cache()
+    typer.echo(f"catalog concepts {len(concepts)}, already asked {len(cache)}")
+    if ask:
+        _, gemini, _ = _stack()
+        try:
+            cache = al.propose(gemini, concepts, cache, limit=limit)
+        except AllKeysExhausted as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=2) from exc
+        al.save_cache(cache)
+    if not cache:
+        typer.echo("nothing proposed yet; re-run with --ask")
+        raise typer.Exit(code=1)
+    kept, stats = al.ground(cache)
+    typer.echo(al.report(kept, stats))
+    if apply:
+        written = al.write(kept)
+        typer.echo(f"wrote {written} aliases across {len(kept)} concepts")
 
 
 @app.command("resolve-nodes")
