@@ -2,9 +2,15 @@
 
 Standalone: does not modify the ETL. Imports existing fold/ground helpers only.
 
+Default mode keeps a short high-precision queue. Noisy heuristics
+(coverage / broken salience substring / thin mention-count) stay off unless
+you pass --noisy.
+
 Example:
     python scripts/audit_mentions.py
-    python scripts/audit_mentions.py --dir data/output/phase1/hadith --top 40
+    python scripts/audit_mentions.py --top 25
+    python scripts/audit_mentions.py --noisy
+    python scripts/audit_mentions.py --codes contrast_foil_without_elevated,predicate_hinge_missing
     python scripts/audit_mentions.py --json-out data/output/mention-audit.json
 """
 
@@ -12,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -35,11 +40,34 @@ _CONTRAST_MARKERS = (
 
 _FRAMING_HEADS = frozenset({"كمال", "صفه", "باب", "فضل", "صفت", "وجوب", "فرض"})
 
+# Default review queue: high-precision claim/quality failures only.
+# high_salience_not_in_matn is intentionally absent: inferred concepts with
+# matn evidence (خشية الله ← لم يخف الله) are valid and must not pollute the queue.
+_PRECISION_CODES = frozenset(
+    {
+        "contrast_foil_without_elevated",
+        "predicate_hinge_missing",
+        "framing_only_top",
+        "ungrounded_mention",
+        "truncated_translation",
+    }
+)
+
+# Useful for debugging extractors; too many FPs for a human review queue.
+# Still excludes high_salience_not_in_matn (literal-label check fights inference).
+_NOISY_CODES = frozenset(
+    {
+        "repeated_matn_root_uncovered",
+        "too_few_mentions",
+    }
+)
+
 # Isnad / deixis / grammar — never treated as missing topical coverage.
 _STOP_ROOTS = frozenset(
     {
         "قول",
         "قال",  # morphology often leaves قال ≠ قول
+        "فقل",  # فقال → فقل
         "حدث",
         "خبر",
         "روي",
@@ -87,6 +115,7 @@ _STOP_ROOTS = frozenset(
         "الذي",
         "التى",
         "اللذ",
+        "الذ",  # الذي → الذ
         "فيه",  # فيها / فيه deixis
         "ذكر",  # often discourse "ذكر" chains, not a topic by itself
         "عند",
@@ -100,20 +129,24 @@ _STOP_ROOTS = frozenset(
         "كلل",
         "جميع",
         "ايي",
+        "بما",
+        "فاذ",  # فاذا
+        "الا",
+        "يقل",  # فيقول
+        "تكن",
     }
 )
 
 _ISSUE_WEIGHT = {
     "truncated_translation": 4,
-    "too_few_mentions": 5,
+    "too_few_mentions": 3,
     "ungrounded_mention": 5,
     "contrast_foil_without_elevated": 6,
     "framing_only_top": 4,
-    "repeated_matn_root_uncovered": 3,
-    "high_salience_not_in_matn": 5,
+    "repeated_matn_root_uncovered": 2,
+    "high_salience_not_in_matn": 2,
     "predicate_hinge_missing": 6,
 }
-
 
 
 @dataclass
@@ -141,6 +174,14 @@ class AuditRow:
             "mention_texts": self.mention_texts,
             "issues": [asdict(i) for i in self.issues],
         }
+
+
+def _matn_body(matn: str) -> str:
+    folded = fold(matn)
+    cut = folded.find(" قال ")
+    if cut < 0:
+        cut = folded.find(" يقول ")
+    return folded[cut + 1 :] if cut >= 0 else folded
 
 
 def _mention_roots(mentions: list[dict]) -> set[str]:
@@ -215,12 +256,8 @@ def _contrast_issues(matn: str, mentions: list[dict]) -> list[Issue]:
 
 
 def _coverage_issues(matn: str, mentions: list[dict]) -> list[Issue]:
-    # Skip isnad-ish prefix: before first قال / يقول often.
-    folded = fold(matn)
-    cut = folded.find(" قال ")
-    if cut < 0:
-        cut = folded.find(" يقول ")
-    body = folded[cut + 1 :] if cut >= 0 else folded
+    """Noisy: dialogue morphology produces many false positives. Off by default."""
+    body = _matn_body(matn)
     words = [w for w in body.split() if len(w) >= 3]
     counts: Counter[str] = Counter()
     samples: dict[str, str] = {}
@@ -233,7 +270,7 @@ def _coverage_issues(matn: str, mentions: list[dict]) -> list[Issue]:
     mention_roots = _mention_roots(mentions)
     issues: list[Issue] = []
     for r, n in counts.most_common():
-        if n < 3:
+        if n < 5:  # stricter than the old ≥3 threshold
             break
         sample = samples[r]
         if _covered(r, mention_roots, mentions, sample):
@@ -245,7 +282,7 @@ def _coverage_issues(matn: str, mentions: list[dict]) -> list[Issue]:
                 weight=_ISSUE_WEIGHT["repeated_matn_root_uncovered"],
             )
         )
-        if len(issues) >= 4:
+        if len(issues) >= 3:
             break
     return issues
 
@@ -257,11 +294,7 @@ def _predicate_hinge_issues(matn: str, mentions: list[dict]) -> list[Issue]:
     body; requires a mention that covers نفع / انتفاع / نافع, not only عالم via
     shared علم root. (morphology root(ينتفع) is unreliable → تفع.)
     """
-    folded = fold(matn)
-    cut = folded.find(" قال ")
-    if cut < 0:
-        cut = folded.find(" يقول ")
-    body = folded[cut + 1 :] if cut >= 0 else folded
+    body = _matn_body(matn)
     words = body.split()
 
     def _naf_stem(w: str) -> bool:
@@ -329,7 +362,6 @@ def _framing_issues(mentions: list[dict]) -> list[Issue]:
     head = words[0]
     if head not in _FRAMING_HEADS:
         return []
-    # Framing-only if no other mention has salience >= 0.85
     others = [
         m
         for m in mentions
@@ -346,72 +378,127 @@ def _framing_issues(mentions: list[dict]) -> list[Issue]:
     ]
 
 
-def audit_payload(payload: dict, path: Path) -> AuditRow | None:
+def _too_few_issues(matn: str, mentions: list[dict]) -> list[Issue]:
+    """Noisy by default. Empty mentions always; single mention only on long matn."""
+    n = len(mentions)
+    if n == 0:
+        return [
+            Issue(
+                "too_few_mentions",
+                "no mentions",
+                _ISSUE_WEIGHT["too_few_mentions"],
+            )
+        ]
+    if n >= 2:
+        return []
+    body_words = [w for w in _matn_body(matn).split() if len(w) >= 3]
+    if len(body_words) < 60:
+        return []
+    return [
+        Issue(
+            "too_few_mentions",
+            f"only 1 mention on a long matn ({len(body_words)} body words)",
+            _ISSUE_WEIGHT["too_few_mentions"],
+        )
+    ]
+
+
+def _salience_ground_issues(matn: str, mentions: list[dict]) -> list[Issue]:
+    """Noisy: require content-root overlap with matn (not broken substrings)."""
+    issues: list[Issue] = []
+    matn_roots = {
+        root(w)
+        for w in fold(matn).split()
+        if len(w) >= 3 and root(w) and root(w) not in _STOP_ROOTS
+    }
+    for m in mentions:
+        sal = float(m.get("salience") or 0)
+        text = str(m.get("text") or "")
+        if sal < 0.9 or not text:
+            continue
+        content_roots = {
+            root(w)
+            for w in fold(text).split()
+            if len(w) >= 3 and root(w) and root(w) not in _STOP_ROOTS
+        }
+        if not content_roots:
+            continue
+        if content_roots & matn_roots:
+            continue
+        issues.append(
+            Issue(
+                "high_salience_not_in_matn",
+                f"{text!r} salience={sal:.2f} has no content root in matn",
+                _ISSUE_WEIGHT["high_salience_not_in_matn"],
+            )
+        )
+    return issues
+
+
+def audit_payload(
+    payload: dict,
+    path: Path,
+    *,
+    enabled_codes: frozenset[str] | None = None,
+) -> AuditRow | None:
     matn = str(payload.get("hadith") or "")
     if not matn.strip():
         return None
     mentions = [m for m in (payload.get("mentions") or []) if isinstance(m, dict)]
+    codes = enabled_codes if enabled_codes is not None else _PRECISION_CODES
+
     issues: list[Issue] = []
 
-    if translation_incomplete(str(payload.get("hadith_fa") or "")):
-        issues.append(
-            Issue(
-                "truncated_translation",
-                "hadith_fa looks truncated/summarized",
-                _ISSUE_WEIGHT["truncated_translation"],
-            )
-        )
-    if translation_incomplete(str(payload.get("hadith_en") or "")):
-        issues.append(
-            Issue(
-                "truncated_translation",
-                "hadith_en looks truncated/summarized",
-                _ISSUE_WEIGHT["truncated_translation"],
-            )
-        )
-
-    if len(mentions) < 2:
-        issues.append(
-            Issue(
-                "too_few_mentions",
-                f"only {len(mentions)} mention(s); expect ≥ 2",
-                _ISSUE_WEIGHT["too_few_mentions"],
-            )
-        )
-
-    for m in mentions:
-        reason = check_mention(m, matn)
-        if reason:
+    if "truncated_translation" in codes:
+        if translation_incomplete(str(payload.get("hadith_fa") or "")):
             issues.append(
                 Issue(
-                    "ungrounded_mention",
-                    f"{m.get('text')!r}: {reason}",
-                    _ISSUE_WEIGHT["ungrounded_mention"],
+                    "truncated_translation",
+                    "hadith_fa looks truncated/summarized",
+                    _ISSUE_WEIGHT["truncated_translation"],
                 )
             )
-        sal = float(m.get("salience") or 0)
-        text = str(m.get("text") or "")
-        if sal >= 0.9 and text:
-            content = [w for w in fold(text).split() if len(w) >= 3 and root(w) not in _STOP_ROOTS]
-            matn_fold = fold(matn).replace(" ", "")
-            if content and not any(fold(w).replace(" ", "") in matn_fold for w in content):
+        if translation_incomplete(str(payload.get("hadith_en") or "")):
+            issues.append(
+                Issue(
+                    "truncated_translation",
+                    "hadith_en looks truncated/summarized",
+                    _ISSUE_WEIGHT["truncated_translation"],
+                )
+            )
+
+    if "too_few_mentions" in codes:
+        issues.extend(_too_few_issues(matn, mentions))
+
+    if "ungrounded_mention" in codes:
+        for m in mentions:
+            reason = check_mention(m, matn)
+            if reason:
                 issues.append(
                     Issue(
-                        "high_salience_not_in_matn",
-                        f"{text!r} salience={sal:.2f} has no content word in matn",
-                        _ISSUE_WEIGHT["high_salience_not_in_matn"],
+                        "ungrounded_mention",
+                        f"{m.get('text')!r}: {reason}",
+                        _ISSUE_WEIGHT["ungrounded_mention"],
                     )
                 )
 
-    issues.extend(_contrast_issues(matn, mentions))
-    issues.extend(_predicate_hinge_issues(matn, mentions))
-    issues.extend(_coverage_issues(matn, mentions))
-    issues.extend(_framing_issues(mentions))
+    if "high_salience_not_in_matn" in codes:
+        issues.extend(_salience_ground_issues(matn, mentions))
 
-    # Deduplicate by (code, detail)
+    if "contrast_foil_without_elevated" in codes:
+        issues.extend(_contrast_issues(matn, mentions))
+    if "predicate_hinge_missing" in codes:
+        issues.extend(_predicate_hinge_issues(matn, mentions))
+    if "repeated_matn_root_uncovered" in codes:
+        issues.extend(_coverage_issues(matn, mentions))
+    if "framing_only_top" in codes:
+        issues.extend(_framing_issues(mentions))
+
     seen: set[tuple[str, str]] = set()
     unique: list[Issue] = []
     for issue in issues:
+        if issue.code not in codes:
+            continue
         key = (issue.code, issue.detail)
         if key in seen:
             continue
@@ -446,23 +533,35 @@ def iter_payloads(directory: Path):
         yield path, data
 
 
-def render_markdown(rows: list[AuditRow], scanned: int, flagged: int) -> str:
+def render_markdown(
+    rows: list[AuditRow],
+    scanned: int,
+    flagged: int,
+    *,
+    mode: str,
+) -> str:
     lines = [
         "# Mention audit",
         "",
-        f"Scanned **{scanned}** hadith payloads; **{flagged}** with risk > 0 "
-        f"(showing top **{len(rows)}**).",
+        f"Mode: **{mode}**. Scanned **{scanned}** hadith payloads; "
+        f"**{flagged}** with risk > 0 (showing top **{len(rows)}**).",
         "",
-        "Review this queue instead of reading every file. Codes:",
+        "Default mode is a short high-precision queue. Pass `--noisy` for "
+        "coverage / thin-count heuristics (literal-label salience stays off). "
+        "For a human review queue run `python scripts/filter_mention_audit.py`.",
         "",
-        "- `contrast_foil_without_elevated` — foil kept, elevated topic missing (mark-4 class)",
-        "- `predicate_hinge_missing` — relative-clause hinge (e.g. ينتفع بعلمه) missing from mentions",
-        "- `repeated_matn_root_uncovered` — recurring matn root with no mention",
-        "- `framing_only_top` — top hit is كمال/فضل/… framing only",
-        "- `truncated_translation` — FA/EN ellipsis / ادامه stubs",
-        "- `too_few_mentions` / `ungrounded_mention` / `high_salience_not_in_matn`",
+        "Codes in this report:",
         "",
     ]
+    shown = sorted({i.code for row in rows for i in row.issues})
+    if not shown:
+        lines.append("_No issues under the active code filter._")
+        lines.append("")
+    else:
+        for code in shown:
+            lines.append(f"- `{code}`")
+        lines.append("")
+
     for i, row in enumerate(rows, 1):
         lines.append(f"## {i}. risk={row.risk} · {row.marker} · {row.locator}")
         lines.append("")
@@ -476,6 +575,15 @@ def render_markdown(rows: list[AuditRow], scanned: int, flagged: int) -> str:
     return "\n".join(lines)
 
 
+def _resolve_codes(*, noisy: bool, codes: str | None) -> tuple[frozenset[str], str]:
+    if codes:
+        selected = frozenset(c.strip() for c in codes.split(",") if c.strip())
+        return selected, f"custom ({', '.join(sorted(selected))})"
+    if noisy:
+        return _PRECISION_CODES | _NOISY_CODES, "noisy (precision + coverage/count)"
+    return _PRECISION_CODES, "precision (default)"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -484,8 +592,19 @@ def main(argv: list[str] | None = None) -> int:
         default=ROOT / "data" / "output" / "phase1" / "hadith",
         help="Directory of phase-1 hadith JSON files",
     )
-    parser.add_argument("--top", type=int, default=50, help="Max rows to print/write")
+    parser.add_argument("--top", type=int, default=25, help="Max rows to print/write")
     parser.add_argument("--min-risk", type=int, default=1, help="Ignore rows below this risk")
+    parser.add_argument(
+        "--noisy",
+        action="store_true",
+        help="Also enable coverage / salience / too-few heuristics",
+    )
+    parser.add_argument(
+        "--codes",
+        type=str,
+        default=None,
+        help="Comma-separated issue codes to enable (overrides --noisy)",
+    )
     parser.add_argument(
         "--md-out",
         type=Path,
@@ -504,37 +623,47 @@ def main(argv: list[str] | None = None) -> int:
         print(f"directory not found: {args.dir}", file=sys.stderr)
         return 1
 
+    enabled, mode = _resolve_codes(noisy=bool(args.noisy), codes=args.codes)
+
     rows: list[AuditRow] = []
     scanned = 0
     for path, payload in iter_payloads(args.dir):
         scanned += 1
-        row = audit_payload(payload, path)
+        row = audit_payload(payload, path, enabled_codes=enabled)
         if row and row.risk >= args.min_risk:
             rows.append(row)
 
     rows.sort(key=lambda r: (-r.risk, r.locator, r.marker))
     top = rows[: max(0, args.top)]
 
-    md = render_markdown(top, scanned, flagged=len(rows))
+    md = render_markdown(top, scanned, flagged=len(rows), mode=mode)
     args.md_out.parent.mkdir(parents=True, exist_ok=True)
     args.md_out.write_text(md, encoding="utf-8")
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
             json.dumps(
-                {"scanned": scanned, "flagged": len(rows), "rows": [r.to_public() for r in top]},
+                {
+                    "scanned": scanned,
+                    "flagged": len(rows),
+                    "mode": mode,
+                    "codes": sorted(enabled),
+                    "rows": [r.to_public() for r in top],
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
         )
 
-    print(f"scanned={scanned} flagged={len(rows)} written={args.md_out}")
+    print(f"scanned={scanned} flagged={len(rows)} mode={mode} written={args.md_out}")
     if top:
         print("top risks:")
         for row in top[:15]:
             codes = ",".join(sorted({i.code for i in row.issues}))
             print(f"  {row.risk:>3}  {row.marker:<6} {row.locator}  [{codes}]")
+    else:
+        print("no rows under active filters")
     return 0
 
 
