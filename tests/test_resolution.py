@@ -438,10 +438,10 @@ def test_narrator_filter_resolves_the_mention_through_the_gazetteer():
     """A raw string compare lets the speaker back in under another of his names."""
     from src.pipelines.grounding import ground_mentions
 
-    matn = "أَحْمَدُ بْنُ إِدْرِيسَ عَنْ أَبِي عَبْدِ اللَّهِ ع قَالَ جَعْفَرُ بْنُ مُحَمَّدٍ"
+    matn = "أَحْمَدُ بْنُ إِدْرِيسَ عَنْ أَبِي عَبْدِ اللَّهِ ع قَالَ مَا الْعَقْلُ جَعْفَرُ بْنُ مُحَمَّدٍ"
     kept, rejected = ground_mentions(
         [
-            {"text": "العقل", "type": "concept", "evidence": "عن أبي عبد الله"},
+            {"text": "العقل", "type": "concept", "evidence": "ما العقل"},
             {"text": "جعفر بن محمد", "type": "person", "evidence": "قال جعفر بن محمد"},
         ],
         matn,

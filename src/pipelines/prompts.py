@@ -14,6 +14,11 @@ every book. Nothing here constrains vocabulary, and nothing here needs to.
 
 from __future__ import annotations
 
+EXHAUSTIVE_EXTRACTION_INSTRUCTION = """\
+CRITICAL: This text contains a massive encyclopedic enumeration. You MUST extract EVERY SINGLE distinct item, attribute, or category listed in the text as a separate mention. Ignore any normal length limits; your output may contain 50 to 150 mentions. Do NOT group them under a single umbrella term. Extract each one meticulously.
+evidence MUST be a verbatim span from the speech after قال — never from the isnad / narrator chain (no بن فلان, no عدة من أصحابنا).
+"""
+
 HADITH_PROMPT = """\
 You extract EVERY hadith on this printed page, not just the first.
 Return JSON with page (copy the locator) and hadiths: one object per distinct narration.
@@ -29,6 +34,7 @@ it wastes the whole response. Return only:
   4. quotes      Qur'anic spans only (kind "quran"), no sura/verse numbers
   5. hadith_fa   fluent Persian of the FULL matn on this page (no `...`, no summary)
   6. hadith_en   precise English of the FULL matn on this page (no `...`, no summary)
+  7. is_encyclopedic  true ONLY if the matn explicitly enumerates a massive list (>10-15 items, attributes, or classes). Otherwise false.
 Translate every sentence of the matn present on the page. Never truncate with
 ellipsis, never write "ادامه" / "Continuation of", never paraphrase half and drop
 the rest. If the page is only isnad with no matn yet, leave fa/en empty.
@@ -63,6 +69,8 @@ Other rules (short):
   معاوية in "فالذي كان في معاوية" IS a mention; أبو عبد الله answering is not
 - INDEX WHAT IS ASSERTED, NOT WHAT IS DENIED
 - Qur'an goes in quotes as the quoted words only -- never a verse number, never a mention
+- ENUMERATIONS (Never collapse into umbrella alone): When the text divides people, states, or acts into categories (e.g., "X is of three types: A, B, and C"), you MUST extract each distinct category/sub-type individually as primary mentions. Do NOT return only the umbrella term (X).
+- GROUPS SPOKEN OF (Identity definitions): When the speaker defines or categorizes a group—even using first-person pronouns like "نحن" (we) or "شيعتنا/أولياؤنا" (our followers)—you MUST extract the group entity (e.g., أهل البيت, الشيعة), as the hadith explicitly establishes their identity.
 
 EXAMPLES
 
@@ -83,6 +91,10 @@ EXAMPLES
 "إن عندنا قوما لهم محبة ... فاعتبروا يا أولي الأبصار"
   mentions: محبة أهل البيت/0.8, العزيمة/0.6
   quotes: {text: "فاعتبروا يا أولي الأبصار", kind: "quran"}
+
+"العبادة ثلاثة: قوم عبدوا الله خوفا فتلك عبادة العبيد، وقوم عبدوا الله رغبة فتلك عبادة التجار، وقوم عبدوا الله شكرا فتلك عبادة الأحرار ونحن أهلها"
+  mentions: عبادة الأحرار/0.95, أهل البيت/group/0.9, عبادة العبيد/0.8, عبادة التجار/0.8, الشكر/0.7, الخوف/0.6, أقسام العبادة/0.5
+  NOT: أقسام العبادة alone as the sole mention (individual categories must be extracted)
 
 Empty mentions on a numbered hadith is invalid. Continuations may omit
 translations when the fragment is isnad with no matn yet. Never fabricate a hadith.
@@ -136,14 +148,25 @@ Prefer 3-6 mentions. Never return mentions: [].
 """
 
 
-def unify_prompt(*, require_topics: bool = False) -> str:
+def unify_prompt(*, require_topics: bool = False, is_exhaustive: bool = False) -> str:
     extra = UNIFY_REQUIRE_TOPICS if require_topics else UNIFY_TOPICS_OPTIONAL
+    if is_exhaustive:
+        extra += f"\n\n{EXHAUSTIVE_EXTRACTION_INSTRUCTION}"
     return f"{UNIFY_PROMPT}\n{extra}"
 
 
-def mentions_fill_prompt() -> str:
+def mentions_fill_prompt(is_exhaustive: bool = False) -> str:
+    if is_exhaustive:
+        base = MENTIONS_FILL_PROMPT.replace(
+            "Prefer 3-6 mentions. Never return mentions: [].",
+            "Prefer as many mentions as the enumeration requires "
+            "(often dozens to ~150). Never return mentions: [].",
+        ).replace(
+            "evidence: short verbatim span from the matn",
+            "evidence: short verbatim span from the speech AFTER قال, never from the isnad",
+        )
+        return f"{base}\n\n{EXHAUSTIVE_EXTRACTION_INSTRUCTION}"
     return MENTIONS_FILL_PROMPT
-
 
 TAFSIR_PROMPT = """\
 You extract one Al-Mizan tafsir unit anchored to a Qur'anic ayah range.

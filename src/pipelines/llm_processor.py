@@ -139,7 +139,122 @@ def translation_incomplete(text: str) -> bool:
     return bool(_INCOMPLETE_TRANSLATION.search(value))
 
 
+def looks_encyclopedic(payload: dict) -> bool:
+    """Backup detector when the page LLM never set is_encyclopedic.
+
+    Conservative: explicit host/inventory framing, or a long multi-page matn
+    with extreme coordination density (the 75-hosts shape). Does not fire on
+    long sermons that lack list structure.
+    """
+    if payload.get("is_encyclopedic"):
+        return True
+    from src.pipelines.morphology import fold
+
+    matn = str(payload.get("hadith") or "")
+    folded = fold(matn)
+    if not folded.strip():
+        return False
+    if "جنود العقل" in folded or "جنود الجهل" in folded:
+        return True
+    pages = [p for p in (payload.get("arabic_pages") or []) if str(p).strip()]
+    n_pages = len(pages)
+    if n_pages == 0 and payload.get("page_start") != payload.get("page_end"):
+        n_pages = 2
+    if n_pages >= 3 and len(folded) > 2500 and folded.count(" و ") >= 80:
+        return True
+    return False
+
+
+def _matn_chunks_for_exhaustive(payload: dict) -> list[str]:
+    pages = [str(p).strip() for p in (payload.get("arabic_pages") or []) if str(p).strip()]
+    if pages:
+        return pages
+    arabic = str(payload.get("hadith") or "")
+    if not arabic:
+        return []
+    if len(arabic) <= UNIFY_BODY_BUDGET:
+        return [arabic]
+    step = 6000
+    return [arabic[i : i + step] for i in range(0, len(arabic), step)]
+
+
+def _exhaustive_mentions_fill(agent: GeminiAgent, payload: dict, label: str) -> list[dict]:
+    """Chunked + multi-round MentionsFill for encyclopedic inventories.
+
+    Uses the proven MentionsFill schema (max 12) in rounds so Gemini structured
+    output stays valid while we accumulate dozens–hundreds of list items.
+    """
+    from src.agents.errors import ProviderServerError, StructuredOutputError
+    from src.pipelines.grounding import ground_mentions
+
+    chunks = _matn_chunks_for_exhaustive(payload)
+    if not chunks:
+        chunks = [str(payload.get("hadith") or "")]
+    merged = list(payload.get("mentions") or [])
+    system = mentions_fill_prompt(is_exhaustive=True)
+    max_rounds = 10
+    for i, chunk in enumerate(chunks):
+        stagnant = 0
+        for round_i in range(max_rounds):
+            known = [str(m.get("text") or "") for m in merged if m.get("text")]
+            known_preview = ", ".join(known[-40:]) if known else "(none yet)"
+            prompt = (
+                f"Arabic hadith fragment {i + 1}/{len(chunks)}, "
+                f"extraction round {round_i + 1}.\n"
+                f"Already extracted (do NOT repeat these texts): {known_preview}\n\n"
+                f"{chunk}\n\n"
+                "Return the NEXT batch of distinct enumerated items still missing "
+                "from the list above. Prefer up to 12 new mentions this round."
+            )
+            try:
+                filled = agent.complete_structured(
+                    prompt,
+                    MentionsFill,
+                    system=system,
+                )
+            except (StructuredOutputError, ProviderServerError) as exc:
+                raise StructuredOutputError(
+                    f"exhaustive mentions fill failed for {label} "
+                    f"(fragment {i + 1}/{len(chunks)} round {round_i + 1}): {exc}"
+                ) from exc
+            before = len(merged)
+            merged = _merge_mentions(
+                merged, [m.model_dump() for m in filled.mentions]
+            )
+            gained = len(merged) - before
+            logger.info(
+                "exhaustive MentionsFill %s fragment %s/%s round %s -> +%s (total %s)",
+                label,
+                i + 1,
+                len(chunks),
+                round_i + 1,
+                gained,
+                len(merged),
+            )
+            if gained == 0:
+                stagnant += 1
+                if stagnant >= 2:
+                    break
+            else:
+                stagnant = 0
+    grounded, dropped = ground_mentions(
+        merged,
+        str(payload.get("hadith") or ""),
+        payload.get("ravis"),
+        quotes=payload.get("quotes"),
+    )
+    if dropped:
+        logger.info(
+            "exhaustive MentionsFill %s grounded drop %s",
+            label,
+            len(dropped),
+        )
+    return grounded
+
+
 def needs_enrichment(payload: dict) -> bool:
+    if looks_encyclopedic(payload):
+        return True
     if payload.get("page_start") != payload.get("page_end"):
         return True
     if translation_incomplete(str(payload.get("hadith_fa") or "")):
@@ -164,11 +279,17 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
     are missing, MentionsFill runs first. Soft unify then fills the rest.
     When topics stay missing after MentionsFill, failure is raised so the
     runner marks ERROR instead of writing hollow PROCESSED files.
+
+    Encyclopedic inventories (`is_encyclopedic` / heuristic) use chunked
+    MentionsFillExhaustive so page prefer-3-8 does not permanently truncate
+    75-pair taxonomies.
     """
     from src.agents.errors import ProviderServerError, StructuredOutputError
 
     payload = dict(payload)
     payload["hadith"] = strip_folklib_footnotes(str(payload.get("hadith") or ""))
+    if looks_encyclopedic(payload):
+        payload["is_encyclopedic"] = True
     if not needs_enrichment(payload):
         return remap_hadith_payload(payload)
     arabic = str(payload.get("hadith") or "")
@@ -177,25 +298,32 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
         body = arabic
     else:
         body = arabic[:UNIFY_BODY_BUDGET]
+
+    is_exhaustive = bool(payload.get("is_encyclopedic"))
+
     topic_count = len(payload.get("mentions") or []) + len(semantic_nodes_of(payload))
-    need_topics = topic_count < 1
+    need_topics = topic_count < 1 or is_exhaustive
+
     label = payload.get("marker") or payload.get("locator")
 
     if need_topics:
         try:
-            filled = agent.complete_structured(
-                f"Arabic hadith:\n{body}",
-                MentionsFill,
-                system=mentions_fill_prompt(),
-            )
+            if is_exhaustive:
+                payload["mentions"] = _exhaustive_mentions_fill(agent, payload, str(label))
+            else:
+                filled = agent.complete_structured(
+                    f"Arabic hadith:\n{body}",
+                    MentionsFill,
+                    system=mentions_fill_prompt(is_exhaustive=False),
+                )
+                payload["mentions"] = _merge_mentions(
+                    payload.get("mentions"),
+                    [m.model_dump() for m in filled.mentions],
+                )
         except (StructuredOutputError, ProviderServerError) as exc:
             raise StructuredOutputError(
                 f"mentions fill failed for {label}: {exc}"
             ) from exc
-        payload["mentions"] = _merge_mentions(
-            payload.get("mentions"),
-            [m.model_dump() for m in filled.mentions],
-        )
         payload = remap_hadith_payload(payload)
         if not (payload.get("mentions") or []):
             raise StructuredOutputError(
@@ -205,8 +333,9 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
             return payload
 
     # Topics present (or MentionsFill already ran): soft unify for FA/EN/ravis.
+    # Do not pass is_exhaustive here — exhaustiveness is MentionsFill's job.
     schema = HadithUnify
-    system = unify_prompt(require_topics=False)
+    system = unify_prompt(require_topics=False, is_exhaustive=False)
     try:
         result = agent.complete_structured(
             f"Isnad / opening:\n{head}\n\nMatn:\n{body}",
@@ -227,7 +356,9 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
     out = dict(payload)
     if result.ravis:
         out["ravis"] = list(result.ravis)
-    if result.mentions:
+    if result.mentions and not is_exhaustive:
+        # Encyclopedic lists are already filled exhaustively; soft unify must
+        # not collapse them by merging a short re-summarization.
         out["mentions"] = _merge_mentions(
             payload.get("mentions"), [m.model_dump() for m in result.mentions]
         )
@@ -278,8 +409,13 @@ def _merge_mentions(existing, extra) -> list[dict]:
             continue
         if float(item.get("salience") or 0) > float(current.get("salience") or 0):
             current["salience"] = item.get("salience")
-        if not str(current.get("evidence") or "").strip():
-            current["evidence"] = item.get("evidence") or ""
+        from src.pipelines.grounding import prefer_evidence_span
+
+        current["evidence"] = prefer_evidence_span(
+            key[0],
+            str(current.get("evidence") or ""),
+            str(item.get("evidence") or ""),
+        )
     return list(merged.values())
 
 

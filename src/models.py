@@ -91,7 +91,7 @@ class HadithExtraction(BaseModel):
     semantic_nodes: list[SemanticNode] = Field(default_factory=list)
     proposed_nodes: list[str] = Field(default_factory=list)
     ravis: list[str] = Field(default_factory=list)
-
+    is_encyclopedic: bool = Field(default=False, description="true ONLY if the matn explicitly enumerates a massive list (>5-15 items, attributes, or classes). Otherwise false.")
     # Mentions are required in the prompt and enforced at unify when the page
     # pass leaves them empty (HadithUnifyRequireTopics). A hard gate here used
     # to reject the entire page extract after 6 retries even when FA/ravis were
@@ -124,6 +124,13 @@ class HadithPageItem(BaseModel):
     quotes: list[QuotedSpan] = Field(default_factory=list)
     hadith_fa: str = ""
     hadith_en: str = ""
+    is_encyclopedic: bool = Field(
+        default=False,
+        description=(
+            "true ONLY if the matn explicitly enumerates a massive list "
+            "(>10-15 items, attributes, or classes). Otherwise false."
+        ),
+    )
 
 
 class HadithPageExtraction(BaseModel):
@@ -199,6 +206,27 @@ class MentionsFill(BaseModel):
     """
 
     mentions: list[Mention] = Field(min_length=2, max_length=12)
+
+    @field_validator("mentions")
+    @classmethod
+    def _dedupe_mentions(cls, value: list[Mention]) -> list[Mention]:
+        cleaned = _dedupe_mention_list(value)
+        if len(cleaned) < 2:
+            raise ValueError(
+                "need at least 2 mentions with text/type/salience/evidence"
+            )
+        return cleaned
+
+
+class MentionsFillExhaustive(BaseModel):
+    """Encyclopedic MentionsFill: inventories may need dozens of mentions per chunk.
+
+    Used only when `is_encyclopedic` is set. Chunked across page fragments so
+    each call stays within Gemini structured-output limits. Normal MentionsFill
+    stays capped at 12.
+    """
+
+    mentions: list[Mention] = Field(min_length=2, max_length=80)
 
     @field_validator("mentions")
     @classmethod

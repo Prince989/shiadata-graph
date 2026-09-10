@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 
-from src.pipelines.morphology import fold
+from src.pipelines.morphology import fold, root, root_signature
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,67 @@ def _contains(haystack: str, needle: str) -> bool:
     return folded_needle in fold(haystack).replace(" ", "")
 
 
+def matn_body(matn: str) -> str:
+    """Speech after the first قال / يقول — not the isnad prefix."""
+    folded = fold(matn)
+    cut = folded.find(" قال ")
+    if cut < 0:
+        cut = folded.find(" يقول ")
+    if cut < 0:
+        return folded
+    return folded[cut + 1 :]
+
+
+def evidence_supports_mention(text: str, evidence: str) -> bool:
+    """True when the span is about this mention, not a random isnad fragment."""
+    folded_text = fold(text)
+    folded_ev = fold(evidence)
+    if not folded_text or not folded_ev:
+        return False
+    compact_ev = folded_ev.replace(" ", "")
+    if folded_text.replace(" ", "") and folded_text.replace(" ", "") in compact_ev:
+        return True
+    for word in folded_text.split():
+        if len(word) >= 3 and word.replace(" ", "") in compact_ev:
+            return True
+    text_roots = {r for r in root_signature(text) if r and len(r) >= 2}
+    ev_roots = {root(w) for w in folded_ev.split() if w and root(w)}
+    return bool(text_roots & ev_roots)
+
+
+def evidence_usable(mention: dict, matn: str) -> bool:
+    """Evidence counts only if it is in the post-قال body.
+
+    In-body spans may infer a concept without repeating the mention label.
+    Isnad names never qualify.
+    """
+    evidence = str(mention.get("evidence") or "").strip()
+    if not fold(evidence).strip():
+        return False
+    return _contains(matn_body(matn), evidence)
+
+
+def prefer_evidence_span(
+    text: str, current: str, other: str, matn: str | None = None
+) -> str:
+    """Pick the span that actually supports `text`; optionally prefer matn body."""
+    cur = str(current or "").strip()
+    alt = str(other or "").strip()
+    if not alt:
+        return cur
+    if not cur:
+        return alt
+    body = matn_body(matn) if matn else ""
+    cur_ok = evidence_supports_mention(text, cur)
+    alt_ok = evidence_supports_mention(text, alt)
+    if matn:
+        cur_ok = cur_ok and _contains(body or matn, cur)
+        alt_ok = alt_ok and _contains(body or matn, alt)
+    if alt_ok and not cur_ok:
+        return alt
+    return cur
+
+
 def check_mention(
     mention: dict, matn: str, require_evidence: bool = REQUIRE_EVIDENCE
 ) -> str | None:
@@ -49,13 +110,10 @@ def check_mention(
     if not text:
         return "empty"
     node_type = str(mention.get("type") or "concept")
-    evidence = str(mention.get("evidence") or "").strip()
-    usable = len(fold(evidence)) >= _MIN_EVIDENCE_CHARS
+    body = matn_body(matn)
+    usable = evidence_usable(mention, matn)
 
-    if usable:
-        if not _contains(matn, evidence):
-            return "evidence not in matn"
-    elif require_evidence and not _contains(matn, text):
+    if not usable and require_evidence and not _contains(matn, text):
         # No usable span AND the term is not in the text either. A concept may
         # be inferred, but something in the narration has to have prompted it;
         # with neither, the mention rests on nothing at all. Previously a blank
@@ -63,9 +121,8 @@ def check_mention(
         # concept through untouched.
         return "no evidence and term not in matn"
 
-    if node_type in GROUNDED_TYPES and not _contains(matn, text):
-        # The name itself has to be on the page. An inferred person is a
-        # hallucinated person.
+    if node_type in GROUNDED_TYPES and not _contains(body or matn, text):
+        # The name itself has to be in the speech, not only the isnad.
         return "entity not in matn"
     return None
 
@@ -160,5 +217,8 @@ def ground_mentions(
             rejected.append((text, reason))
             logger.info("drop ungrounded mention %r: %s", text, reason)
             continue
-        kept.append(mention)
+        row = dict(mention)
+        if matn and not evidence_usable(row, matn):
+            row["evidence"] = ""
+        kept.append(row)
     return kept, rejected

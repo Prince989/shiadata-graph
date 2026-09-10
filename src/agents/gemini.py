@@ -144,7 +144,7 @@ class GeminiAgent:
 
     def _retry_addon(self, schema: type[BaseModel] | None) -> str:
         name = getattr(schema, "__name__", "") if schema is not None else ""
-        if name == "MentionsFill":
+        if name in {"MentionsFill", "MentionsFillExhaustive"}:
             return MENTIONS_FILL_RETRY
         return COMPACT_JSON_RETRY
 

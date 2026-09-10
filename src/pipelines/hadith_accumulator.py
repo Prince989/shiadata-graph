@@ -53,10 +53,15 @@ def _resolve_quotes(quotes: list, existing_refs: list[str]) -> list[str]:
 
 
 def _upgrade_mention(existing: dict, other: dict) -> None:
+    from src.pipelines.grounding import prefer_evidence_span
+
     if float(other.get("salience") or 0) > float(existing.get("salience") or 0):
         existing["salience"] = other.get("salience")
-    if not str(existing.get("evidence") or "").strip():
-        existing["evidence"] = other.get("evidence") or ""
+    existing["evidence"] = prefer_evidence_span(
+        str(existing.get("text") or other.get("text") or ""),
+        str(existing.get("evidence") or ""),
+        str(other.get("evidence") or ""),
+    )
 
 
 def norm_marker(marker: str) -> str:
@@ -106,6 +111,7 @@ class OpenHadith:
     quotes_seed: list = field(default_factory=list)
     kitab: str = ""
     bab: str = ""
+    is_encyclopedic: bool = False
 
     def append_slice(
         self,
@@ -119,8 +125,11 @@ class OpenHadith:
         proposed: list[str] | None = None,
         mentions: list | None = None,
         quotes: list | None = None,
+        is_encyclopedic: bool = False
     ) -> None:
         self.page_end = locator
+        if is_encyclopedic:
+            self.is_encyclopedic = True
         if arabic:
             self.arabic.append(arabic)
         if fa:
@@ -164,6 +173,7 @@ class OpenHadith:
             "quotes_seed": self.quotes_seed,
             "kitab": self.kitab,
             "bab": self.bab,
+            "is_encyclopedic": self.is_encyclopedic
         }
 
     @classmethod
@@ -189,6 +199,7 @@ class OpenHadith:
             quotes_seed=list(data.get("quotes_seed") or []),
             kitab=str(data.get("kitab") or ""),
             bab=str(data.get("bab") or ""),
+            is_encyclopedic=bool(data.get("is_encyclopedic"))
         )
 
     def assemble(self) -> dict:
@@ -227,6 +238,9 @@ class OpenHadith:
             # The book's own classification. Authored by Kulayni, not inferred.
             "kitab": self.kitab,
             "bab": self.bab,
+            "is_encyclopedic": self.is_encyclopedic,
+            # Per-page Arabic fragments for chunked exhaustive MentionsFill.
+            "arabic_pages": [p for p in self.arabic if p],
         }
 
 
@@ -249,6 +263,7 @@ def _slice_from_item(
         "mentions": [m for m in (item.get("mentions") or []) if isinstance(m, dict)],
         "quotes": [q for q in (item.get("quotes") or []) if isinstance(q, dict)],
         "quran_refs": list(quran_refs or []),
+        "is_encyclopedic": bool(item.get("is_encyclopedic"))
     }
 
 
@@ -267,6 +282,7 @@ def _single(slice_: dict, locator: str, kitab: str = "", bab: str = "") -> dict:
         slice_.get("proposed_nodes"),
         slice_.get("mentions"),
         slice_.get("quotes"),
+        is_encyclopedic=slice_.get("is_encyclopedic", False)
     )
     return buf.assemble()
 
@@ -310,6 +326,7 @@ def consume_page(
             quran_refs=refs.get("continuation"),
             mentions=[m for m in (item.get("mentions") or []) if isinstance(m, dict)],
             quotes=[q for q in (item.get("quotes") or []) if isinstance(q, dict)],
+            is_encyclopedic=bool(item.get("is_encyclopedic")),
         )
 
     if buf and starts:
@@ -336,6 +353,7 @@ def consume_page(
                 slice_["proposed_nodes"],
                 slice_["mentions"],
                 slice_["quotes"],
+                is_encyclopedic=bool(slice_.get("is_encyclopedic")),
             )
         else:
             flushed.append(_single(slice_, locator, kitab, bab))
@@ -353,14 +371,20 @@ def close_open_hadith_with_page(
     gemini_items: list[dict],
     buffer: OpenHadith,
     quran_refs: dict[str, list[str]] | None = None,
+    next_text: str | None = None,
+    *,
+    force_close: bool = True,
 ) -> tuple[dict | None, OpenHadith | None]:
-    """Append only the leading continuation of `text` and close `buffer`.
+    """Append only the leading continuation of `text`.
 
-    Used by targeted `--page` runs: the next printed page is fetched solely to
-    finish a spanning hadith, without flushing that page's new numbered markers.
+    By default (`force_close=True`) always assembles — legacy single-lookahead.
+    With `force_close=False`, assembles only when a new numbered start begins on
+    this page or the following page does not continue the narration; otherwise
+    returns `(None, buffer)` so targeted `--page` can follow a multi-page span.
     """
     refs = quran_refs or {}
     text = strip_folklib_footnotes(text)
+    next_text = strip_folklib_footnotes(next_text) if next_text else next_text
     leading, starts = page_prefix_and_starts(text)
     buf = buffer
     if leading:
@@ -374,7 +398,8 @@ def close_open_hadith_with_page(
             quran_refs=refs.get("continuation"),
             mentions=[m for m in (item.get("mentions") or []) if isinstance(m, dict)],
             quotes=[q for q in (item.get("quotes") or []) if isinstance(q, dict)],
+            is_encyclopedic=bool(item.get("is_encyclopedic")),
         )
-    # A numbered start on the next page means our open hadith ended before it.
-    # Always assemble here: this helper exists to finish the buffer, not hold it.
-    return buf.assemble(), None
+    if force_close or starts or not next_page_continues(next_text):
+        return buf.assemble(), None
+    return None, buf

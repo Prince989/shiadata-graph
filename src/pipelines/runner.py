@@ -313,68 +313,88 @@ def run_hadith_phase1(
             if stop:
                 break
             # Targeted --page left an open buffer because the next printed page
-            # continues the last hadith: fetch that page only to close the
-            # spanning marker (do not flush that page's new numbered hadiths).
+            # continues the last hadith: follow pages until the spanning marker
+            # closes (do not flush those pages' new numbered hadiths).
             if page_filter and buf and target_indexes:
                 next_i = target_indexes[-1] + 1
-                if next_i < len(all_units):
+                lookahead = 0
+                max_lookahead = 12
+                while buf is not None and next_i < len(all_units) and lookahead < max_lookahead:
                     unit = all_units[next_i]
-                    if not should_skip(unit.text, settings.skip_min_chars):
+                    following = (
+                        all_units[next_i + 1].text
+                        if next_i + 1 < len(all_units)
+                        else None
+                    )
+                    if should_skip(unit.text, settings.skip_min_chars):
+                        next_i += 1
+                        lookahead += 1
+                        continue
+                    try:
+                        page_payload = extract_hadith_page(agent, unit)
+                    except StructuredOutputError as exc:
+                        errors += 1
+                        logger.error(
+                            "phase1 JSON failed %s (lookahead): %s",
+                            unit.locator,
+                            exc,
+                        )
+                        break
+                    except ProviderServerError:
+                        raise
+                    items = [
+                        it
+                        for it in (page_payload.get("hadiths") or [])
+                        if isinstance(it, dict)
+                    ]
+                    closed, buf = close_open_hadith_with_page(
+                        unit.locator,
+                        unit.text,
+                        items,
+                        buf,
+                        unit.quran_refs,
+                        next_text=following,
+                        force_close=False,
+                    )
+                    last_buf = buf
+                    lookahead += 1
+                    next_i += 1
+                    logger.info(
+                        "phase1 --page lookahead %s (open=%s)",
+                        unit.locator,
+                        buf is not None,
+                    )
+                    if closed is not None:
                         try:
-                            page_payload = extract_hadith_page(agent, unit)
+                            rec = unify_assembled_hadith(agent, closed)
                         except StructuredOutputError as exc:
                             errors += 1
                             logger.error(
-                                "phase1 JSON failed %s (lookahead): %s",
-                                unit.locator,
+                                "phase1 unify mentions failed %s: %s",
+                                closed.get("marker") or unit.locator,
                                 exc,
                             )
-                        except ProviderServerError:
-                            raise
-                        else:
-                            items = [
-                                it
-                                for it in (page_payload.get("hadiths") or [])
-                                if isinstance(it, dict)
-                            ]
-                            closed, buf = close_open_hadith_with_page(
-                                unit.locator,
-                                unit.text,
-                                items,
-                                buf,
-                                unit.quran_refs,
+                            persist_complete_hadith(
+                                state,
+                                book_id=book_id,
+                                source_path=source,
+                                payload=remap_hadith_payload(dict(closed)),
+                                output_dir=output_dir,
+                                status=ChunkStatus.ERROR,
+                                error=str(exc)[:2000],
+                                force=True,
                             )
-                            last_buf = buf
-                            if closed is not None:
-                                try:
-                                    rec = unify_assembled_hadith(agent, closed)
-                                except StructuredOutputError as exc:
-                                    errors += 1
-                                    logger.error(
-                                        "phase1 unify mentions failed %s: %s",
-                                        closed.get("marker") or unit.locator,
-                                        exc,
-                                    )
-                                    persist_complete_hadith(
-                                        state,
-                                        book_id=book_id,
-                                        source_path=source,
-                                        payload=remap_hadith_payload(dict(closed)),
-                                        output_dir=output_dir,
-                                        status=ChunkStatus.ERROR,
-                                        error=str(exc)[:2000],
-                                        force=True,
-                                    )
-                                else:
-                                    persist_complete_hadith(
-                                        state,
-                                        book_id=book_id,
-                                        source_path=source,
-                                        payload=rec,
-                                        output_dir=output_dir,
-                                        force=True,
-                                    )
-                                    flushed += 1
+                        else:
+                            persist_complete_hadith(
+                                state,
+                                book_id=book_id,
+                                source_path=source,
+                                payload=rec,
+                                output_dir=output_dir,
+                                force=True,
+                            )
+                            flushed += 1
+                        break
             # End of volume, or end of a targeted page selection with an open
             # spanning buffer — flush so debug runs still write a payload.
             at_volume_end = not page_filter and i >= len(ordered)
