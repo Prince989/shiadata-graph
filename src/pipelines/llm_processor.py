@@ -139,12 +139,32 @@ def translation_incomplete(text: str) -> bool:
     return bool(_INCOMPLETE_TRANSLATION.search(value))
 
 
+# Short coordinated nouns (الخير و الشر و الايمان …). Sermons use و too, but
+# the conjuncts are clauses, not 1–4-word labels.
+_MAX_LIST_CONJUNCT_CHARS = 40
+_MAX_LIST_CONJUNCT_WORDS = 4
+_ENCYCLOPEDIC_SHORT_ITEMS = 12
+_ENCYCLOPEDIC_SHORT_ITEMS_SPANNED = 8
+
+
+def _short_coordinated_items(folded: str) -> int:
+    """How many و-conjuncts look like inventory labels, not clauses."""
+    n = 0
+    for part in folded.split(" و "):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        words = chunk.split()
+        if 1 <= len(words) <= _MAX_LIST_CONJUNCT_WORDS and len(chunk) <= _MAX_LIST_CONJUNCT_CHARS:
+            n += 1
+    return n
+
+
 def looks_encyclopedic(payload: dict) -> bool:
     """Backup detector when the page LLM never set is_encyclopedic.
 
-    Conservative: explicit host/inventory framing, or a long multi-page matn
-    with extreme coordination density (the 75-hosts shape). Does not fire on
-    long sermons that lack list structure.
+    Structural only: a dense run of short و-linked labels. Book titles and
+    particular concepts are not consulted — any inventory hadith qualifies.
     """
     if payload.get("is_encyclopedic"):
         return True
@@ -154,13 +174,14 @@ def looks_encyclopedic(payload: dict) -> bool:
     folded = fold(matn)
     if not folded.strip():
         return False
-    if "جنود العقل" in folded or "جنود الجهل" in folded:
-        return True
+    short = _short_coordinated_items(folded)
     pages = [p for p in (payload.get("arabic_pages") or []) if str(p).strip()]
     n_pages = len(pages)
     if n_pages == 0 and payload.get("page_start") != payload.get("page_end"):
         n_pages = 2
-    if n_pages >= 3 and len(folded) > 2500 and folded.count(" و ") >= 80:
+    if short >= _ENCYCLOPEDIC_SHORT_ITEMS:
+        return True
+    if n_pages >= 2 and short >= _ENCYCLOPEDIC_SHORT_ITEMS_SPANNED:
         return True
     return False
 
@@ -281,8 +302,7 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
     runner marks ERROR instead of writing hollow PROCESSED files.
 
     Encyclopedic inventories (`is_encyclopedic` / heuristic) use chunked
-    MentionsFillExhaustive so page prefer-3-8 does not permanently truncate
-    75-pair taxonomies.
+    MentionsFill so page prefer-3-8 does not permanently truncate long lists.
     """
     from src.agents.errors import ProviderServerError, StructuredOutputError
 
