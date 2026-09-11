@@ -139,49 +139,63 @@ def translation_incomplete(text: str) -> bool:
     return bool(_INCOMPLETE_TRANSLATION.search(value))
 
 
-# Short coordinated nouns (الخير و الشر و الايمان …). Sermons use و too, but
-# the conjuncts are clauses, not 1–4-word labels.
+# Short coordinated nouns (الخير و الشر و الايمان …). Sermons and Qur'anic
+# citations also use و, but inventory lists are a *consecutive* run of short
+# labels. Counting every short conjunct in the whole matn (old heuristic)
+# false-positive'd the long Hisham sermon and burned the free-tier quota.
 _MAX_LIST_CONJUNCT_CHARS = 40
 _MAX_LIST_CONJUNCT_WORDS = 4
-_ENCYCLOPEDIC_SHORT_ITEMS = 12
-_ENCYCLOPEDIC_SHORT_ITEMS_SPANNED = 8
+_ENCYCLOPEDIC_STREAK = 12
+_ENCYCLOPEDIC_STREAK_SPANNED = 8
+# Free-tier guard: one encyclopedic hadith must not spend the whole day.
+_EXHAUSTIVE_MAX_CALLS = 20
+_EXHAUSTIVE_MAX_MENTIONS = 160
+_EXHAUSTIVE_MAX_ROUNDS = 8
 
 
-def _short_coordinated_items(folded: str) -> int:
-    """How many و-conjuncts look like inventory labels, not clauses."""
-    n = 0
+def _short_list_streak(folded: str) -> int:
+    """Longest consecutive run of short و-conjuncts (inventory shape)."""
+    best = 0
+    cur = 0
     for part in folded.split(" و "):
         chunk = part.strip()
         if not chunk:
             continue
         words = chunk.split()
-        if 1 <= len(words) <= _MAX_LIST_CONJUNCT_WORDS and len(chunk) <= _MAX_LIST_CONJUNCT_CHARS:
-            n += 1
-    return n
+        if (
+            1 <= len(words) <= _MAX_LIST_CONJUNCT_WORDS
+            and len(chunk) <= _MAX_LIST_CONJUNCT_CHARS
+        ):
+            cur += 1
+            if cur > best:
+                best = cur
+        else:
+            cur = 0
+    return best
 
 
 def looks_encyclopedic(payload: dict) -> bool:
-    """Backup detector when the page LLM never set is_encyclopedic.
+    """Structural detector for inventory matns (exhaustive MentionsFill).
 
-    Structural only: a dense run of short و-linked labels. Book titles and
-    particular concepts are not consulted — any inventory hadith qualifies.
+    Does NOT trust the page LLM's `is_encyclopedic` flag alone — a false
+    positive there costs dozens of Gemini calls. Requires a consecutive
+    streak of short و-linked labels (hosts-of-intellect shape), not a
+    sermon that merely quotes coordinated Qur'anic phrases.
     """
-    if payload.get("is_encyclopedic"):
-        return True
     from src.pipelines.morphology import fold
 
     matn = str(payload.get("hadith") or "")
     folded = fold(matn)
     if not folded.strip():
         return False
-    short = _short_coordinated_items(folded)
+    streak = _short_list_streak(folded)
     pages = [p for p in (payload.get("arabic_pages") or []) if str(p).strip()]
     n_pages = len(pages)
     if n_pages == 0 and payload.get("page_start") != payload.get("page_end"):
         n_pages = 2
-    if short >= _ENCYCLOPEDIC_SHORT_ITEMS:
+    if streak >= _ENCYCLOPEDIC_STREAK:
         return True
-    if n_pages >= 2 and short >= _ENCYCLOPEDIC_SHORT_ITEMS_SPANNED:
+    if n_pages >= 2 and streak >= _ENCYCLOPEDIC_STREAK_SPANNED:
         return True
     return False
 
@@ -213,10 +227,30 @@ def _exhaustive_mentions_fill(agent: GeminiAgent, payload: dict, label: str) -> 
         chunks = [str(payload.get("hadith") or "")]
     merged = list(payload.get("mentions") or [])
     system = mentions_fill_prompt(is_exhaustive=True)
-    max_rounds = 10
+    calls = 0
+    stop = False
     for i, chunk in enumerate(chunks):
+        if stop:
+            break
         stagnant = 0
-        for round_i in range(max_rounds):
+        for round_i in range(_EXHAUSTIVE_MAX_ROUNDS):
+            if calls >= _EXHAUSTIVE_MAX_CALLS:
+                logger.warning(
+                    "exhaustive MentionsFill %s hit call budget %s; stopping at %s mentions",
+                    label,
+                    _EXHAUSTIVE_MAX_CALLS,
+                    len(merged),
+                )
+                stop = True
+                break
+            if len(merged) >= _EXHAUSTIVE_MAX_MENTIONS:
+                logger.info(
+                    "exhaustive MentionsFill %s reached mention cap %s",
+                    label,
+                    _EXHAUSTIVE_MAX_MENTIONS,
+                )
+                stop = True
+                break
             known = [str(m.get("text") or "") for m in merged if m.get("text")]
             known_preview = ", ".join(known[-40:]) if known else "(none yet)"
             prompt = (
@@ -238,19 +272,21 @@ def _exhaustive_mentions_fill(agent: GeminiAgent, payload: dict, label: str) -> 
                     f"exhaustive mentions fill failed for {label} "
                     f"(fragment {i + 1}/{len(chunks)} round {round_i + 1}): {exc}"
                 ) from exc
+            calls += 1
             before = len(merged)
             merged = _merge_mentions(
                 merged, [m.model_dump() for m in filled.mentions]
             )
             gained = len(merged) - before
             logger.info(
-                "exhaustive MentionsFill %s fragment %s/%s round %s -> +%s (total %s)",
+                "exhaustive MentionsFill %s fragment %s/%s round %s -> +%s (total %s, calls %s)",
                 label,
                 i + 1,
                 len(chunks),
                 round_i + 1,
                 gained,
                 len(merged),
+                calls,
             )
             if gained == 0:
                 stagnant += 1
@@ -308,8 +344,10 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
 
     payload = dict(payload)
     payload["hadith"] = strip_folklib_footnotes(str(payload.get("hadith") or ""))
-    if looks_encyclopedic(payload):
-        payload["is_encyclopedic"] = True
+    # Structural only. Page LLM `is_encyclopedic` is not trusted for the
+    # expensive MentionsFill path (false positives burned the free tier).
+    is_exhaustive = looks_encyclopedic(payload)
+    payload["is_encyclopedic"] = is_exhaustive
     if not needs_enrichment(payload):
         return remap_hadith_payload(payload)
     arabic = str(payload.get("hadith") or "")
@@ -318,8 +356,6 @@ def unify_assembled_hadith(agent: GeminiAgent, payload: dict) -> dict:
         body = arabic
     else:
         body = arabic[:UNIFY_BODY_BUDGET]
-
-    is_exhaustive = bool(payload.get("is_encyclopedic"))
 
     topic_count = len(payload.get("mentions") or []) + len(semantic_nodes_of(payload))
     need_topics = topic_count < 1 or is_exhaustive
