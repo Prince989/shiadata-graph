@@ -496,6 +496,7 @@ def persist_complete_hadith(
     status: ChunkStatus = ChunkStatus.PROCESSED_PHASE1,
     error: str | None = None,
     force: bool = False,
+    day_report=None,
 ) -> str:
     """Write one complete narration and upsert it as an embeddable Phase 1 chunk.
 
@@ -536,6 +537,10 @@ def persist_complete_hadith(
             ]
         )
     state.mark(cid, status, payload=payload, error=error)
+    if status == ChunkStatus.PROCESSED_PHASE1 and day_report is not None:
+        record = getattr(day_report, "record_hadith", None)
+        if callable(record):
+            record(source_path, payload)
     logger.info(
         "phase1 hadith %s %s %s",
         status.value,

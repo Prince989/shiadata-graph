@@ -124,12 +124,15 @@ class GeminiAgent:
         settings: Settings | None = None,
         key_pool: KeyPool | None = None,
         generate_fn=None,
+        day_report=None,
     ):
         self.settings = settings or get_settings()
         self.pool = key_pool or KeyPool(state, self.settings)
         self._generate_fn = generate_fn
         self._last_call_at: float | None = None
         self._skip_min_interval = False
+        # Optional Phase1DayReport (or any object with record_http).
+        self.day_report = day_report
 
     def _configured_models(self) -> list[str]:
         models = [m for m in (self.settings.gemini_models or []) if m]
@@ -215,7 +218,13 @@ class GeminiAgent:
             try:
                 logger.info("Gemini model %s on %s", current_model, key.id)
                 try:
-                    text = self._call_once(key, prompt, sys, current_model, schema)
+                    try:
+                        text = self._call_once(key, prompt, sys, current_model, schema)
+                    except StructuredOutputError:
+                        # Empty / truncated replies still used a successful HTTP slot.
+                        self._record_http(key, 200)
+                        raise
+                    self._record_http(key, 200)
                 finally:
                     self._mark_call()
                 if schema is not None:
@@ -241,6 +250,10 @@ class GeminiAgent:
                 kind, retry_ms = classify_provider_error(exc)
                 if kind is None:
                     raise
+                if kind == FailureKind.SERVER_ERROR:
+                    self._record_http(key, 503)
+                elif kind in {FailureKind.RATE_LIMITED, FailureKind.QUOTA_EXHAUSTED}:
+                    self._record_http(key, 429)
                 logger.warning("Gemini call failed on %s (%s): %s", key.id, current_model, exc)
                 if kind == FailureKind.SERVER_ERROR:
                     # With a single configured model (3.6-flash), retry the same
@@ -284,6 +297,14 @@ class GeminiAgent:
         if kind == FailureKind.QUOTA_EXHAUSTED:
             raise AllKeysExhausted(FREE_TIER_TODAY) from last_error
         raise ProviderServerError(str(last_error) if last_error else "gemini failed")
+
+    def _record_http(self, key: LlmKey, status: int) -> None:
+        report = self.day_report
+        if report is None:
+            return
+        record = getattr(report, "record_http", None)
+        if callable(record):
+            record(key.index, status)
 
     def _wait_min_interval(self) -> None:
         if self._skip_min_interval:

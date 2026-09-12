@@ -124,6 +124,7 @@ def _unify_and_persist_one(
             status=ChunkStatus.ERROR,
             error=str(exc)[:2000],
             force=force,
+            day_report=getattr(agent, "day_report", None),
         )
         return False
     persist_complete_hadith(
@@ -133,6 +134,7 @@ def _unify_and_persist_one(
         payload=out,
         output_dir=output_dir,
         force=force,
+        day_report=getattr(agent, "day_report", None),
     )
     return True
 
@@ -454,6 +456,7 @@ def run_hadith_phase1(
                                 status=ChunkStatus.ERROR,
                                 error=str(exc)[:2000],
                                 force=True,
+                                day_report=getattr(agent, "day_report", None),
                             )
                         else:
                             persist_complete_hadith(
@@ -463,6 +466,7 @@ def run_hadith_phase1(
                                 payload=rec,
                                 output_dir=output_dir,
                                 force=True,
+                                day_report=getattr(agent, "day_report", None),
                             )
                             flushed += 1
                         break

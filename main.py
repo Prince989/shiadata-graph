@@ -30,6 +30,7 @@ from src.pipelines.proposals import (
     scan_output_dir,
 )
 from src.pipelines.reset import reset_catalog_book
+from src.pipelines.phase1_report import Phase1DayReport
 from src.pipelines.runner import run_phase1
 from src.state_manager import StateManager
 
@@ -44,10 +45,10 @@ def _setup_logging() -> None:
     )
 
 
-def _stack() -> tuple[StateManager, GeminiAgent, EmbeddingAgent]:
+def _stack(day_report: Phase1DayReport | None = None) -> tuple[StateManager, GeminiAgent, EmbeddingAgent]:
     settings = get_settings()
     state = StateManager(settings.state_db)
-    gemini = GeminiAgent(state, settings)
+    gemini = GeminiAgent(state, settings, day_report=day_report)
     embeddings = EmbeddingAgent(settings, state)
     return state, gemini, embeddings
 
@@ -77,7 +78,9 @@ def phase1(
 ) -> None:
     """Parse a book and run Gemini structured extraction."""
     _setup_logging()
-    state, gemini, _ = _stack()
+    report = Phase1DayReport()
+    typer.echo(f"phase1 day report (live): {report.md_path}")
+    state, gemini, _ = _stack(day_report=report)
     try:
         stats = run_phase1(book, state, gemini, limit=limit, page=page, volume=volume)
     except FileNotFoundError as exc:
@@ -98,6 +101,8 @@ def phase1(
         )
         raise typer.Exit(code=2) from exc
     finally:
+        path = report.flush()
+        typer.echo(f"phase1 day report saved: {path}")
         state.close()
     typer.echo(stats)
 

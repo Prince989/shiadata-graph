@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 data/state.db
 data/output/
+data/reports/
 .env
 *.egg-info/
 dist/
