@@ -61,6 +61,82 @@ def locator_matches_page(
     return bool(re.search(rf"جلد\s*{re.escape(vol)}(?!\d)", loc))
 
 
+def _split_resume_buffer(
+    raw: dict | None,
+) -> tuple[OpenHadith | None, list[dict]]:
+    """Load open spanning buffer + assembled hadiths still waiting on unify.
+
+    Legacy rows were a bare OpenHadith dict. New rows wrap both channels so a
+    quota death mid-unify cannot drop a closed multi-page narration while
+    progress has already walked past its pages.
+    """
+    if not raw:
+        return None, []
+    if "open" in raw or "pending_unify" in raw:
+        open_raw = raw.get("open")
+        pending = [p for p in (raw.get("pending_unify") or []) if isinstance(p, dict)]
+        buf = OpenHadith.from_dict(open_raw) if open_raw else None
+        return buf, pending
+    return OpenHadith.from_dict(raw), []
+
+
+def _dump_resume_buffer(
+    buf: OpenHadith | None, pending: list[dict] | None
+) -> dict | None:
+    pending = [p for p in (pending or []) if isinstance(p, dict)]
+    if buf is None and not pending:
+        return None
+    return {
+        "open": buf.to_dict() if buf else None,
+        "pending_unify": pending,
+    }
+
+
+def _unify_and_persist_one(
+    *,
+    state: StateManager,
+    agent: GeminiAgent,
+    book_id: str,
+    source: str,
+    rec: dict,
+    output_dir: Path,
+    force: bool = False,
+) -> bool:
+    """Unify+persist one assembled hadith. True if flushed OK, False if ERROR row.
+
+    Propagates AllKeysExhausted / ProviderServerError so the caller can stash
+    this record and any still-waiting siblings in the resume buffer.
+    """
+    try:
+        out = unify_assembled_hadith(agent, rec)
+    except StructuredOutputError as exc:
+        logger.error(
+            "phase1 unify mentions failed %s: %s",
+            rec.get("marker") or rec.get("locator"),
+            exc,
+        )
+        persist_complete_hadith(
+            state,
+            book_id=book_id,
+            source_path=source,
+            payload=remap_hadith_payload(dict(rec)),
+            output_dir=output_dir,
+            status=ChunkStatus.ERROR,
+            error=str(exc)[:2000],
+            force=force,
+        )
+        return False
+    persist_complete_hadith(
+        state,
+        book_id=book_id,
+        source_path=source,
+        payload=out,
+        output_dir=output_dir,
+        force=force,
+    )
+    return True
+
+
 def _flush_open_hadith(
     *,
     state: StateManager,
@@ -74,35 +150,16 @@ def _flush_open_hadith(
     """Assemble and persist a trailing open buffer. Returns (flushed, errors)."""
     if buf is None:
         return 0, 0
-    assembled = buf.assemble()
-    try:
-        rec = unify_assembled_hadith(agent, assembled)
-    except StructuredOutputError as exc:
-        logger.error(
-            "phase1 unify mentions failed %s: %s",
-            assembled.get("marker") or assembled.get("locator"),
-            exc,
-        )
-        persist_complete_hadith(
-            state,
-            book_id=book_id,
-            source_path=source,
-            payload=remap_hadith_payload(dict(assembled)),
-            output_dir=output_dir,
-            status=ChunkStatus.ERROR,
-            error=str(exc)[:2000],
-            force=force,
-        )
-        return 0, 1
-    persist_complete_hadith(
-        state,
+    ok = _unify_and_persist_one(
+        state=state,
+        agent=agent,
         book_id=book_id,
-        source_path=source,
-        payload=rec,
+        source=source,
+        rec=buf.assemble(),
         output_dir=output_dir,
         force=force,
     )
-    return 1, 0
+    return (1, 0) if ok else (0, 1)
 
 
 def parse_file(path: Path):
@@ -182,6 +239,7 @@ def run_hadith_phase1(
     page_filter = str(page).strip() if page else None
     last_source: str | None = None
     last_buf: OpenHadith | None = None
+    last_pending: list[dict] = []
     try:
         for path in spec.files:
             if stop or (remaining is not None and remaining <= 0):
@@ -189,6 +247,7 @@ def run_hadith_phase1(
             source = str(path)
             last_source = source
             all_units = prepare_units("hadith", parse_file(path), settings)
+            pending: list[dict] = []
             if page_filter:
                 target_indexes = [
                     i
@@ -219,8 +278,30 @@ def run_hadith_phase1(
                         if unit.locator == last:
                             start_i = i + 1
                             break
-                raw_buf = state.get_hadith_buffer(book_id, source)
-                buf = OpenHadith.from_dict(raw_buf) if raw_buf else None
+                buf, pending = _split_resume_buffer(
+                    state.get_hadith_buffer(book_id, source)
+                )
+                # Finish hadiths that closed before quota died mid-unify, before
+                # walking further pages (otherwise progress skips their span).
+                while pending:
+                    last_pending = list(pending)
+                    last_buf = buf
+                    if _unify_and_persist_one(
+                        state=state,
+                        agent=agent,
+                        book_id=book_id,
+                        source=source,
+                        rec=pending[0],
+                        output_dir=output_dir,
+                    ):
+                        flushed += 1
+                    else:
+                        errors += 1
+                    pending.pop(0)
+                    state.set_hadith_buffer(
+                        book_id, source, _dump_resume_buffer(buf, pending)
+                    )
+                last_pending = []
             last_buf = buf
             i = start_i
             while i < len(ordered):
@@ -246,7 +327,7 @@ def run_hadith_phase1(
                     logger.error("phase1 JSON failed %s: %s", unit.locator, exc)
                     if not page_filter:
                         state.set_hadith_buffer(
-                            book_id, source, buf.to_dict() if buf else None
+                            book_id, source, _dump_resume_buffer(buf, pending)
                         )
                     stop = True
                     break
@@ -259,7 +340,7 @@ def run_hadith_phase1(
                     )
                     if not page_filter:
                         state.set_hadith_buffer(
-                            book_id, source, buf.to_dict() if buf else None
+                            book_id, source, _dump_resume_buffer(buf, pending)
                         )
                     raise
                 items = [it for it in (page_payload.get("hadiths") or []) if isinstance(it, dict)]
@@ -273,38 +354,28 @@ def run_hadith_phase1(
                     (unit.kitab, unit.bab),
                 )
                 last_buf = buf
-                for rec in complete:
-                    try:
-                        rec = unify_assembled_hadith(agent, rec)
-                    except StructuredOutputError as exc:
-                        errors += 1
-                        logger.error(
-                            "phase1 unify mentions failed %s: %s",
-                            rec.get("marker") or unit.locator,
-                            exc,
-                        )
-                        persist_complete_hadith(
-                            state,
-                            book_id=book_id,
-                            source_path=source,
-                            payload=remap_hadith_payload(dict(rec)),
-                            output_dir=output_dir,
-                            status=ChunkStatus.ERROR,
-                            error=str(exc)[:2000],
-                            force=bool(page_filter),
-                        )
-                        continue
-                    persist_complete_hadith(
-                        state,
+                pending = list(complete)
+                last_pending = list(pending)
+                while pending:
+                    last_pending = list(pending)
+                    if _unify_and_persist_one(
+                        state=state,
+                        agent=agent,
                         book_id=book_id,
-                        source_path=source,
-                        payload=rec,
+                        source=source,
+                        rec=pending[0],
                         output_dir=output_dir,
                         force=bool(page_filter),
-                    )
-                    flushed += 1
+                    ):
+                        flushed += 1
+                    else:
+                        errors += 1
+                    pending.pop(0)
+                last_pending = []
                 if not page_filter:
-                    state.set_hadith_buffer(book_id, source, buf.to_dict() if buf else None)
+                    state.set_hadith_buffer(
+                        book_id, source, _dump_resume_buffer(buf, pending)
+                    )
                     state.set_hadith_progress(book_id, source, unit.locator)
                 pages += 1
                 if remaining is not None:
@@ -423,15 +494,28 @@ def run_hadith_phase1(
             )
     except AllKeysExhausted:
         if last_source is not None and not page_filter:
+            # Keep assembled-but-unflushed hadiths in pending_unify. Do not rewind
+            # progress when that stash exists — resume finishes unify first, then
+            # continues from last_locator without re-paying for those pages.
             state.set_hadith_buffer(
-                book_id, last_source, last_buf.to_dict() if last_buf else None
+                book_id,
+                last_source,
+                _dump_resume_buffer(last_buf, last_pending),
             )
+            if last_pending:
+                logger.warning(
+                    "phase1 saved %s pending unify hadith(s); first=%s",
+                    len(last_pending),
+                    last_pending[0].get("marker") or last_pending[0].get("locator"),
+                )
         state.finish_job(job_id, pause_reason="all_keys_exhausted")
         raise
     except ProviderServerError:
         if last_source is not None and not page_filter:
             state.set_hadith_buffer(
-                book_id, last_source, last_buf.to_dict() if last_buf else None
+                book_id,
+                last_source,
+                _dump_resume_buffer(last_buf, last_pending),
             )
         state.finish_job(job_id, pause_reason="provider_unavailable")
         raise
