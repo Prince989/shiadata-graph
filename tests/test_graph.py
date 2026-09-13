@@ -265,6 +265,22 @@ def test_collect_google_keys_keeps_three_unique_secrets():
     assert keys == ["alpha", "beta", "gamma", "delta"]
 
 
+def test_collect_google_keys_accepts_gemini_prefix_and_merges_indexes():
+    from config.settings import collect_google_keys
+
+    keys = collect_google_keys(
+        {
+            "GOOGLE_API_KEY": "a0",
+            "GOOGLE_API_KEY1": "a1",
+            "GEMINI_API_KEY10": "g10",
+            "GEMINI_API_KEY11": "g11",
+            "GOOGLE_API_KEY10": "g10-override",
+            "GEMINI_API_KEY_12": "g12",
+        }
+    )
+    assert keys == ["a0", "a1", "g10-override", "g11", "g12"]
+
+
 def test_round_robin_cycles_every_configured_key(state: StateManager):
     pool = KeyPool(state, keys=["a", "b", "c"])
     order = [pool.acquire().secret for _ in range(6)]

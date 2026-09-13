@@ -15,7 +15,11 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from config.paths import DEFAULT_RAG_ENV, LOCAL_ENV, PROJECT_ROOT, RAW_EPUBS_DIR, STATE_DB_PATH
 
-_GOOGLE_KEY_PATTERN = re.compile(r"^GOOGLE_API_KEY_?(\d*)$")
+# Accept GOOGLE_API_KEY / GOOGLE_API_KEY1 and GEMINI_API_KEY / GEMINI_API_KEY1.
+_KEY_PATTERNS = (
+    re.compile(r"^GOOGLE_API_KEY_?(\d*)$"),
+    re.compile(r"^GEMINI_API_KEY_?(\d*)$"),
+)
 
 DEFAULT_GEMINI_MODELS = (
     "gemini-3.6-flash",
@@ -42,18 +46,34 @@ def collect_env_maps() -> dict[str, str]:
 
 
 def collect_google_keys(env: dict[str, str] | None = None) -> list[str]:
+    """Collect Gemini secrets from GOOGLE_API_KEY* and GEMINI_API_KEY* env vars.
+
+    Same numeric index from either prefix shares a slot (GOOGLE wins over GEMINI
+    when both are set). Duplicate secret values are collapsed once, in index order.
+    """
     sources = env or collect_env_maps()
-    found: dict[int, str] = {}
+    # index -> (prefer_google, secret); GOOGLE_* overwrites GEMINI_* at same index
+    found: dict[int, tuple[bool, str]] = {}
     for name, value in sources.items():
-        match = _GOOGLE_KEY_PATTERN.match(name)
-        if not match or not value.strip():
+        secret = (value or "").strip()
+        if not secret:
             continue
-        index = int(match.group(1)) if match.group(1) else 0
-        found[index] = value.strip()
+        for pattern, is_google in (
+            (_KEY_PATTERNS[0], True),
+            (_KEY_PATTERNS[1], False),
+        ):
+            match = pattern.match(name)
+            if not match:
+                continue
+            index = int(match.group(1)) if match.group(1) else 0
+            previous = found.get(index)
+            if previous is None or (is_google and not previous[0]):
+                found[index] = (is_google, secret)
+            break
     ordered: list[str] = []
     seen: set[str] = set()
     for index in sorted(found):
-        key = found[index]
+        key = found[index][1]
         if key not in seen:
             seen.add(key)
             ordered.append(key)
