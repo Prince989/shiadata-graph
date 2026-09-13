@@ -139,33 +139,80 @@ def translation_incomplete(text: str) -> bool:
     return bool(_INCOMPLETE_TRANSLATION.search(value))
 
 
-# Short coordinated nouns (الخير و الشر و الايمان …). Sermons and Qur'anic
-# citations also use و, but inventory lists are a *consecutive* run of short
-# labels. Counting every short conjunct in the whole matn (old heuristic)
-# false-positive'd the long Hisham sermon and burned the free-tier quota.
-_MAX_LIST_CONJUNCT_CHARS = 40
-_MAX_LIST_CONJUNCT_WORDS = 4
+# Inventory labels are short nouns (الخير و الشر و الايمان …). Sermons and
+# cosmic/Qur'anic coordination also use و, but those conjuncts are clauses or
+# short prose crumbs (بان له، من سمائه). Only consecutive *label-shaped*
+# conjuncts count; a 2-page cosmic list of 6–8 must not burn MentionsFill.
+_MAX_LIST_CONJUNCT_CHARS = 24
+_MAX_LIST_CONJUNCT_WORDS = 2
 _ENCYCLOPEDIC_STREAK = 12
-_ENCYCLOPEDIC_STREAK_SPANNED = 8
+_ENCYCLOPEDIC_STREAK_SPANNED = 12
 # Free-tier guard: one encyclopedic hadith must not spend the whole day.
 _EXHAUSTIVE_MAX_CALLS = 20
 _EXHAUSTIVE_MAX_MENTIONS = 160
 _EXHAUSTIVE_MAX_ROUNDS = 8
 
+# Folded clause / particle heads that never start an inventory label.
+_LIST_CONJUNCT_STOP = frozenset(
+    {
+        "ان",
+        "بان",
+        "فان",
+        "لان",
+        "من",
+        "في",
+        "على",
+        "عن",
+        "ثم",
+        "قد",
+        "لم",
+        "لا",
+        "ما",
+        "اذا",
+        "اذ",
+        "كان",
+        "يكون",
+        "قال",
+        "قيل",
+        "هذا",
+        "هذه",
+        "ذلك",
+        "تلك",
+        "هو",
+        "هي",
+        "هم",
+        "هن",
+        "له",
+        "لها",
+        "لهم",
+        "به",
+        "بها",
+        "بهم",
+    }
+)
+
+
+def _is_inventory_label(chunk: str) -> bool:
+    """True for short noun-like و-conjuncts, not sermon / cosmic crumbs."""
+    words = chunk.split()
+    if not (1 <= len(words) <= _MAX_LIST_CONJUNCT_WORDS):
+        return False
+    if len(chunk) > _MAX_LIST_CONJUNCT_CHARS:
+        return False
+    if words[0] in _LIST_CONJUNCT_STOP:
+        return False
+    return True
+
 
 def _short_list_streak(folded: str) -> int:
-    """Longest consecutive run of short و-conjuncts (inventory shape)."""
+    """Longest consecutive run of inventory-shaped و-conjuncts."""
     best = 0
     cur = 0
     for part in folded.split(" و "):
         chunk = part.strip()
         if not chunk:
             continue
-        words = chunk.split()
-        if (
-            1 <= len(words) <= _MAX_LIST_CONJUNCT_WORDS
-            and len(chunk) <= _MAX_LIST_CONJUNCT_CHARS
-        ):
+        if _is_inventory_label(chunk):
             cur += 1
             if cur > best:
                 best = cur
@@ -179,8 +226,8 @@ def looks_encyclopedic(payload: dict) -> bool:
 
     Does NOT trust the page LLM's `is_encyclopedic` flag alone — a false
     positive there costs dozens of Gemini calls. Requires a consecutive
-    streak of short و-linked labels (hosts-of-intellect shape), not a
-    sermon that merely quotes coordinated Qur'anic phrases.
+    streak of short و-linked *labels* (hosts-of-intellect shape), not a
+    sermon that coordinates creation nouns or Qur'anic phrases.
     """
     from src.pipelines.morphology import fold
 
