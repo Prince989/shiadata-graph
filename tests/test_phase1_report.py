@@ -27,7 +27,7 @@ def test_day_report_writes_live_after_each_event(tmp_path: Path):
     assert report.md_path.exists()
     report.record_http(0, 503)
     text = report.md_path.read_text(encoding="utf-8")
-    assert "|   1 |   1 |   0 |   0 |       0 |" in text
+    assert "|   1 |   1 |   0 |   0 |   0 |       0 |" in text
     report.record_http(0, 200)
     report.record_hadith(
         "al-kafi-1.txt",
@@ -36,7 +36,7 @@ def test_day_report_writes_live_after_each_event(tmp_path: Path):
     text = report.md_path.read_text(encoding="utf-8")
     assert "al-kafi-1_1_20_13" in text
     assert "### Key 1" in text
-    assert "|   1 |   1 |   1 |   0 |       1 |" in text
+    assert "|   1 |   1 |   1 |   0 |   0 |       1 |" in text
 
 
 def test_day_report_merges_same_day_rerun(tmp_path: Path):
@@ -45,6 +45,7 @@ def test_day_report_merges_same_day_rerun(tmp_path: Path):
     first.record_http(0, 200)
     first.record_http(0, 503)
     first.record_http(1, 429)
+    first.record_http(1, 401)
     first.record_hadith(
         "al-kafi-1.txt",
         {"marker": "13 -", "locator": "جلد 1 - صفحه 20"},
@@ -64,4 +65,5 @@ def test_day_report_merges_same_day_rerun(tmp_path: Path):
     text = path.read_text(encoding="utf-8")
     assert "`al-kafi-1_1_20_13`" in text
     assert "`al-kafi-1_1_20-23_14`" in text
-    assert "|   1 |   1 |   2 |   0 |       2 |" in text
+    assert "|   1 |   1 |   2 |   0 |   0 |       2 |" in text
+    assert "|   2 |   0 |   0 |   1 |   1 |       0 |" in text

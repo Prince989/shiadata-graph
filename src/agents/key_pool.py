@@ -98,9 +98,35 @@ class KeyPool:
             )
         else:
             logger.info("Loaded %d distinct Gemini key(s)", len(self._keys))
+        self._log_blocked_summary()
 
     def pool_size(self) -> int:
         return len(self._keys)
+
+    def _log_blocked_summary(self) -> None:
+        now = int(time.time() * 1000)
+        auth_ns: list[int] = []
+        quota_ns: list[int] = []
+        for key in self._keys:
+            record = self.state.get_cooldown(key.id)
+            if not record or self._is_healthy(key.id, now):
+                continue
+            if record["reason"] == FailureKind.AUTH_INVALID.value:
+                auth_ns.append(key.index + 1)
+            elif record["reason"] == FailureKind.QUOTA_EXHAUSTED.value:
+                quota_ns.append(key.index + 1)
+        if auth_ns:
+            logger.warning(
+                "Skipping %d auth-invalid key(s) until cooldown ends or state is cleared: %s",
+                len(auth_ns),
+                auth_ns,
+            )
+        if quota_ns:
+            logger.info(
+                "%d key(s) already on daily free-tier cooldown: %s",
+                len(quota_ns),
+                quota_ns if len(quota_ns) <= 12 else f"{quota_ns[:12]}…",
+            )
 
     def acquire(self) -> LlmKey:
         n = len(self._keys)
@@ -110,8 +136,9 @@ class KeyPool:
         deadline = int(time.time() * 1000) + max_wait
         while True:
             now = int(time.time() * 1000)
-            if self.all_daily_quota_locked():
-                raise AllKeysExhausted(FREE_TIER_TODAY)
+            stop_msg = self._unusable_stop_message(now)
+            if stop_msg:
+                raise AllKeysExhausted(stop_msg)
             for _ in range(n):
                 candidate = self._keys[self._rr % n]
                 self._rr += 1
@@ -128,7 +155,7 @@ class KeyPool:
                     return candidate
             retry_at = self._soonest_waitable_retry_at()
             if retry_at is None:
-                raise AllKeysExhausted(FREE_TIER_TODAY)
+                raise AllKeysExhausted(self._unusable_stop_message(now) or FREE_TIER_TODAY)
             wait_ms = retry_at - now
             if wait_ms <= 0:
                 continue
@@ -139,6 +166,42 @@ class KeyPool:
         raise AllKeysExhausted(
             "All Gemini keys are cooling or disabled. State is saved; resume later."
         )
+
+    def _unusable_stop_message(self, now_ms: int) -> str | None:
+        """If every key is daily-quota or auth-dead, return a stop message."""
+        if not self._keys:
+            return None
+        auth = 0
+        quota = 0
+        for key in self._keys:
+            record = self.state.get_cooldown(key.id)
+            if not record:
+                return None
+            reason = record["reason"]
+            if reason == FailureKind.AUTH_INVALID.value:
+                if int(record["retry_at_ms"]) > now_ms:
+                    auth += 1
+                    continue
+                return None
+            if reason == FailureKind.QUOTA_EXHAUSTED.value and self._quota_still_locked(
+                record, now_ms
+            ):
+                quota += 1
+                continue
+            return None
+        if auth and not quota:
+            return (
+                f"All {auth} Gemini key(s) are auth-invalid (401/403). "
+                "Replace those keys in .env, clear their cooldowns in data/state.db, then resume."
+            )
+        if auth and quota:
+            return (
+                f"{quota} key(s) hit free-tier daily quota; {auth} key(s) are auth-invalid. "
+                "Progress is saved. Fix auth-dead keys or wait until midnight Pacific for quota."
+            )
+        if quota:
+            return FREE_TIER_TODAY
+        return None
 
     def all_daily_quota_locked(self) -> bool:
         now = int(time.time() * 1000)
@@ -153,13 +216,16 @@ class KeyPool:
         return True
 
     def _soonest_waitable_retry_at(self) -> int | None:
-        """Soonest retry among keys that are not on a 24h daily-quota cooldown."""
+        """Soonest retry among keys on short cooldowns (not daily quota / auth)."""
         times: list[int] = []
         for key in self._keys:
             record = self.state.get_cooldown(key.id)
             if not record:
                 return None
-            if record["reason"] == FailureKind.QUOTA_EXHAUSTED.value:
+            if record["reason"] in {
+                FailureKind.QUOTA_EXHAUSTED.value,
+                FailureKind.AUTH_INVALID.value,
+            }:
                 continue
             times.append(int(record["retry_at_ms"]))
         return min(times) if times else None

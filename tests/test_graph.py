@@ -321,6 +321,44 @@ def test_classify_rpm_429_uses_retry_delay():
     assert 12_000 <= ms <= 14_000
 
 
+def test_classify_401_with_generate_content_is_auth_not_rate():
+    """Regression: 'rate' inside GenerateContent must not win over 401/403."""
+    from src.agents.gemini import classify_provider_error
+
+    class Exc(Exception):
+        status_code = 401
+
+    kind, _ = classify_provider_error(
+        Exc(
+            "401 UNAUTHENTICATED. The bound service account is deleted. "
+            "method: GenerativeService.GenerateContent"
+        )
+    )
+    assert kind == FailureKind.AUTH_INVALID
+
+    class Forbidden(Exception):
+        status_code = 403
+
+    kind, _ = classify_provider_error(
+        Forbidden(
+            "403 PERMISSION_DENIED. Your project has been denied access. "
+            "GenerateContent"
+        )
+    )
+    assert kind == FailureKind.AUTH_INVALID
+
+
+def test_classify_dns_connect_error_is_timeout():
+    from src.agents.gemini import classify_provider_error
+
+    kind, ms = classify_provider_error(Exception("[Errno 11001] getaddrinfo failed"))
+    assert kind == FailureKind.TIMEOUT
+    assert ms == 5_000
+
+    kind, ms = classify_provider_error(Exception("ConnectError: failed to resolve host"))
+    assert kind == FailureKind.TIMEOUT
+
+
 def test_classify_retired_model_404_is_server_error():
     from src.agents.gemini import classify_provider_error
 

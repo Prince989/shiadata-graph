@@ -94,6 +94,7 @@ class _KeyStats:
     count_200: int = 0
     count_503: int = 0
     count_429: int = 0
+    count_401: int = 0
     hadiths: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -101,6 +102,7 @@ class _KeyStats:
             "200": self.count_200,
             "503": self.count_503,
             "429": self.count_429,
+            "401": self.count_401,
             "hadiths": list(self.hadiths),
         }
 
@@ -111,6 +113,7 @@ class _KeyStats:
             count_200=int(data.get("200") or 0),
             count_503=int(data.get("503") or 0),
             count_429=int(data.get("429") or 0),
+            count_401=int(data.get("401") or 0),
             hadiths=[str(x) for x in (data.get("hadiths") or []) if str(x).strip()],
         )
 
@@ -164,6 +167,8 @@ class Phase1DayReport:
             row.count_503 += 1
         elif status == 429:
             row.count_429 += 1
+        elif status in {401, 403}:
+            row.count_401 += 1
         if self.live:
             self.flush()
 
@@ -215,13 +220,13 @@ class Phase1DayReport:
         updated = payload.get("updated_at") or ""
         keys = payload.get("keys") or {}
 
-        headers = ["key", "503", "200", "429", "hadiths"]
-        aligns = ["right", "right", "right", "right", "right"]
+        headers = ["key", "503", "200", "429", "401", "hadiths"]
+        aligns = ["right", "right", "right", "right", "right", "right"]
         rows: list[list[str]] = []
         hadith_sections: list[str] = []
 
         if not keys:
-            rows.append(["—", "0", "0", "0", "0"])
+            rows.append(["—", "0", "0", "0", "0", "0"])
         else:
             for key in sorted(keys, key=lambda k: int(k)):
                 stats = keys[key] or {}
@@ -237,6 +242,7 @@ class Phase1DayReport:
                         str(int(stats.get("503") or 0)),
                         str(int(stats.get("200") or 0)),
                         str(int(stats.get("429") or 0)),
+                        str(int(stats.get("401") or 0)),
                         str(len(hadiths)),
                     ]
                 )

@@ -82,12 +82,31 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
     compact = lowered.replace("_", "").replace("-", "").replace(" ", "")
     retry_after = _parse_retry_after(text)
 
-    if status == 429 or "429" in text or "resource exhausted" in lowered or "rate" in lowered:
+    # Auth before rate/429: error bodies often include "GenerateContent", and the
+    # old `"rate" in text` check matched inside that word and mis-labeled 401/403.
+    auth_markers = (
+        "unauthenticated",
+        "permission_denied",
+        "account_state_invalid",
+        "api key not valid",
+        "api key invalid",
+        "denied access",
+        "consumer_invalid",
+    )
+    if status in {401, 403} or any(m in lowered for m in auth_markers):
+        return FailureKind.AUTH_INVALID, None
+    if (
+        status == 429
+        or "429" in text
+        or "resource exhausted" in lowered
+        or "rate limit" in lowered
+        or "ratelimit" in compact
+    ):
         daily = "perday" in compact or "requestsperday" in compact
         if daily:
             return FailureKind.QUOTA_EXHAUSTED, None
         return FailureKind.RATE_LIMITED, retry_after
-    if status in {401, 403} or "api key" in lowered or "permission" in lowered:
+    if "api key" in lowered or "permission" in lowered:
         return FailureKind.AUTH_INVALID, None
     if (
         status in {404, 500, 502, 503, 504}
@@ -97,8 +116,31 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
         or "no longer available" in lowered
     ):
         return FailureKind.SERVER_ERROR, retry_after
-    if "timeout" in lowered or "timed out" in lowered:
-        return FailureKind.TIMEOUT, None
+    network_markers = (
+        "getaddrinfo failed",
+        "name or service not known",
+        "nodename nor servname",
+        "failed to resolve",
+        "connecterror",
+        "connect error",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "network is unreachable",
+        "temporarily unavailable",
+        "errno 11001",
+        "errno 11002",
+        "winerror 10054",
+        "winerror 10060",
+        "name resolution",
+    )
+    if (
+        "timeout" in lowered
+        or "timed out" in lowered
+        or any(m in lowered for m in network_markers)
+    ):
+        # Transient local network / DNS (common with flaky VPN). Retry with pause.
+        return FailureKind.TIMEOUT, retry_after or 5_000
     return None, None
 
 
@@ -254,6 +296,8 @@ class GeminiAgent:
                     self._record_http(key, 503)
                 elif kind in {FailureKind.RATE_LIMITED, FailureKind.QUOTA_EXHAUSTED}:
                     self._record_http(key, 429)
+                elif kind == FailureKind.AUTH_INVALID:
+                    self._record_http(key, 401)
                 logger.warning("Gemini call failed on %s (%s): %s", key.id, current_model, exc)
                 if kind == FailureKind.SERVER_ERROR:
                     # With a single configured model (3.6-flash), retry the same
@@ -286,6 +330,14 @@ class GeminiAgent:
                     )
                     self._skip_min_interval = True
                     continue
+                if kind == FailureKind.TIMEOUT:
+                    wait_s = (retry_ms / 1000.0) if retry_ms else 5.0
+                    logger.warning(
+                        "Network/timeout on %s; waiting %.1fs then retrying",
+                        key.id,
+                        wait_s,
+                    )
+                    time.sleep(wait_s)
                 self.pool.report_failure(key, kind, retry_ms)
                 key = None
                 if kind == FailureKind.QUOTA_EXHAUSTED and self.pool.all_daily_quota_locked():
