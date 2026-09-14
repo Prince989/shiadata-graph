@@ -103,9 +103,12 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
         or "ratelimit" in compact
     ):
         daily = "perday" in compact or "requestsperday" in compact
-        if daily:
+        # Google often labels free-tier 429s as PerDay even when retryDelay is
+        # seconds (or <1s). A sub-minute retry means "back off briefly", not
+        # "lock until Pacific midnight" — locking early was burning healthy keys.
+        if daily and (retry_after is None or retry_after >= 60_000):
             return FailureKind.QUOTA_EXHAUSTED, None
-        return FailureKind.RATE_LIMITED, retry_after
+        return FailureKind.RATE_LIMITED, retry_after or 5_000
     if "api key" in lowered or "permission" in lowered:
         return FailureKind.AUTH_INVALID, None
     if (
@@ -146,6 +149,7 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
 
 def _parse_retry_after(text: str) -> int | None:
     patterns = (
+        r"please retry in (\d+(?:\.\d+)?)\s*ms",
         r"please retry in (\d+(?:\.\d+)?)\s*s",
         r"retryDelay['\":\s]+(\d+(?:\.\d+)?)s",
         r"retry[- ]after[:\s]*(\d+(?:\.\d+)?)",
@@ -153,7 +157,10 @@ def _parse_retry_after(text: str) -> int | None:
     for pattern in patterns:
         match = re.search(pattern, text, re.I)
         if match:
-            return int(float(match.group(1)) * 1000) + 500
+            raw = float(match.group(1))
+            if pattern.endswith("ms"):
+                return max(int(raw) + 500, 1_000)
+            return int(raw * 1000) + 500
     return None
 
 

@@ -247,6 +247,11 @@ class KeyPool:
             strikes = int(previous["strikes"]) + 1
         else:
             strikes = 1
+        # Repeated short PerDay-shaped 429s eventually mean the key is done for
+        # the free-tier day — escalate so we stop thrashing every ~15s.
+        if kind == FailureKind.RATE_LIMITED and strikes >= 5:
+            kind = FailureKind.QUOTA_EXHAUSTED
+            retry_after_ms = None
         cooldown = self._cooldown_ms(kind, strikes, retry_after_ms)
         retry_at = int(time.time() * 1000) + cooldown
         self.state.set_cooldown(key.id, kind.value, strikes, retry_at)

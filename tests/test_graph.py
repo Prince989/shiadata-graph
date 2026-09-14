@@ -292,7 +292,22 @@ def test_round_robin_cycles_every_configured_key(state: StateManager):
     assert "a" not in skipped
 
 
-def test_classify_per_day_429_is_daily_quota():
+def test_classify_per_day_429_with_long_retry_is_daily_quota():
+    from src.agents.gemini import classify_provider_error
+
+    kind, ms = classify_provider_error(
+        Exception(
+            "429 RESOURCE_EXHAUSTED. You exceeded your current quota. "
+            "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
+            "Please retry in 120s. retryDelay': '120s'"
+        )
+    )
+    assert kind == FailureKind.QUOTA_EXHAUSTED
+    assert ms is None
+
+
+def test_classify_per_day_429_with_short_retry_is_rate_limit():
+    """Sub-minute retryDelay must not overnight-lock the key."""
     from src.agents.gemini import classify_provider_error
 
     kind, ms = classify_provider_error(
@@ -300,11 +315,23 @@ def test_classify_per_day_429_is_daily_quota():
             "429 RESOURCE_EXHAUSTED. You exceeded your current quota. "
             "Quota exceeded for metric: generate_content_free_tier_requests, "
             "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
-            "Please retry in 3.295465684s. retryDelay': '3s'"
+            "Please retry in 48.0998069s. retryDelay': '48s'"
         )
     )
-    assert kind == FailureKind.QUOTA_EXHAUSTED
-    assert ms is None
+    assert kind == FailureKind.RATE_LIMITED
+    assert ms is not None
+    assert 48_000 <= ms <= 50_000
+
+    kind, ms = classify_provider_error(
+        Exception(
+            "429 RESOURCE_EXHAUSTED. "
+            "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
+            "Please retry in 559.522631ms. retryDelay': '0s'"
+        )
+    )
+    assert kind == FailureKind.RATE_LIMITED
+    assert ms is not None
+    assert ms < 60_000
 
 
 def test_classify_rpm_429_uses_retry_delay():
