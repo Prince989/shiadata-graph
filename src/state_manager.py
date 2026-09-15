@@ -84,7 +84,8 @@ class StateManager:
                 key_id TEXT PRIMARY KEY,
                 reason TEXT NOT NULL,
                 strikes INTEGER NOT NULL,
-                retry_at_ms INTEGER NOT NULL
+                retry_at_ms INTEGER NOT NULL,
+                exhausted_day TEXT
             );
             CREATE TABLE IF NOT EXISTS edge_pairs (
                 pair_id TEXT PRIMARY KEY,
@@ -117,7 +118,18 @@ class StateManager:
             );
             """
         )
+        self._migrate_key_cooldowns()
         self._conn.commit()
+
+    def _migrate_key_cooldowns(self) -> None:
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(key_cooldowns)").fetchall()
+        }
+        if "exhausted_day" not in cols:
+            self._conn.execute(
+                "ALTER TABLE key_cooldowns ADD COLUMN exhausted_day TEXT"
+            )
 
     def now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -302,17 +314,25 @@ class StateManager:
         ).fetchone()
         return dict(row) if row else None
 
-    def set_cooldown(self, key_id: str, reason: str, strikes: int, retry_at_ms: int) -> None:
+    def set_cooldown(
+        self,
+        key_id: str,
+        reason: str,
+        strikes: int,
+        retry_at_ms: int,
+        exhausted_day: str | None = None,
+    ) -> None:
         self._conn.execute(
             """
-            INSERT INTO key_cooldowns(key_id, reason, strikes, retry_at_ms)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO key_cooldowns(key_id, reason, strikes, retry_at_ms, exhausted_day)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(key_id) DO UPDATE SET
                 reason = excluded.reason,
                 strikes = excluded.strikes,
-                retry_at_ms = excluded.retry_at_ms
+                retry_at_ms = excluded.retry_at_ms,
+                exhausted_day = excluded.exhausted_day
             """,
-            (key_id, reason, strikes, retry_at_ms),
+            (key_id, reason, strikes, retry_at_ms, exhausted_day),
         )
         self._conn.commit()
 

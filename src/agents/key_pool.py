@@ -12,7 +12,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 
 from config.settings import Settings, get_settings
@@ -60,11 +60,21 @@ def _pacific_tz():
         return timezone(timedelta(hours=-7))
 
 
-def pacific_day_start_ms(now_ms: int) -> int:
+def pacific_day_start_ms(now_ms: int | None = None) -> int:
     """Unix ms of the most recent midnight in America/Los_Angeles."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
     local = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(_pacific_tz())
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp() * 1000)
+
+
+def pacific_calendar_date(now_ms: int | None = None) -> date:
+    """Gemini free-tier day boundary: calendar date in America/Los_Angeles."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    local = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc).astimezone(_pacific_tz())
+    return local.date()
 
 
 def next_pacific_midnight_ms(now_ms: int) -> int:
@@ -98,7 +108,34 @@ class KeyPool:
             )
         else:
             logger.info("Loaded %d distinct Gemini key(s)", len(self._keys))
+        self.clear_quota_locks_for_new_pacific_day()
         self._log_blocked_summary()
+
+    def clear_quota_locks_for_new_pacific_day(self) -> int:
+        """Drop free-tier overnight locks that are not for *today's* Pacific date.
+
+        Google RPD resets at America/Los_Angeles midnight. Locks carry
+        ``exhausted_day`` (YYYY-MM-DD). Legacy rows without that field are
+        cleared — they were often stale report re-locks pointing at tonight.
+        """
+        today = pacific_calendar_date().isoformat()
+        cleared = 0
+        for key in self._keys:
+            record = self.state.get_cooldown(key.id)
+            if not record or record["reason"] != FailureKind.QUOTA_EXHAUSTED.value:
+                continue
+            day = record.get("exhausted_day")
+            if day == today:
+                continue
+            self.state.clear_cooldown(key.id)
+            cleared += 1
+        if cleared:
+            logger.info(
+                "Cleared %d free-tier overnight lock(s) (not for Pacific day %s)",
+                cleared,
+                today,
+            )
+        return cleared
 
     def pool_size(self) -> int:
         return len(self._keys)
@@ -145,7 +182,16 @@ class KeyPool:
                 if self._is_healthy(candidate.id, now):
                     stale = self.state.get_cooldown(candidate.id)
                     if stale:
-                        self.state.clear_cooldown(candidate.id)
+                        reason = stale["reason"]
+                        # Keep rate-limit strike counts across short cooldowns and
+                        # successes; only drop rows that are not 429-tracking.
+                        if reason == FailureKind.RATE_LIMITED.value:
+                            pass
+                        elif reason == FailureKind.QUOTA_EXHAUSTED.value:
+                            # Unlocked after Pacific midnight — start a fresh day.
+                            self.state.clear_cooldown(candidate.id)
+                        else:
+                            self.state.clear_cooldown(candidate.id)
                     logger.info(
                         "Using Gemini key %d/%d (%s)",
                         candidate.index + 1,
@@ -230,7 +276,85 @@ class KeyPool:
             times.append(int(record["retry_at_ms"]))
         return min(times) if times else None
 
+    def lock_labels(self) -> dict[int, str]:
+        """1-based key number → short lock label; empty string if currently free."""
+        now = int(time.time() * 1000)
+        labels = {
+            FailureKind.QUOTA_EXHAUSTED.value: "quota",
+            FailureKind.AUTH_INVALID.value: "auth",
+            FailureKind.RATE_LIMITED.value: "rate",
+            FailureKind.TIMEOUT.value: "wait",
+            FailureKind.SERVER_ERROR.value: "wait",
+        }
+        out: dict[int, str] = {}
+        for key in self._keys:
+            n = key.index + 1
+            if self._is_healthy(key.id, now):
+                out[n] = ""
+                continue
+            record = self.state.get_cooldown(key.id)
+            reason = (record or {}).get("reason") or ""
+            out[n] = labels.get(reason, "lock")
+        return out
+
+    def lock_indexes_for_day(
+        self,
+        indexes: list[int],
+        *,
+        strikes: int = 4,
+    ) -> list[LlmKey]:
+        """Overnight-lock the given 0-based pool indexes (from day-report 429s)."""
+        now = int(time.time() * 1000)
+        retry_at = next_pacific_midnight_ms(now)
+        locked: list[LlmKey] = []
+        for index in indexes:
+            if index < 0 or index >= len(self._keys):
+                continue
+            key = self._keys[index]
+            previous = self.state.get_cooldown(key.id)
+            if (
+                previous
+                and previous["reason"] == FailureKind.QUOTA_EXHAUSTED.value
+                and self._quota_still_locked(previous, now)
+            ):
+                continue
+            use_strikes = max(strikes, int(previous["strikes"]) if previous else 0, 4)
+            day = pacific_calendar_date(now).isoformat()
+            self.state.set_cooldown(
+                key.id,
+                FailureKind.QUOTA_EXHAUSTED.value,
+                use_strikes,
+                retry_at,
+                exhausted_day=day,
+            )
+            logger.warning(
+                "Key %s overnight-locked from day-report 429s (strike %d)",
+                key.id,
+                use_strikes,
+            )
+            locked.append(key)
+        return locked
+
     def report_success(self, key: LlmKey) -> None:
+        """Mark the key usable but keep 429 strike counts for the Pacific day."""
+        previous = self.state.get_cooldown(key.id)
+        if not previous:
+            return
+        reason = previous["reason"]
+        if reason == FailureKind.QUOTA_EXHAUSTED.value:
+            # Still day-locked — ignore (should not get a success while locked).
+            return
+        if reason == FailureKind.RATE_LIMITED.value:
+            # Preserve strikes; retry_at=now means immediately reusable.
+            now = int(time.time() * 1000)
+            self.state.set_cooldown(
+                key.id,
+                FailureKind.RATE_LIMITED.value,
+                int(previous["strikes"]),
+                now,
+                exhausted_day=None,
+            )
+            return
         self.state.clear_cooldown(key.id)
 
     def report_failure(
@@ -243,18 +367,26 @@ class KeyPool:
             return
         now = int(time.time() * 1000)
         previous = self.state.get_cooldown(key.id)
-        if previous and not self._is_healthy(key.id, now):
+        if kind == FailureKind.RATE_LIMITED:
+            strikes = self._next_429_strikes(previous, now)
+            # After more than three 429 hits this Pacific day → overnight lock.
+            if strikes > 3:
+                kind = FailureKind.QUOTA_EXHAUSTED
+                retry_after_ms = None
+        elif previous and not self._is_healthy(key.id, now):
             strikes = int(previous["strikes"]) + 1
         else:
             strikes = 1
-        # Repeated short PerDay-shaped 429s eventually mean the key is done for
-        # the free-tier day — escalate so we stop thrashing every ~15s.
-        if kind == FailureKind.RATE_LIMITED and strikes >= 5:
-            kind = FailureKind.QUOTA_EXHAUSTED
-            retry_after_ms = None
         cooldown = self._cooldown_ms(kind, strikes, retry_after_ms)
         retry_at = int(time.time() * 1000) + cooldown
-        self.state.set_cooldown(key.id, kind.value, strikes, retry_at)
+        exhausted_day = (
+            pacific_calendar_date(now).isoformat()
+            if kind == FailureKind.QUOTA_EXHAUSTED
+            else None
+        )
+        self.state.set_cooldown(
+            key.id, kind.value, strikes, retry_at, exhausted_day=exhausted_day
+        )
         logger.warning(
             "Key %s cooling for %s (%d ms, strike %d)",
             key.id,
@@ -262,6 +394,29 @@ class KeyPool:
             cooldown,
             strikes,
         )
+
+    def _next_429_strikes(self, previous: dict | None, now_ms: int) -> int:
+        """Cumulative 429 strikes for the current Pacific day (survive short cooldowns)."""
+        if not previous:
+            return 1
+        reason = previous["reason"]
+        if reason not in {
+            FailureKind.RATE_LIMITED.value,
+            FailureKind.QUOTA_EXHAUSTED.value,
+        }:
+            return 1
+        if reason == FailureKind.QUOTA_EXHAUSTED.value and not self._quota_still_locked(
+            previous, now_ms
+        ):
+            return 1
+        # Rate-limit row from a previous Pacific day (stale leftover).
+        if reason == FailureKind.RATE_LIMITED.value:
+            day_start = pacific_day_start_ms(now_ms)
+            # retry_at is last_failure + short cooldown; if that window ended
+            # before today's Pacific midnight, treat as a new day.
+            if int(previous["retry_at_ms"]) < day_start:
+                return 1
+        return int(previous["strikes"]) + 1
 
     def _is_healthy(self, key_id: str, now_ms: int) -> bool:
         record = self.state.get_cooldown(key_id)
@@ -272,19 +427,15 @@ class KeyPool:
         return int(record["retry_at_ms"]) <= now_ms
 
     def _quota_still_locked(self, record: dict, now_ms: int) -> bool:
-        """True until the next Pacific midnight after the original daily-quota 429.
+        """True while ``exhausted_day`` equals today's Pacific calendar date.
 
-        Google free-tier RPD resets at midnight America/Los_Angeles, not 24h
-        after the error. Older rows stored lock+24h; those unlock at PT midnight too.
+        Free-tier RPD resets at America/Los_Angeles midnight. Legacy rows
+        without ``exhausted_day`` are treated as unlocked (stale re-locks).
         """
-        retry_at = int(record["retry_at_ms"])
-        if retry_at <= now_ms:
+        day = record.get("exhausted_day")
+        if not day:
             return False
-        quota_ms = int(self.settings.key_quota_cooldown_ms)
-        assumed_lock = retry_at - quota_ms
-        if assumed_lock < pacific_day_start_ms(now_ms):
-            return False
-        return now_ms < next_pacific_midnight_ms(now_ms)
+        return day == pacific_calendar_date(now_ms).isoformat()
 
     def _cooldown_ms(
         self,

@@ -2,6 +2,9 @@
 
 Written under `data/reports/phase1/YYYY-MM-DD.md` (plus a `.json` sidecar so
 same-day re-runs merge instead of overwriting). The directory is gitignored.
+
+The day boundary is America/Los_Angeles (Gemini free-tier RPD reset), not the
+machine's local midnight — so a Tehran run after ~10:30 starts a fresh file.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from config.paths import DATA_DIR
+from src.agents.key_pool import pacific_calendar_date, pacific_day_start_ms
 
 REPORT_DIR = DATA_DIR / "reports" / "phase1"
 
@@ -95,6 +99,7 @@ class _KeyStats:
     count_503: int = 0
     count_429: int = 0
     count_401: int = 0
+    lock: str = ""
     hadiths: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -103,6 +108,7 @@ class _KeyStats:
             "503": self.count_503,
             "429": self.count_429,
             "401": self.count_401,
+            "lock": self.lock or "",
             "hadiths": list(self.hadiths),
         }
 
@@ -114,13 +120,15 @@ class _KeyStats:
             count_503=int(data.get("503") or 0),
             count_429=int(data.get("429") or 0),
             count_401=int(data.get("401") or 0),
+            lock=str(data.get("lock") or ""),
             hadiths=[str(x) for x in (data.get("hadiths") or []) if str(x).strip()],
         )
 
 
 class Phase1DayReport:
-    """Accumulate one calendar day's Phase 1 Gemini + flush stats.
+    """Accumulate one Gemini free-tier day's Phase 1 Gemini + flush stats.
 
+    Day = America/Los_Angeles calendar date (quota reset), not local midnight.
     Writes the markdown (and JSON sidecar) after every event so a cancel,
     crash, or quota stop still leaves a usable report on disk.
     """
@@ -132,13 +140,20 @@ class Phase1DayReport:
         *,
         live: bool = True,
     ):
-        self.day = day or date.today()
+        self.day = day or pacific_calendar_date()
         self.report_dir = report_dir or REPORT_DIR
         self.live = live
         self._keys: dict[int, _KeyStats] = {}
         self._last_ok_key: int | None = None
+        self._key_pool = None
         self._load()
         # Create the day file immediately so the directory is visible mid-run.
+        if self.live:
+            self.flush()
+
+    def bind_key_pool(self, pool) -> None:
+        """Attach KeyPool so each flush refreshes the live lock column."""
+        self._key_pool = pool
         if self.live:
             self.flush()
 
@@ -172,6 +187,20 @@ class Phase1DayReport:
         if self.live:
             self.flush()
 
+    def count_429(self, key_index: int) -> int:
+        """0-based pool index → day's recorded 429 count."""
+        return int(self._key(key_index + 1).count_429)
+
+    def key_indexes_over_429(self, threshold: int = 3) -> list[int]:
+        """0-based pool indexes whose day-report 429 count is > threshold."""
+        out: list[int] = []
+        for key_no, stats in self._keys.items():
+            if key_no <= 0:
+                continue
+            if int(stats.count_429) > threshold:
+                out.append(key_no - 1)
+        return out
+
     def record_hadith(self, source_path: str, payload: dict, key_no: int | None = None) -> None:
         label = hadith_run_id(source_path, payload)
         target = key_no if key_no is not None else self._last_ok_key
@@ -193,17 +222,56 @@ class Phase1DayReport:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
+        expected_start = pacific_day_start_ms()
+        stored = data.get("pacific_day_start_ms")
+        # Missing marker = pre-fix / polluted overnight merge. Archive and
+        # start empty so yesterday's 429 totals cannot overnight-lock today.
+        if stored is None or int(stored) != expected_start:
+            self._archive_stale_sidecar(data)
+            return
         for key, stats in (data.get("keys") or {}).items():
             try:
                 self._keys[int(key)] = _KeyStats.from_dict(stats)
             except (TypeError, ValueError):
                 continue
 
+    def _archive_stale_sidecar(self, data: dict) -> None:
+        stamp = datetime.now().strftime("%H%M%S")
+        base = f"{self.day.isoformat()}-stale-{stamp}"
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        json_dest = self.report_dir / f"{base}.json"
+        md_dest = self.report_dir / f"{base}.md"
+        try:
+            if self.json_path.exists():
+                self.json_path.replace(json_dest)
+            if self.md_path.exists():
+                self.md_path.replace(md_dest)
+            elif data:
+                md_dest.write_text(self.render_markdown(data), encoding="utf-8")
+        except OSError:
+            return
+
+    def _refresh_locks(self) -> None:
+        pool = self._key_pool
+        if pool is None:
+            return
+        labels = pool.lock_labels()
+        for key_no, label in labels.items():
+            if label:
+                # Surface currently locked keys even if they have no HTTP yet.
+                self._key(key_no)
+        for key_no, stats in self._keys.items():
+            if key_no <= 0:
+                continue
+            stats.lock = labels.get(key_no, "")
+
     def flush(self) -> Path:
         """Rewrite JSON + markdown from current in-memory totals."""
+        self._refresh_locks()
         self.report_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "date": self.day.isoformat(),
+            "pacific_day_start_ms": pacific_day_start_ms(),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "keys": {str(k): v.to_dict() for k, v in sorted(self._keys.items())},
         }
@@ -220,13 +288,13 @@ class Phase1DayReport:
         updated = payload.get("updated_at") or ""
         keys = payload.get("keys") or {}
 
-        headers = ["key", "503", "200", "429", "401", "hadiths"]
-        aligns = ["right", "right", "right", "right", "right", "right"]
+        headers = ["key", "503", "200", "429", "401", "lock", "hadiths"]
+        aligns = ["right", "right", "right", "right", "right", "left", "right"]
         rows: list[list[str]] = []
         hadith_sections: list[str] = []
 
         if not keys:
-            rows.append(["—", "0", "0", "0", "0", "0"])
+            rows.append(["—", "0", "0", "0", "0", "-", "0"])
         else:
             for key in sorted(keys, key=lambda k: int(k)):
                 stats = keys[key] or {}
@@ -236,6 +304,7 @@ class Phase1DayReport:
                     for h in (stats.get("hadiths") or [])
                     if str(h).strip()
                 ]
+                lock = str(stats.get("lock") or "").strip() or "-"
                 rows.append(
                     [
                         label,
@@ -243,6 +312,7 @@ class Phase1DayReport:
                         str(int(stats.get("200") or 0)),
                         str(int(stats.get("429") or 0)),
                         str(int(stats.get("401") or 0)),
+                        lock,
                         str(len(hadiths)),
                     ]
                 )
@@ -257,6 +327,8 @@ class Phase1DayReport:
             f"# Phase 1 - {day}",
             "",
             f"Updated `{updated}`",
+            "",
+            "_lock: `-` free, `quota` overnight, `auth` dead, `rate` short 429, `wait` net/503_",
             "",
             "```",
             *_ascii_table(headers, rows, aligns),

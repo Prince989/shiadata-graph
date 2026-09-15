@@ -93,32 +93,6 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
         "denied access",
         "consumer_invalid",
     )
-    if status in {401, 403} or any(m in lowered for m in auth_markers):
-        return FailureKind.AUTH_INVALID, None
-    if (
-        status == 429
-        or "429" in text
-        or "resource exhausted" in lowered
-        or "rate limit" in lowered
-        or "ratelimit" in compact
-    ):
-        daily = "perday" in compact or "requestsperday" in compact
-        # Google often labels free-tier 429s as PerDay even when retryDelay is
-        # seconds (or <1s). A sub-minute retry means "back off briefly", not
-        # "lock until Pacific midnight" — locking early was burning healthy keys.
-        if daily and (retry_after is None or retry_after >= 60_000):
-            return FailureKind.QUOTA_EXHAUSTED, None
-        return FailureKind.RATE_LIMITED, retry_after or 5_000
-    if "api key" in lowered or "permission" in lowered:
-        return FailureKind.AUTH_INVALID, None
-    if (
-        status in {404, 500, 502, 503, 504}
-        or "unavailable" in lowered
-        or "not_found" in compact
-        or "notfound" in compact
-        or "no longer available" in lowered
-    ):
-        return FailureKind.SERVER_ERROR, retry_after
     network_markers = (
         "getaddrinfo failed",
         "name or service not known",
@@ -133,14 +107,40 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
         "temporarily unavailable",
         "errno 11001",
         "errno 11002",
+        "winerror 10013",  # socket access forbidden (firewall) — not API auth
         "winerror 10054",
         "winerror 10060",
         "name resolution",
+        "access a socket",
+        "forbidden by its access permissions",
     )
+    if any(m in lowered for m in network_markers):
+        return FailureKind.TIMEOUT, retry_after or 5_000
+    if status in {401, 403} or any(m in lowered for m in auth_markers):
+        return FailureKind.AUTH_INVALID, None
+    if (
+        status == 429
+        or "429" in text
+        or "resource exhausted" in lowered
+        or "rate limit" in lowered
+        or "ratelimit" in compact
+    ):
+        # First hits use Google's retryDelay (rate_limited). KeyPool escalates to
+        # overnight quota_exhausted after more than 3 strikes on the same key.
+        return FailureKind.RATE_LIMITED, retry_after or 5_000
+    if "api key" in lowered:
+        return FailureKind.AUTH_INVALID, None
+    if (
+        status in {404, 500, 502, 503, 504}
+        or "unavailable" in lowered
+        or "not_found" in compact
+        or "notfound" in compact
+        or "no longer available" in lowered
+    ):
+        return FailureKind.SERVER_ERROR, retry_after
     if (
         "timeout" in lowered
         or "timed out" in lowered
-        or any(m in lowered for m in network_markers)
     ):
         # Transient local network / DNS (common with flaky VPN). Retry with pause.
         return FailureKind.TIMEOUT, retry_after or 5_000
@@ -303,6 +303,14 @@ class GeminiAgent:
                     self._record_http(key, 503)
                 elif kind in {FailureKind.RATE_LIMITED, FailureKind.QUOTA_EXHAUSTED}:
                     self._record_http(key, 429)
+                    # Day-report 429 count is the source of truth (survives short
+                    # cooldowns / successes). Lock overnight after more than 3.
+                    if (
+                        kind == FailureKind.RATE_LIMITED
+                        and self._day_429_count(key) > 3
+                    ):
+                        kind = FailureKind.QUOTA_EXHAUSTED
+                        retry_ms = None
                 elif kind == FailureKind.AUTH_INVALID:
                     self._record_http(key, 401)
                 logger.warning("Gemini call failed on %s (%s): %s", key.id, current_model, exc)
@@ -346,6 +354,11 @@ class GeminiAgent:
                     )
                     time.sleep(wait_s)
                 self.pool.report_failure(key, kind, retry_ms)
+                report = self.day_report
+                if report is not None and getattr(report, "live", False):
+                    flush = getattr(report, "flush", None)
+                    if callable(flush):
+                        flush()
                 key = None
                 if kind == FailureKind.QUOTA_EXHAUSTED and self.pool.all_daily_quota_locked():
                     raise AllKeysExhausted(FREE_TIER_TODAY) from exc
@@ -364,6 +377,15 @@ class GeminiAgent:
         record = getattr(report, "record_http", None)
         if callable(record):
             record(key.index, status)
+
+    def _day_429_count(self, key: LlmKey) -> int:
+        report = self.day_report
+        if report is None:
+            return 0
+        count = getattr(report, "count_429", None)
+        if callable(count):
+            return int(count(key.index))
+        return 0
 
     def _wait_min_interval(self) -> None:
         if self._skip_min_interval:

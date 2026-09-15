@@ -79,8 +79,15 @@ def phase1(
     """Parse a book and run Gemini structured extraction."""
     _setup_logging()
     report = Phase1DayReport()
-    typer.echo(f"phase1 day report (live): {report.md_path}")
+    typer.echo(
+        f"phase1 day report (live, Pacific free-tier day {report.day.isoformat()}): "
+        f"{report.md_path}"
+    )
     state, gemini, _ = _stack(day_report=report)
+    report.bind_key_pool(gemini.pool)
+    # Do not overnight-lock from report totals at startup — that re-locked every
+    # key on the new Pacific day using yesterday's 429 counts. Live escalation
+    # in GeminiAgent still locks after >3 429s *today*.
     try:
         stats = run_phase1(book, state, gemini, limit=limit, page=page, volume=volume)
     except FileNotFoundError as exc:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -292,28 +294,12 @@ def test_round_robin_cycles_every_configured_key(state: StateManager):
     assert "a" not in skipped
 
 
-def test_classify_per_day_429_with_long_retry_is_daily_quota():
+def test_classify_429_is_rate_limited_with_retry():
     from src.agents.gemini import classify_provider_error
 
     kind, ms = classify_provider_error(
         Exception(
             "429 RESOURCE_EXHAUSTED. You exceeded your current quota. "
-            "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
-            "Please retry in 120s. retryDelay': '120s'"
-        )
-    )
-    assert kind == FailureKind.QUOTA_EXHAUSTED
-    assert ms is None
-
-
-def test_classify_per_day_429_with_short_retry_is_rate_limit():
-    """Sub-minute retryDelay must not overnight-lock the key."""
-    from src.agents.gemini import classify_provider_error
-
-    kind, ms = classify_provider_error(
-        Exception(
-            "429 RESOURCE_EXHAUSTED. You exceeded your current quota. "
-            "Quota exceeded for metric: generate_content_free_tier_requests, "
             "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
             "Please retry in 48.0998069s. retryDelay': '48s'"
         )
@@ -324,21 +310,6 @@ def test_classify_per_day_429_with_short_retry_is_rate_limit():
 
     kind, ms = classify_provider_error(
         Exception(
-            "429 RESOURCE_EXHAUSTED. "
-            "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
-            "Please retry in 559.522631ms. retryDelay': '0s'"
-        )
-    )
-    assert kind == FailureKind.RATE_LIMITED
-    assert ms is not None
-    assert ms < 60_000
-
-
-def test_classify_rpm_429_uses_retry_delay():
-    from src.agents.gemini import classify_provider_error
-
-    kind, ms = classify_provider_error(
-        Exception(
             "429 RESOURCE_EXHAUSTED. Please retry in 12.5s. "
             "quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier."
         )
@@ -346,6 +317,26 @@ def test_classify_rpm_429_uses_retry_delay():
     assert kind == FailureKind.RATE_LIMITED
     assert ms is not None
     assert 12_000 <= ms <= 14_000
+
+
+def test_rate_limit_escalates_to_daily_lock_after_more_than_three_strikes(state: StateManager):
+    pool = KeyPool(state, keys=["k"])
+    key = pool.acquire()
+    for expected in (1, 2, 3):
+        pool.report_failure(key, FailureKind.RATE_LIMITED, 1_000)
+        row = state.get_cooldown(key.id)
+        assert row is not None
+        assert row["reason"] == FailureKind.RATE_LIMITED.value
+        assert int(row["strikes"]) == expected
+        # Simulate short cooldown expiry + a successful call (strikes must survive).
+        pool.report_success(key)
+        again = pool.acquire()
+        assert again.secret == "k"
+    pool.report_failure(key, FailureKind.RATE_LIMITED, 1_000)
+    row = state.get_cooldown(key.id)
+    assert row is not None
+    assert row["reason"] == FailureKind.QUOTA_EXHAUSTED.value
+    assert int(row["strikes"]) == 4
 
 
 def test_classify_401_with_generate_content_is_auth_not_rate():
@@ -383,6 +374,12 @@ def test_classify_dns_connect_error_is_timeout():
     assert ms == 5_000
 
     kind, ms = classify_provider_error(Exception("ConnectError: failed to resolve host"))
+    assert kind == FailureKind.TIMEOUT
+
+    kind, ms = classify_provider_error(
+        Exception("[WinError 10013] An attempt was made to access a socket in a way "
+                  "forbidden by its access permissions")
+    )
     assert kind == FailureKind.TIMEOUT
 
 
@@ -424,15 +421,19 @@ def test_quota_unlocks_after_pacific_midnight(state: StateManager, monkeypatch):
     pool = KeyPool(state, keys=["k"])
     key = pool.acquire()
     today_mid = 1_800_000_000_000
-    lock = today_mid - 3_600_000
-    retry = lock + 86_400_000
     now = today_mid + 60_000
-    state.set_cooldown(key.id, FailureKind.QUOTA_EXHAUSTED.value, 3, retry)
+    # Locked for yesterday's Pacific day — must unlock after midnight.
+    state.set_cooldown(
+        key.id,
+        FailureKind.QUOTA_EXHAUSTED.value,
+        3,
+        today_mid + 86_400_000,
+        exhausted_day="2020-01-01",
+    )
     monkeypatch.setattr("src.agents.key_pool.time.time", lambda: now / 1000.0)
-    monkeypatch.setattr("src.agents.key_pool.pacific_day_start_ms", lambda _now: today_mid)
     monkeypatch.setattr(
-        "src.agents.key_pool.next_pacific_midnight_ms",
-        lambda _now: today_mid + 86_400_000,
+        "src.agents.key_pool.pacific_calendar_date",
+        lambda _now=None: date(2026, 9, 15),
     )
     again = pool.acquire()
     assert again.secret == "k"
@@ -447,18 +448,36 @@ def test_quota_stays_locked_same_pacific_day(state: StateManager, monkeypatch):
     pool = KeyPool(state, keys=["k"])
     key = pool.acquire()
     today_mid = 1_800_000_000_000
-    lock = today_mid + 3_600_000
-    retry = lock + 86_400_000
-    now = lock + 5_000
-    state.set_cooldown(key.id, FailureKind.QUOTA_EXHAUSTED.value, 1, retry)
+    now = today_mid + 3_600_000
+    state.set_cooldown(
+        key.id,
+        FailureKind.QUOTA_EXHAUSTED.value,
+        4,
+        today_mid + 86_400_000,
+        exhausted_day="2026-09-15",
+    )
     monkeypatch.setattr("src.agents.key_pool.time.time", lambda: now / 1000.0)
-    monkeypatch.setattr("src.agents.key_pool.pacific_day_start_ms", lambda _now: today_mid)
     monkeypatch.setattr(
-        "src.agents.key_pool.next_pacific_midnight_ms",
-        lambda _now: today_mid + 86_400_000,
+        "src.agents.key_pool.pacific_calendar_date",
+        lambda _now=None: date(2026, 9, 15),
     )
     with pytest.raises(AllKeysExhausted, match="free tier"):
         pool.acquire()
+
+
+def test_legacy_quota_without_exhausted_day_unlocks(state: StateManager):
+    pool = KeyPool(state, keys=["k"])
+    key = pool.acquire()
+    # Stale report re-lock: retry_at=tonight, no exhausted_day → treat unlocked.
+    state.set_cooldown(
+        key.id,
+        FailureKind.QUOTA_EXHAUSTED.value,
+        10,
+        int(time.time() * 1000) + 86_400_000,
+    )
+    again = KeyPool(state, keys=["k"]).acquire()
+    assert again.secret == "k"
+    assert state.get_cooldown(key.id) is None
 
 
 def test_server_error_strikes_reset_after_cooldown_expires(state: StateManager):
