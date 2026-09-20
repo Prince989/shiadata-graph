@@ -14,12 +14,11 @@ Clustering runs on three signals, cheapest first:
      share no root and no wording, so only a human-written alias joins them.
   2. root signature -- Arabic derivational morphology. الحساب، حساب العباد،
      يحاسب and محاسبة all key on حسب without anyone listing them.
-  3. compound recurrence -- a multi-word mention keeps its own identity only if
-     it recurs as a compound. خلق العقل appears across parallel narrations and
-     becomes a node under العقل; عقل المرء appears once and folds into العقل.
-
-Point 3 is what no hand-written rule could do. خلق العقل and عقل المرء are the
-same shape -- noun plus genitive -- and only the corpus separates them.
+  3. compound parent -- a multi-word mention always keeps its own identity.
+     If a known topic is named inside it, parent points there: عقل المرء hangs
+     under العقل. df is statistical weight for Phase 2, never a reason to
+     delete or absorb the node. Incremental ingest means today's df=1 may be
+     tomorrow's df=15.
 """
 
 from __future__ import annotations
@@ -38,17 +37,14 @@ from src.pipelines.ontology import (
 
 logger = logging.getLogger(__name__)
 
-# A compound must recur across this many distinct documents to keep an identity
-# of its own rather than folding into its head. Scales with corpus size: two
-# co-occurrences out of 30 documents is evidence, two out of 15,000 is a
-# coincidence, and a fixed floor would promote a long tail of accidents on a
-# full run.
+# Kept for API compatibility. Compounds no longer fold or drop at this floor:
+# incremental ingest cannot treat today's df as a deletion signal.
 COMPOUND_MIN_DF = 2
 COMPOUND_DF_PER_10K = 3
 
 
 def compound_threshold(doc_count: int, base: int = COMPOUND_MIN_DF) -> int:
-    """Minimum df for a compound to keep its own identity, given corpus size."""
+    """Legacy df floor. Unused for keep-vs-fold; compounds always keep identity."""
     return max(base, round(doc_count * COMPOUND_DF_PER_10K / 10_000))
 
 
@@ -195,8 +191,8 @@ def _topic_parent(text: str, node_type: str) -> tuple[str, str, bool, str] | Non
     عقل المرء it is the first word, in كمال العقل and قدر العقول it is the
     second. So the rule is the first constituent the catalog recognises, which
     lands all three on العقل. When no constituent is known, fall back to the
-    head's root -- and if that head never appears on its own either, the caller
-    drops the compound rather than keeping a singleton nobody can reach.
+    head's root. The caller keeps the compound either way and sets parent when
+    that topic exists as a node.
     """
     for word in (text or "").split():
         seed = _seed_key(word, node_type)
@@ -349,9 +345,10 @@ def resolve_with_assignments(
     right -- correct label, correct df -- while the payload that Phase 2 and the
     export actually read had lost the mention.
 
-    Keys move twice more after the first pass, when a rare compound folds into
-    its parent and when an entity absorbs a shorter name, so a redirect table is
-    threaded through both and followed at the end.
+    Keys can still move after the first pass when an entity absorbs a shorter
+    name, so a redirect table is threaded through that merge and followed at
+    the end. Concept compounds are not redirected: they keep their own key and
+    may point at a parent.
     """
     nodes, redirect, initial = _cluster(
         mentions, compound_min_df, entity_merge_max_df
@@ -370,7 +367,7 @@ def resolve_with_assignments(
 def _follow(
     key: str | None, redirect: dict[str, str], nodes: dict[str, Node]
 ) -> str | None:
-    """Chase a key through the fold/merge redirects to where it ended up."""
+    """Chase a key through entity-merge redirects to where it ended up."""
     seen: set[str] = set()
     while key and key not in nodes and key in redirect and key not in seen:
         seen.add(key)
@@ -393,8 +390,7 @@ def _cluster(
     entity_merge_max_df: int = ENTITY_MERGE_MAX_DF,
 ) -> tuple[dict[str, Node], dict[str, str], list[str | None]]:
     """The clustering itself. Returns (nodes, redirects, per-mention initial key)."""
-    if compound_min_df is None:
-        compound_min_df = compound_threshold(len({m.doc_id for m in mentions}))
+    _ = compound_min_df  # unused: compounds keep identity regardless of df
     nodes: dict[str, Node] = {}
     compound_children: dict[str, tuple[str, str, bool, str]] = {}
     redirect: dict[str, str] = {}
@@ -408,10 +404,9 @@ def _cluster(
 
         keys: list[str] = []
         # A multi-word concept the catalog does not know as a whole also names
-        # its constituents. The mention reaches all of them directly, so nothing
-        # is lost when the compound itself turns out to be a one-off; and when
-        # the compound recurs it survives alongside them, giving the narration
-        # both the specific topic and the general ones.
+        # its constituents. The mention reaches those topics directly and also
+        # keeps its own node, so the narration has both the specific wording
+        # and the general ones.
         constituents: list[tuple[str, str]] = []
         if (
             mention.type == CONCEPT_TYPE
@@ -452,15 +447,13 @@ def _cluster(
                 if mention.type == CONCEPT_TYPE:
                     key, parent = _morph_key(part, mention.type)
                     if constituents:
-                        # Decomposition already gave the mention its parents, so
-                        # the compound only has to justify its OWN existence.
                         first_key, first_label = constituents[0]
                         parent = (first_key, first_label, True, CONCEPT_TYPE)
                     if parent and parent[0] != key:
                         compound_children[key] = parent
                 else:
                     # Entities key on the whole name; identity is settled
-                    # afterwards by prefix merging, not by folding into a head.
+                    # afterwards by prefix merging, not by hanging under a head.
                     key = f"{mention.type}:{normalize_ar(part)}"
                 node = nodes.setdefault(
                     key, Node(key=key, label=part, type=mention.type)
@@ -471,7 +464,8 @@ def _cluster(
                 keys.append(key)
         initial.append(keys)
 
-    # A compound that never recurred is this narration's phrasing, not a topic.
+    # Compounds always keep their own node. parent links to a known topic when
+    # one exists; df is not a deletion or absorption signal.
     for key, (parent_key, parent_label, parent_curated, parent_type) in compound_children.items():
         node = nodes.get(key)
         if node is None or node.curated:
@@ -484,25 +478,7 @@ def _cluster(
             nodes[parent_key] = Node(
                 key=parent_key, label=parent_label, type=parent_type, curated=True
             )
-        if node.df >= compound_min_df:
-            # The corpus reached for it more than once, so it is a real topic.
-            # It keeps its own identity and hangs under its parent: خلق العقل
-            # becomes a child of العقل rather than a rival to it.
-            node.parent = parent_key if parent_key in nodes else None
-            continue
-        parent = nodes.get(parent_key)
-        if parent is None:
-            # Said once, and built on nothing anyone else uses. عتاب الله is the
-            # case: no constituent is a known topic and the phrase never
-            # recurred, so there is nothing for it to be reachable by.
-            logger.debug("drop unreachable singleton %s", node.label)
-            del nodes[key]
-            continue
-        parent.surfaces.update(node.surfaces)
-        parent.docs.update(node.docs)
-        logger.debug("fold %s into %s (df=%d)", node.label, parent.label, node.df)
-        redirect[key] = parent_key
-        del nodes[key]
+        node.parent = parent_key if parent_key in nodes else None
 
     _merge_entity_prefixes(nodes, entity_merge_max_df, redirect)
 

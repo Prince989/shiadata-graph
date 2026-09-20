@@ -51,9 +51,10 @@ It made the vocabulary an **input** to extraction. Three consequences, all fatal
 3. Forced to pick from a list, the model distorts when the right term is absent.
 
 And the deeper problem, which several rounds of rule-writing failed to solve:
-`خلق العقل` (a real recurring topic) and `عقل المرء` (one sentence's grammar) are
-**grammatically identical** — noun plus genitive. No surface rule separates them.
-Whether a term groups anything is a property of the corpus, not of the string.
+`خلق العقل` and `عقل المرء` are **grammatically identical** — noun plus genitive.
+No surface rule separates them. Whether a term will group later volumes is a
+property of the growing corpus, not of today's `df`. Both stay in the graph;
+`parent` links the compound to a known topic when one exists.
 
 So the vocabulary became an **output**.
 
@@ -160,16 +161,16 @@ and `entities.yaml` now express only what clustering *cannot* discover:
 `قتل النفس` → `الانتحار` share no root and no letters, so only a human-written
 alias joins them.
 
-**3. Compound recurrence.** A multi-word mention keeps its own identity only if
-it recurs across enough documents; otherwise it folds into the constituent that
-names a known topic. The threshold **scales with corpus size**
-(`compound_threshold()`): two co-occurrences out of 30 documents is evidence,
-two out of 15,000 is a coincidence, and a fixed floor would promote a long tail
-of accidents on a full run.
+**3. Compound parent.** A multi-word mention always keeps its own identity.
+If a known topic is named inside it, `parent` points there: `عقل المرء` hangs
+under `العقل`. `df` is statistical weight for Phase 2 ranking / IDF — never a
+reason to delete or absorb the node. Incremental ingest (Al-Kafi now, more
+volumes later) means today's `df=1` may be next month's `df=15`.
+`compound_threshold()` remains in the API but is unused for keep-vs-fold.
 
 Concepts and entities use **different identity rules**, which matters:
-- concept compounds are *narrower topics* → fold when rare
-- entity compounds are *fuller names* → merge by prefix, always
+- concept compounds are *narrower topics* → keep the node, set `parent`
+- entity compounds are *fuller names* → merge by prefix
 
 so `زرارة` + `زرارة بن أعين` become one person and `واقعة صفين` + `صفين` one
 event, none of them enumerated anywhere. Nasab chains are cut at بن; generic
@@ -213,9 +214,10 @@ Also note Arabic *iḍāfa* puts the topic on either side: `عقل المرء` (
 and `كمال العقل` / `قدر العقول` (second). The rule is *the first constituent the
 catalog recognises*, not the head. Head-first was tried and is wrong.
 
-Verified end to end: `العقل`, `العقول`, `عقل المرء`, `قدر العقول`, `كمال العقل`
-→ one node df=4; `خلق العقل` (df=3) survives as a **child** of it; `عتاب الله`
-(df=1, anchored to nothing) is dropped.
+Verified end to end: `العقل` stays the catalog node; `عقل المرء`, `قدر العقول`,
+and `كمال العقل` survive as **children** of it; `خلق العقل` likewise hangs under
+it; `عتاب الله` (df=1, no known constituent) is **kept** as its own node with no
+parent.
 
 ### Stage C — candidate pairs, ranked
 
@@ -323,8 +325,9 @@ run-phase2     → candidate pairs → LLM relation judgement
 export-neo4j
 ```
 
-`resolve-nodes` **must** be a separate pass: knowing `عقل المرء` is `العقل`
+`resolve-nodes` **must** be a separate pass: hanging `عقل المرء` under `العقل`
 requires having seen `العقل` elsewhere, which per-page extraction cannot do.
+Both remain distinct nodes.
 
 `python check_nodes.py` demonstrates all of it on real data, free and instantly.
 
@@ -383,8 +386,8 @@ and `proposals.py` are all dead code and should be deleted.
   `MAX_BLOCK_MEMBERS` / `MAX_BLOCK_DF_RATIO` and stops proposing pairs while
   still contributing to scores. The false-merge rate has not been measured on
   live mentions.
-- **`COMPOUND_MIN_DF` now scales with corpus size, but the slope is a guess.**
-  `COMPOUND_DF_PER_10K = 3` was chosen without data.
+- **Concept compounds always keep identity.** `df` ranks; it does not fold or
+  drop. `COMPOUND_MIN_DF` / `compound_threshold()` are unused for absorption.
 - **Entity merging is guarded but not solved.** `ENTITY_MERGE_MAX_DF` stops a
   very common short name being absorbed, which handles the `أبو محمد` chain. It
   does not handle two rare men with the same rare name. Shared-context signals

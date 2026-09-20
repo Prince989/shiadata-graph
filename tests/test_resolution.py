@@ -50,8 +50,8 @@ def _m(doc: str, text: str, node_type: str = "concept") -> Mention:
     return Mention(text=text, type=node_type, doc_id=doc)
 
 
-def test_phrasing_folds_into_the_topic_it_is_built_on():
-    """عقل المرء، كمال العقل، قدر العقول are one sentence's grammar, not topics."""
+def test_phrasing_hangs_under_the_topic_it_is_built_on():
+    """عقل المرء، كمال العقل، قدر العقول stay as children of العقل."""
     nodes = resolve(
         [
             _m("h1", "العقل"),
@@ -61,15 +61,15 @@ def test_phrasing_folds_into_the_topic_it_is_built_on():
             _m("h11", "العقول"),
         ]
     )
-    assert len(nodes) == 1
-    node = next(iter(nodes.values()))
-    assert node.label == "العقل"
-    assert node.df == 4
-    assert {"عقل المرء", "كمال العقل", "قدر العقول"} <= node.surfaces
+    labels = {n.label: n for n in nodes.values()}
+    assert "العقل" in labels
+    for compound in ("كمال العقل", "عقل المرء", "قدر العقول"):
+        assert compound in labels
+        assert labels[compound].parent == labels["العقل"].key
 
 
 def test_a_compound_that_recurs_keeps_its_own_identity():
-    """خلق العقل and عقل المرء are the same shape; only the corpus separates them."""
+    """خلق العقل and عقل المرء are the same shape; both keep identity."""
     nodes = resolve(
         [
             _m("h1", "خلق العقل"),
@@ -82,22 +82,23 @@ def test_a_compound_that_recurs_keeps_its_own_identity():
     labels = {n.label: n for n in nodes.values()}
     assert "خلق العقل" in labels
     assert labels["خلق العقل"].df == 3
-    # It hangs under العقل rather than competing with it.
-    assert labels["خلق العقل"].parent is not None
-    # And the one-off phrasing did not survive.
-    assert "عقل المرء" not in labels
+    # Catalogued as a whole term (derived_ontology); morph parent is not required.
+    assert "عقل المرء" in labels
+    assert labels["عقل المرء"].parent == labels["العقل"].key
 
 
-def test_a_singleton_anchored_to_nothing_is_dropped():
-    """عتاب الله: said once, built on no known topic, reachable by nobody."""
+def test_a_singleton_anchored_to_nothing_is_kept():
+    """عتاب الله: said once, no known parent — still a node."""
     nodes = resolve([_m("h5", "عتاب الله"), _m("h5", "العزيمة")])
-    assert {n.label for n in nodes.values()} == {"العزيمة"}
+    assert {"عتاب الله", "العزيمة"} <= {n.label for n in nodes.values()}
 
 
 def test_a_curated_parent_is_created_even_if_never_seen_alone():
     """حساب العباد must still reach الحساب, which the catalog knows."""
     nodes = resolve([_m("h7", "حساب العباد")])
-    assert {n.label for n in nodes.values()} == {"الحساب"}
+    labels = {n.label: n for n in nodes.values()}
+    assert set(labels) == {"حساب العباد", "الحساب"}
+    assert labels["حساب العباد"].parent == labels["الحساب"].key
 
 
 def test_people_resolve_without_being_enumerated_anywhere():
@@ -546,7 +547,8 @@ def test_a_coordinated_mention_reaches_both_nodes(tmp_path: Path):
     resolve_pass.run(root=tmp_path)
     written = json.loads((tmp_path / "a.json").read_text(encoding="utf-8"))
     labels = {n["label"] for n in written["nodes"]}
-    assert labels == {"الوضوء", "الصلاة"}
+    assert {"الوضوء", "الصلاة"} <= labels
+    assert "الوضوء والصلاة" in labels
 
 
 def test_a_curated_coordination_is_not_taken_apart():
@@ -765,8 +767,8 @@ def test_retyped_mentions_reach_the_payload_not_just_the_node_table(tmp_path: Pa
     assert written[0]["nodes"][0]["type"] == "concept"
 
 
-def test_folded_and_merged_mentions_still_reach_the_payload(tmp_path: Path):
-    """Keys move twice after clustering: compound folds and entity merges."""
+def test_compound_and_merged_mentions_still_reach_the_payload(tmp_path: Path):
+    """عقل المرء stays its own key; زرارة still merges into زرارة بن أعين."""
     from src.pipelines import resolve_pass
 
     book = tmp_path / "hadith"
@@ -803,9 +805,15 @@ def test_folded_and_merged_mentions_still_reach_the_payload(tmp_path: Path):
 
     a = json.loads((book / "a.json").read_text(encoding="utf-8"))
     b = json.loads((book / "b.json").read_text(encoding="utf-8"))
-    # عقل المرء folded into العقل; both must carry the surviving key.
-    assert set(n["key"] for n in a["nodes"]) == set(n["key"] for n in b["nodes"])
-    assert len(a["nodes"]) == 2
+    a_labels = {n["label"]: n for n in a["nodes"]}
+    b_labels = {n["label"]: n for n in b["nodes"]}
+    assert "عقل المرء" in a_labels
+    assert a_labels["عقل المرء"].get("parent")
+    person_keys_a = {n["key"] for n in a["nodes"] if n["type"] == "person"}
+    person_keys_b = {n["key"] for n in b["nodes"] if n["type"] == "person"}
+    assert person_keys_a == person_keys_b
+    assert len(person_keys_a) == 1
+    assert "العقل" in b_labels
 
 
 # ------------------------------------------------------------ grounding scope

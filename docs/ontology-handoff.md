@@ -346,7 +346,7 @@ separate line. Vols 2 and 3 currently yield zero headings.
 |---|---|
 | `src/pipelines/harvest.py` | layers 1–3; span buffering; term filters; `_abandoned_from` |
 | `src/pipelines/adjudicate.py` | layer 4; orphan discovery, batching, cache |
-| `src/pipelines/resolver.py` | corpus-wide clustering; `decompose`, compound thresholds |
+| `src/pipelines/resolver.py` | corpus-wide clustering; `decompose`; compounds keep identity with optional `parent` |
 | `src/pipelines/ontology.py` | dual-catalog loading, `normalize_ar`, cached indexes |
 | `src/pipelines/morphology.py` | surface-form hashing — **not** a root extractor |
 | `src/extractors/classification.py` | kitab/bab detection, `heading_topic`, `_names_a_book` |

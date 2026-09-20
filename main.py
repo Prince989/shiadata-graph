@@ -344,9 +344,10 @@ def resolve_nodes(
 ) -> None:
     """Resolve every mention in the corpus into canonical graph nodes.
 
-    Runs between phase 1 and phase 2. Identity is a property of the whole
-    corpus -- knowing that عقل المرء is العقل needs العقل to have been seen
-    somewhere else -- so it cannot be settled while extracting one page.
+    Runs between phase 1 and phase 2. Parent links are a property of the whole
+    corpus -- hanging عقل المرء under العقل needs العقل to have been seen
+    somewhere else -- so they cannot be settled while extracting one page.
+    Both remain distinct nodes.
     """
     _setup_logging()
     from src.pipelines import resolve_pass

@@ -1,8 +1,9 @@
 """Corpus-wide pass: mentions in, resolved nodes out.
 
 Runs after phase 1 and before phase 2. It has to be a separate pass because
-identity is a property of the whole corpus -- deciding that عقل المرء is العقل
-requires having seen العقل elsewhere, which per-page extraction cannot do.
+identity and parent links are properties of the whole corpus -- hanging
+عقل المرء under العقل requires having seen العقل elsewhere, which per-page
+extraction cannot do. Both remain distinct nodes.
 
 Reads every phase-1 payload, resolves all mentions together, then writes the
 resolved node keys back onto each payload and saves the node table alongside.

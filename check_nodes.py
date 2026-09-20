@@ -72,12 +72,12 @@ def test_1c_resolver() -> None:
     nodes = resolve([Mention(text=t, type=ty, doc_id=d) for d, t, ty in raw])
     print("\nAfter looking at all of them together:\n")
     for node in sorted(nodes.values(), key=lambda n: -n.df):
-        tag = "  (a sub-topic)" if node.parent else ""
+        tag = f"  parent={node.parent}" if node.parent else ""
         print(f"   {node.label:<16} in {node.df} hadiths{tag}")
-        print(f"        absorbed: {sorted(node.surfaces)}")
-    print("\n   خلق العقل survived because THREE hadiths reached for it.")
-    print("   عقل المرء did not, so it folded into العقل.")
-    print("   عتاب الله was said once and built on nothing known -> dropped.")
+        print(f"        surfaces: {sorted(node.surfaces)}")
+    print("\n   خلق العقل keeps its own node and hangs under العقل.")
+    print("   عقل المرء does too — df=1 is not a reason to absorb it.")
+    print("   عتاب الله was said once with no known parent -> kept as its own node.")
     print("   زرارة and زرارة بن أعين became one man. Nobody listed him.")
 
 

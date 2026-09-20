@@ -157,6 +157,24 @@ class Phase1DayReport:
         if self.live:
             self.flush()
 
+    def _ensure_key_pool(self):
+        """Use the bound pool, or open live state when writing the real day report."""
+        if self._key_pool is not None:
+            return self._key_pool
+        # Unit tests / custom dirs must not touch data/state.db.
+        if self.report_dir.resolve() != REPORT_DIR.resolve():
+            return None
+        try:
+            from config.settings import get_settings
+            from src.agents.key_pool import KeyPool
+            from src.state_manager import StateManager
+
+            settings = get_settings()
+            self._key_pool = KeyPool(StateManager(settings.state_db), settings)
+        except Exception:  # noqa: BLE001 — report must still flush without pool
+            return None
+        return self._key_pool
+
     @property
     def json_path(self) -> Path:
         return self.report_dir / f"{self.day.isoformat()}.json"
@@ -252,9 +270,13 @@ class Phase1DayReport:
             return
 
     def _refresh_locks(self) -> None:
-        pool = self._key_pool
+        pool = self._ensure_key_pool()
         if pool is None:
             return
+        # Heal missed escalations: day-report 429 > 3 ⇒ overnight lock.
+        over = self.key_indexes_over_429(3)
+        if over:
+            pool.lock_indexes_for_day(over)
         labels = pool.lock_labels()
         for key_no, label in labels.items():
             if label:

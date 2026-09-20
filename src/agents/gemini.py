@@ -1,8 +1,8 @@
 """Reusable Gemini agent with key rotation and same-model retry.
 
 Every later phase should call `complete()` or `complete_structured()` on this
-class. Key rotation, 429/quota handling, 503 retry on the configured model(s),
-and AllKeysExhausted live here so pipelines stay free of provider details.
+class. Key rotation, 429/quota handling, 503 skip-to-next-key, and
+AllKeysExhausted live here so pipelines stay free of provider details.
 """
 
 from __future__ import annotations
@@ -55,11 +55,6 @@ MENTIONS_FILL_RETRY = (
     "and evidence (verbatim matn span). Do NOT return mentions:[]. "
     "Do NOT return hadith_fa/hadith_en/ravis on this call."
 )
-
-
-# Brief pause before retrying the same (or next) model on 503/5xx so a demand
-# spike is not burned through attempts in under a second.
-SERVER_ERROR_RETRY_SLEEP_S = 5.0
 
 
 def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int | None]:
@@ -315,36 +310,34 @@ class GeminiAgent:
                     self._record_http(key, 401)
                 logger.warning("Gemini call failed on %s (%s): %s", key.id, current_model, exc)
                 if kind == FailureKind.SERVER_ERROR:
-                    # With a single configured model (3.6-flash), retry the same
-                    # model after a pause. Multi-model lists still rotate if set.
-                    unavailable.add(current_model)
-                    still = [m for m in models if m not in unavailable]
                     msg = str(exc).lower()
-                    is_demand = (
+                    compact = msg.replace("_", "").replace("-", "").replace(" ", "")
+                    is_capacity = (
                         "503" in msg
-                        or "unavailable" in msg
-                        or "high demand" in msg
                         or "502" in msg
                         or "504" in msg
+                        or "high demand" in msg
+                        or "temporarily unavailable" in msg
                     )
-                    if not still:
-                        unavailable.clear()
-                        still = [current_model]
-                    wait_s = 0.0
-                    if is_demand:
-                        wait_s = (
-                            (retry_ms / 1000.0)
-                            if retry_ms
-                            else SERVER_ERROR_RETRY_SLEEP_S
-                        )
-                        time.sleep(wait_s)
+                    is_retired = (
+                        "404" in msg
+                        or "not_found" in compact
+                        or "notfound" in compact
+                        or "no longer available" in msg
+                    )
+                    if is_retired and not is_capacity:
+                        unavailable.add(current_model)
+                        still = [m for m in models if m not in unavailable]
+                        if not still:
+                            unavailable.clear()
+                            still = [current_model]
+                        logger.warning("Retrying Gemini model %s", still[0])
+                        self._skip_min_interval = True
+                        continue
                     logger.warning(
-                        "Retrying Gemini model %s%s",
-                        still[0],
-                        f" after {wait_s:.1f}s" if wait_s else "",
+                        "503/unavailable on %s; skipping to next key",
+                        key.id,
                     )
-                    self._skip_min_interval = True
-                    continue
                 if kind == FailureKind.TIMEOUT:
                     wait_s = (retry_ms / 1000.0) if retry_ms else 5.0
                     logger.warning(

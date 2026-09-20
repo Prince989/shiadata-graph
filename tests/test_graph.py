@@ -545,43 +545,43 @@ def test_gemini_min_interval_actually_sleeps(state: StateManager):
     assert elapsed >= 0.35
 
 
-def test_gemini_503_falls_back_to_next_model(state: StateManager, monkeypatch: pytest.MonkeyPatch):
-    slept: list[float] = []
-    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: slept.append(s))
+def test_gemini_503_skips_to_next_key(state: StateManager, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: None)
     seen: list[tuple[str, str]] = []
 
     def fake_generate(*, key, prompt, system, model, schema):
         seen.append((key.secret, model))
-        if model == "hot-model":
+        if key.secret == "a":
             raise RuntimeError("503 UNAVAILABLE. high demand")
         return "ok"
 
     agent = GeminiAgent(
         state,
         settings=Settings(
-            gemini_min_interval_ms=20_000,
+            gemini_min_interval_ms=0,
             gemini_max_attempts=3,
-            gemini_models=["hot-model", "cool-model"],
-            gemini_model="hot-model",
+            gemini_models=["gemini-3.6-flash"],
+            key_cooldown_base_ms=1_000,
         ),
         key_pool=KeyPool(state, keys=["a", "b"]),
         generate_fn=fake_generate,
     )
     assert agent.complete("x") == "ok"
-    assert seen == [("a", "hot-model"), ("a", "cool-model")]
-    assert slept == [5.0]
-    assert state.get_cooldown(key_id_for("a", 0)) is None
+    assert seen == [("a", "gemini-3.6-flash"), ("b", "gemini-3.6-flash")]
+    row = state.get_cooldown(key_id_for("a", 0))
+    assert row is not None
+    assert row["reason"] == FailureKind.SERVER_ERROR.value
 
 
-def test_gemini_503_retries_same_model_when_alone(
+def test_gemini_503_retries_same_key_when_it_is_the_only_one(
     state: StateManager, monkeypatch: pytest.MonkeyPatch
 ):
-    slept: list[float] = []
-    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: slept.append(s))
+    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: None)
+    monkeypatch.setattr("src.agents.key_pool.time.sleep", lambda s: None)
     seen: list[str] = []
 
     def fake_generate(*, key, prompt, system, model, schema):
-        seen.append(model)
+        seen.append(key.secret)
         if len(seen) == 1:
             raise RuntimeError("503 UNAVAILABLE. high demand")
         return "ok"
@@ -592,13 +592,23 @@ def test_gemini_503_retries_same_model_when_alone(
             gemini_min_interval_ms=0,
             gemini_max_attempts=3,
             gemini_models=["gemini-3.6-flash"],
+            key_cooldown_base_ms=50,
+            key_acquire_wait_max_ms=2_000,
         ),
-        key_pool=KeyPool(state, keys=["k"]),
+        key_pool=KeyPool(
+            state,
+            settings=Settings(
+                gemini_min_interval_ms=0,
+                key_cooldown_base_ms=50,
+                key_acquire_wait_max_ms=2_000,
+                google_api_keys=["k"],
+            ),
+            keys=["k"],
+        ),
         generate_fn=fake_generate,
     )
     assert agent.complete("x") == "ok"
-    assert seen == ["gemini-3.6-flash", "gemini-3.6-flash"]
-    assert slept == [5.0]
+    assert seen == ["k", "k"]
 
 
 def test_gemini_404_retired_model_falls_back(state: StateManager):

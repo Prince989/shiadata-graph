@@ -28,11 +28,13 @@ each true of exactly one narration and therefore indexing nothing.
 
 Several rounds of adding rules (stoplists, banned heads, compound reduction)
 failed to converge: each run produced a *different* set of bad labels. The
-decisive observation is that **whether a term groups anything is a property of
-the corpus, not of the string.** `خلق العقل` ("the creation of the intellect", a
-real recurring topic) and `عقل المرء` (noise) are grammatically identical — both
-a noun plus a genitive. No surface rule can separate them. So the system stopped
-predicting df and started measuring it.
+decisive observation is that **whether a term will group later volumes is a
+property of the growing corpus, not of today's string or today's `df`.**
+`خلق العقل` ("the creation of the intellect") and `عقل المرء` are grammatically
+identical — both a noun plus a genitive. No surface rule can separate them, and
+dropping `df=1` now would destroy valid nodes before the rest of the corpus is
+ingested. The resolver keeps both; `parent` links a compound to a known topic
+when one exists.
 
 ## The three layers now in place
 
@@ -96,37 +98,38 @@ still need it or `فضيلة محمد` passes as a person node.
 
 Repair feeds proposals: `enforce_node_policy(..., collect_repairs=[...])` records
 the *original* wording of anything repaired or dropped for being off-vocabulary,
-and `remap_hadith_payload` merges it into that hadith's `proposed_nodes`. Without
-this, a model that wrote `خلق العقل` into `semantic_nodes` instead of
-`proposed_nodes` would have it silently collapsed to `العقل`, and the term could
-never accumulate the frequency that promotes it. **Promotion no longer depends on
-the model choosing the right field.**
+and `remap_hadith_payload` merges it into that hadith's `proposed_nodes`. That
+was the old closed-vocabulary gate. **`resolve-nodes` does not collapse those
+strings into the parent:** `خلق العقل` and `عقل المرء` stay as distinct graph
+nodes; `parent` links a compound to a known topic when one exists. `df` ranks
+them for Phase 2; it does not delete them.
 
 Also fixes the reverse failure: `محبة أهل البيت` had been in the catalog all
 along, and the model kept missing it because *generating* an established
 technical term from a matn that only says `مَحَبَّةٌ` is hard. Recognising it on a
 list is easy.
 
-### Layer 3 — frequency decides what enters the vocabulary
+### Layer 3 — frequency ranks; it does not delete graph nodes
 
-`src/pipelines/proposals.py` (new), CLI `python main.py proposals [--promote]`.
+`src/pipelines/proposals.py`, CLI `python main.py proposals [--promote]`.
 
-The model writes anything the vocabulary cannot express into `proposed_nodes`,
-a separate field that **never reaches the graph**. Proposals are counted across
-distinct hadiths and sorted:
+This is **catalog** tooling, not graph membership. The resolver keeps every
+extracted mention as a node. `df` is for statistical weight, IDF, and ranking
+in Phase 2 — and for deciding which labels to *promote into the YAML catalog*.
+It is not a reason to fold `عقل المرء` into `العقل` or to drop `عتاب الله`.
+
+The model may still write gaps into `proposed_nodes` (legacy payloads). Those
+piles are:
 
 | pile | rule | example |
 |---|---|---|
 | promote | df ≥ threshold (default 2) | `خلق العقل` df=3 → added to catalog |
-| repair | df=1 but anchors to a catalog term | `عقل المرء` → `العقل` |
-| drop | df=1, anchored to nothing | `اجتهاد المجتهدين` |
+| repair | df=1 but anchors to a catalog term | catalog alias suggestion, not graph absorption |
+| drop | df=1, anchored to nothing | catalog-queue noise only; the graph node remains |
 
 Promotion appends to `config/base_ontology.yaml` as text rather than
 re-serialising YAML, because the catalog is hand-maintained and its comments
 carry reasoning that a round-trip would erase. Verified to stay parseable.
-
-This is the part that stops the whack-a-mole: nothing in the code knows about
-`خلق العقل` in advance.
 
 ## Other work in the same session
 
@@ -208,7 +211,7 @@ for a verse the editor cites as `2:269`. Citations now come from the page.
 | topic nodes | invented free-text per hadith | selected from a closed vocabulary |
 | vocabulary growth | hand-edited YAML only | measured df promotes proposals automatically |
 | connectivity | depended entirely on the LLM | exported graph guaranteed by 2002 inherited headings; Phase 2 buckets at bab granularity |
-| off-vocabulary terms | entered the graph as singletons | routed to `proposed_nodes`, never graphed |
+| off-vocabulary terms | entered the graph as singletons | kept as nodes; `parent` when a known topic is named; `df` ranks, does not delete |
 | `broader` | parsed, unused | drives bucket expansion via ancestors |
 | Qur'an citations | none (and one fabricated example in the prompt) | footnote-parsed + phrase-matched, model cannot invent |
 | narrator as topic | Imam being quoted became a node | dropped via canonicalised isnad comparison |
