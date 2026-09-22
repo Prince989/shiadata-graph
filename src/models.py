@@ -239,17 +239,40 @@ class MentionsFillExhaustive(BaseModel):
         return cleaned
 
 
+class CitedHadith(BaseModel):
+    """A narration Tabatabai quotes; not a CanonicalHadith.
+
+    `span` is the verbatim evidence from this unit (usually Persian).
+    `text_ar` / `text_fa` / `text_en` are the same narration in three
+    languages so a citation can meet a hadith payload later.
+    """
+
+    source_work: str = ""
+    speaker: str = ""
+    span: str = ""
+    text_ar: str = ""
+    text_fa: str = ""
+    text_en: str = ""
+
+
 class TafsirExtraction(BaseModel):
+    """What the tafsir pass asks Gemini for.
+
+    Field order is the JSON-schema property order. `tafsir_chunk` is gone: the
+    Folklib unit is already on disk. The model fills fluent Arabic, Persian,
+    and English of THIS unit, and three-language text on every cited hadith.
+
+    `core_concepts` / `referenced_hadith` are not requested. Resolve still
+    upcasts legacy payloads that have them.
+    """
+
     ayah_anchor: str
-    # Same mention channel as hadith, so tafsir and hadith resolve into ONE node
-    # space. Previously tafsir emitted free-text core_concepts that could never
-    # merge with a hadith node, which walled the two pipelines off from each
-    # other entirely.
     mentions: list[Mention] = Field(default_factory=list)
-    core_concepts: list[str] = Field(default_factory=list)
-    referenced_hadith: str = ""
-    summary_fa: str
-    tafsir_chunk: str
+    quotes: list[QuotedSpan] = Field(default_factory=list)
+    cited_hadiths: list[CitedHadith] = Field(default_factory=list)
+    tafsir_ar: str = ""
+    tafsir_fa: str = ""
+    tafsir_en: str = ""
 
 
 class HistoricalEvent(BaseModel):

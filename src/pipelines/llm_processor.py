@@ -32,6 +32,7 @@ from src.pipelines.prompts import (
     hadith_prompt,
     unify_prompt,
 )
+from src.pipelines.tafsir import finalize_payload as finalize_tafsir_payload
 from src.state_manager import ChunkStatus, StateManager
 
 logger = logging.getLogger(__name__)
@@ -606,10 +607,15 @@ def process_unit(
     unit: ParsedUnit,
     output_dir: Path,
     min_chars: int,
+    force: bool = False,
 ) -> ChunkStatus:
     cid = chunk_id(book_id, unit.locator, unit.text)
     existing = state.get_chunk(cid)
-    if existing and existing.status not in {ChunkStatus.PENDING, ChunkStatus.ERROR}:
+    if (
+        not force
+        and existing
+        and existing.status not in {ChunkStatus.PENDING, ChunkStatus.ERROR}
+    ):
         return existing.status
 
     if should_skip(unit.text, min_chars):
@@ -625,6 +631,8 @@ def process_unit(
     payload = result.model_dump()
     if pipeline == "hadith":
         payload = remap_hadith_payload(payload)
+    elif pipeline == "tafsir":
+        payload = finalize_tafsir_payload(unit, payload)
     dest = output_dir / book_id
     dest.mkdir(parents=True, exist_ok=True)
     (dest / phase1_filename(unit.source_path, unit.locator, cid)).write_text(

@@ -115,6 +115,39 @@ def ayah_count(sura: int) -> int:
     return entry[1] if entry else 0
 
 
+# Folklib Al-Mizan banners: "سوره 2 - آیات 26-27", "سوره 2 - آیه 34".
+# A section suffix after | is ignored ("سوره 1 - آیات 1-5 | بيان").
+_MIZAN_RANGE = re.compile(
+    r"سوره\s*(?P<sura>\d+)\s*[-–—]\s*آی(?:ه|ات)\s*(?P<start>\d+)"
+    r"(?:\s*[-–—تا]+\s*(?P<end>\d+))?",
+)
+
+
+def expand_mizan_locator(locator: str) -> list[str]:
+    """Expand an Al-Mizan locator into `sura:ayah` refs, or [].
+
+    Hadith CITES edges use this same `sura:ayah` form. Exporting tafsir as
+    `ayah:سوره 1 - آیات 1-5` left the two pipelines on different nodes.
+    """
+    head = (locator or "").split("|", 1)[0].strip()
+    match = _MIZAN_RANGE.search(head)
+    if not match:
+        return []
+    sura = int(match.group("sura"))
+    start = int(match.group("start"))
+    end = int(match.group("end") or start)
+    if end < start:
+        start, end = end, start
+    n = ayah_count(sura)
+    if n <= 0:
+        return []
+    start = max(1, start)
+    end = min(end, n)
+    if start > end:
+        return []
+    return [f"{sura}:{i}" for i in range(start, end + 1)]
+
+
 def sura_number(name: str) -> int | None:
     folded = fold(_STRIP_SURA_WORD.sub("", (name or "").strip()))
     return _name_index().get(folded)
@@ -314,6 +347,100 @@ def match_quran(text: str) -> list[str]:
         if ref not in found:
             found.append(ref)
     return found
+
+
+_PAREN_SPAN = re.compile(r"\(([^)]{8,800})\)")
+_PERSIAN_LETTERS = re.compile(r"[پچژگ]")
+
+
+def _tafsir_lemma_spans(text: str) -> list[str]:
+    """Parenthetical lemmata plus Arabic-looking lines (verse headings)."""
+    spans: list[str] = []
+    for match in _PAREN_SPAN.finditer(text or ""):
+        spans.append(match.group(1))
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or _PERSIAN_LETTERS.search(line):
+            continue
+        squashed = fold(line).replace(" ", "")
+        if _GRAM <= len(squashed) <= 240:
+            spans.append(line)
+    return spans
+
+
+def _ayah_num(ref: str) -> int:
+    try:
+        return int(ref.split(":")[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _pick_banner_ref(candidates: list[str], last: int | None) -> str:
+    """Al-Mizan walks the printed range forward; duplicate wording (37:81 /
+    37:111) is assigned to the next ayah at or after the last unique hit."""
+    if last is None:
+        return min(candidates, key=_ayah_num)
+    forward = [ref for ref in candidates if _ayah_num(ref) >= last]
+    pool = forward or candidates
+    return min(pool, key=lambda ref: abs(_ayah_num(ref) - last))
+
+
+def resolve_tafsir_quran_refs(
+    locator: str,
+    text: str,
+    quotes: list | None = None,
+) -> tuple[list[str], list[str]]:
+    """Split verse hits into banner commentary vs cross-sura citations.
+
+    The Folklib locator is bibliographic (the printed range). Graph edges
+    must come from quotations in THIS section: model `quotes`, then lemmata
+    in the commentary after the mushaf preamble. `quran_refs` is the
+    intersection with the banner (COMMENTS_ON). `quran_cites` is the rest
+    (CITES), the same meeting point hadith already uses.
+
+    When one lemma sits in more than one banner ayah (إنه من عبادنا المؤمنين
+    is 37:81 and 37:111), keep the hit that continues the section's walk
+    through the range, not every duplicate locus.
+    """
+    from src.extractors.chunkers import mizan_commentary_body
+
+    banner = expand_mizan_locator(locator)
+    banner_set = set(banner)
+    banner_groups: list[list[str]] = []
+    cites_found: list[str] = []
+    banner_suras = {int(ref.split(":")[0]) for ref in banner}
+
+    def _absorb(span: str) -> None:
+        in_banner: list[str] = []
+        for ref in match_quran(span):
+            if ref in banner_set:
+                if ref not in in_banner:
+                    in_banner.append(ref)
+            elif int(ref.split(":")[0]) not in banner_suras and ref not in cites_found:
+                cites_found.append(ref)
+        if in_banner:
+            banner_groups.append(in_banner)
+
+    for quote in quotes or []:
+        if not isinstance(quote, dict) or quote.get("kind", "quran") != "quran":
+            continue
+        _absorb(str(quote.get("text") or ""))
+    body = mizan_commentary_body(text)
+    for span in _tafsir_lemma_spans(body):
+        _absorb(span)
+
+    chosen: list[str] = []
+    last: int | None = None
+    for group in banner_groups:
+        if len(group) == 1:
+            pick = group[0]
+        else:
+            pick = _pick_banner_ref(group, last)
+        if pick not in chosen:
+            chosen.append(pick)
+        last = _ayah_num(pick)
+    comments = [ref for ref in banner if ref in set(chosen)]
+    return comments, cites_found
 
 
 _LEADING_MARKER_RE = re.compile(r"^\s*\[\d{1,3}\]\s*")

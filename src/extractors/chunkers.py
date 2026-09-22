@@ -231,6 +231,177 @@ def tafsir_ayah_units(units: list[ParsedUnit]) -> list[ParsedUnit]:
     return ayah if ayah else units
 
 
+# Al-Mizan section heads sit at line start: بيان, بحث روايتى, بحث فلسفى, …
+# Folklib also opens the riwayat block as "رواياتى درباره …" with no
+# "بحث روايتى" line. "حديثى از امام رضا" is a subheading inside that
+# block and must not start a new unit. "بحث پيرامون كلمه" is prose.
+_TAFSIR_HEADING = re.compile(
+    r"^(?:بيان\b|"
+    r"(?:يك\s+)?بحث\s+"
+    r"(?:روايت[ىی]|فلسف[ىی]|تاريخ[ىی]|علم[ىی]|اخلاق[ىی]|اجتماع[ىی])"
+    r"|روايات[ىی]\b"
+    r"|روايت[ىی]\s+(?:از|درباره|در\s+باره|در\s+ذيل)"
+    r")",
+    re.MULTILINE,
+)
+
+_DUMP_TITLE = re.compile(r"^آيات?\s+\d+")
+_DUMP_NUMBERED = re.compile(r"^\d{1,3}\s*[-–—]")
+_DUMP_TRAILING_N = re.compile(r"\(\s*\d{1,3}\s*\)\s*$")
+_PERSIAN_LETTERS = re.compile(r"[پچژگ]")
+
+
+def _strong_mizan_dump_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    return bool(
+        _DUMP_TITLE.match(s) or _DUMP_NUMBERED.match(s) or _DUMP_TRAILING_N.search(s)
+    )
+
+
+def _weak_mizan_dump_line(line: str) -> bool:
+    """Arabic mushaf lines after a dump has already started (no ayah number)."""
+    s = (line or "").strip()
+    if not s or _PERSIAN_LETTERS.search(s):
+        return False
+    squashed = re.sub(r"\s+", "", s)
+    return 2 <= len(squashed) <= 80
+
+
+def strip_mizan_mushaf_dump(text: str) -> str:
+    """Drop the opening reprint of the banner's ayahs, keep Tabatabai's prose.
+
+    Folklib reprints Arabic + Persian of the range, then commentary. Some
+    banners never use a بيان line until later (or open with سبب ابتداء).
+    Dropping everything before the first heading would delete real tafsir.
+    """
+    source = text or ""
+    lines = source.splitlines()
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines):
+        return source
+    first = lines[i].strip()
+    if not (
+        _strong_mizan_dump_line(first)
+        or first.startswith("بسم")
+        or first.startswith("آيات")
+    ):
+        return source
+    hits = 0
+    last_dump = i - 1
+    for j in range(i, len(lines)):
+        s = lines[j].strip()
+        if not s:
+            continue
+        if _strong_mizan_dump_line(s) or (hits and _weak_mizan_dump_line(s)) or (
+            hits == 0 and s.startswith("بسم")
+        ):
+            hits += 1
+            last_dump = j
+            continue
+        if hits >= 3 and _looks_interpretive(s):
+            break
+        if hits:
+            last_dump = j
+    if hits < 3:
+        return source
+    rest = "\n".join(lines[last_dump + 1 :]).strip()
+    return rest if rest else source
+
+
+def _looks_interpretive(line: str) -> bool:
+    s = (line or "").strip()
+    if len(s) < 40:
+        return False
+    if _DUMP_TRAILING_N.search(s) or _DUMP_NUMBERED.match(s) or _DUMP_TITLE.match(s):
+        return False
+    return bool(_PERSIAN_LETTERS.search(s)) or "مى" in s or "است" in s
+
+
+def _section_label(heading: str, seen: dict[str, int]) -> str:
+    line = (heading or "").strip().split("\n", 1)[0]
+    line = re.sub(r"^يك\s+", "", line)
+    if line.startswith("بيان"):
+        kind = "بيان"
+    elif re.match(r"بحث\s+روايت[ىی]", line) or line.startswith("روايات") or re.match(
+        r"روايت[ىی]\s+(?:از|درباره|در\s+باره|در\s+ذيل)", line
+    ):
+        kind = "بحث روايتى"
+    elif re.match(r"بحث\s+فلسف[ىی]", line):
+        kind = "بحث فلسفى"
+    elif re.match(r"بحث\s+تاريخ[ىی]", line):
+        kind = "بحث تاريخى"
+    elif re.match(r"بحث\s+علم[ىی]", line):
+        kind = "بحث علمى"
+    elif re.match(r"بحث\s+اخلاق[ىی]", line):
+        kind = "بحث اخلاقى"
+    elif re.match(r"بحث\s+اجتماع[ىی]", line):
+        kind = "بحث اجتماعى"
+    else:
+        kind = line[:40] or "قسمت"
+    seen[kind] = seen.get(kind, 0) + 1
+    return kind if seen[kind] == 1 else f"{kind} {seen[kind]}"
+
+
+def mizan_commentary_body(text: str) -> str:
+    """Text used for verse matching: mushaf dump gone, start at first heading."""
+    stripped = strip_mizan_mushaf_dump(text or "")
+    match = _TAFSIR_HEADING.search(stripped)
+    if match:
+        return stripped[match.start() :]
+    return stripped
+
+
+def split_mizan_sections(unit: ParsedUnit) -> list[ParsedUnit]:
+    """One Gemini unit per بيان / بحث / رواياتى block inside an ayah-range banner.
+
+    The opening mushaf reprint is dropped. Prose before the first heading
+    (سبب ابتداء, unlabeled tafsir) stays on the first section.
+    """
+    text = strip_mizan_mushaf_dump(unit.text or "")
+    matches = list(_TAFSIR_HEADING.finditer(text))
+    if not matches:
+        if text.strip() and text.strip() != (unit.text or "").strip():
+            return [
+                ParsedUnit(
+                    locator=f"{unit.locator} | بيان",
+                    text=text,
+                    source_path=unit.source_path,
+                )
+            ]
+        return [unit]
+    seen: dict[str, int] = {}
+    parts: list[ParsedUnit] = []
+    preamble = text[: matches[0].start()].strip()
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[match.start() : end].strip()
+        if i == 0 and preamble:
+            body = f"{preamble}\n\n{body}"
+        if not body:
+            continue
+        label = _section_label(match.group(0), seen)
+        locator = f"{unit.locator} | {label}"
+        parts.append(
+            ParsedUnit(
+                locator=locator,
+                text=body,
+                source_path=unit.source_path,
+            )
+        )
+    return parts or [unit]
+
+
+def tafsir_section_units(units: list[ParsedUnit]) -> list[ParsedUnit]:
+    out: list[ParsedUnit] = []
+    for unit in tafsir_ayah_units(units):
+        out.extend(split_mizan_sections(unit))
+    return out
+
+
 def pack_history(
     units: list[ParsedUnit],
     pages_per_call: int,

@@ -85,7 +85,13 @@ def embed_text_for_chunk(chunk: ChunkRecord) -> str:
         joined = "\n\n".join(part for part in parts if part)
         return joined or str(payload.get("hadith") or chunk.text)
     if chunk.pipeline == "tafsir":
-        return str(payload.get("tafsir_chunk") or payload.get("summary_fa") or chunk.text)
+        return str(
+            payload.get("tafsir_chunk")
+            or payload.get("tafsir_fa")
+            or payload.get("tafsir_en")
+            or payload.get("summary_fa")
+            or chunk.text
+        )
     if chunk.pipeline == "history":
         events = payload.get("events") or []
         titles = [e.get("event_title", "") for e in events if isinstance(e, dict)]
@@ -148,6 +154,21 @@ def graph_nodes_for_chunk(chunk: ChunkRecord) -> list[dict]:
             ravis = list(payload.get("ravis") or [])
         return enforce_node_policy(nodes, ravis)
     if chunk.pipeline == "tafsir":
+        mentions = [
+            {
+                "node": str(m.get("text") or ""),
+                "type": str(m.get("type") or "concept"),
+                "role": (
+                    "primary"
+                    if float(m.get("salience") or 0) >= 0.6
+                    else "secondary"
+                ),
+            }
+            for m in (payload.get("mentions") or [])
+            if isinstance(m, dict) and str(m.get("text") or "").strip()
+        ]
+        if mentions:
+            return enforce_node_policy(mentions, strict=False)
         # strict=False: tafsir has no proposals channel yet, and closing its
         # vocabulary would silently empty every tafsir chunk.
         return enforce_node_policy(

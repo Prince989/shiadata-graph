@@ -65,9 +65,10 @@ def phase1(
         None,
         "--page",
         help=(
-            "Only process this print page (debug). "
-            "Bare number like 30, or locator fragment like 'جلد 1 - صفحه 30'. "
-            "Does not advance resume progress."
+            "Only process this print page or ayah (debug). "
+            "Hadith: bare number like 30, or 'جلد 1 - صفحه 30'. "
+            "Tafsir: '37:88' or a locator fragment like "
+            "'سوره 37 - آیات 71-113'. Does not advance resume progress."
         ),
     ),
     volume: str | None = typer.Option(

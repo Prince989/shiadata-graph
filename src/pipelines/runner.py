@@ -40,15 +40,25 @@ def locator_matches_page(
     page: str,
     volume: int | str | None = None,
 ) -> bool:
-    """True when a unit locator is the requested print page (debug targeting).
+    """True when a unit locator is the requested print page or ayah (debug).
 
-    `page` may be a bare number (`30`) or a locator fragment
-    (`جلد 1 - صفحه 30`). Optional `volume` further requires `جلد N`.
+    Hadith: bare number (`30`) or fragment (`جلد 1 - صفحه 30`). Optional
+    `volume` further requires `جلد N`.
+
+    Tafsir: `37:88` (any unit whose expanded range contains that ayah) or a
+    locator fragment (`سوره 37 - آیات 71-113`).
     """
     loc = str(locator or "").strip()
     want = str(page or "").strip()
     if not loc or not want:
         return False
+    ayah = re.fullmatch(r"(\d{1,3}):(\d{1,3})", want)
+    if ayah:
+        from src.extractors.quran_refs import expand_mizan_locator
+
+        return want in expand_mizan_locator(loc)
+    if "سوره" in loc:
+        return want in loc
     if "صفحه" in want or "جلد" in want:
         if want not in loc and loc != want:
             return False
@@ -564,15 +574,43 @@ def run_phase1(
             volume=volume,
         )
 
-    if page:
-        raise ValueError("--page is only supported for hadith books")
-
-    ingest_book(book_id, state, settings, raw_dir=raw_dir, limit=limit)
-    pending = state.list_chunks(
-        book_id=book_id,
-        statuses=[ChunkStatus.PENDING, ChunkStatus.ERROR],
-        limit=limit,
-    )
+    page_filter = str(page).strip() if page else None
+    force = bool(page_filter)
+    if page_filter:
+        rows = []
+        remaining = limit
+        for path in spec.files:
+            units = prepare_units(spec.pipeline, parse_file(path), settings)
+            for unit in units:
+                if not locator_matches_page(unit.locator, page_filter, volume):
+                    continue
+                if remaining is not None and remaining <= 0:
+                    break
+                rows.append(
+                    {
+                        "id": chunk_id(book_id, unit.locator, unit.text),
+                        "book_id": book_id,
+                        "pipeline": spec.pipeline,
+                        "locator": unit.locator,
+                        "source_path": unit.source_path,
+                        "text": unit.text,
+                    }
+                )
+                if remaining is not None:
+                    remaining -= 1
+            if remaining is not None and remaining <= 0:
+                break
+        if not rows:
+            raise ValueError(f"no {spec.pipeline} unit matches --page {page_filter!r}")
+        state.upsert_chunks(rows)
+        pending = [c for r in rows if (c := state.get_chunk(r["id"]))]
+    else:
+        ingest_book(book_id, state, settings, raw_dir=raw_dir, limit=limit)
+        pending = state.list_chunks(
+            book_id=book_id,
+            statuses=[ChunkStatus.PENDING, ChunkStatus.ERROR],
+            limit=limit,
+        )
     job_id = state.record_job("phase1", book_id)
     processed = 0
     skipped = 0
@@ -594,6 +632,7 @@ def run_phase1(
                     ),
                     output_dir=OUTPUT_DIR / "phase1",
                     min_chars=settings.skip_min_chars,
+                    force=force,
                 )
             except StructuredOutputError as exc:
                 state.mark(

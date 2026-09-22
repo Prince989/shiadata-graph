@@ -69,16 +69,18 @@ def evidence_supports_mention(text: str, evidence: str) -> bool:
     return bool(text_roots & ev_roots)
 
 
-def evidence_usable(mention: dict, matn: str) -> bool:
-    """Evidence counts only if it is in the post-قال body.
+def evidence_usable(mention: dict, matn: str, *, cut_isnad: bool = True) -> bool:
+    """Evidence counts only if it is in the usable body of the unit.
 
-    In-body spans may infer a concept without repeating the mention label.
-    Isnad names never qualify.
+    Hadith (`cut_isnad=True`): post-قال speech, so isnad names never qualify.
+    Tafsir (`cut_isnad=False`): the whole unit — Al-Mizan is Persian prose,
+    not an isnad+matn pair.
     """
     evidence = str(mention.get("evidence") or "").strip()
     if not fold(evidence).strip():
         return False
-    return _contains(matn_body(matn), evidence)
+    haystack = matn_body(matn) if cut_isnad else matn
+    return _contains(haystack, evidence)
 
 
 def prefer_evidence_span(
@@ -103,15 +105,19 @@ def prefer_evidence_span(
 
 
 def check_mention(
-    mention: dict, matn: str, require_evidence: bool = REQUIRE_EVIDENCE
+    mention: dict,
+    matn: str,
+    require_evidence: bool = REQUIRE_EVIDENCE,
+    *,
+    cut_isnad: bool = True,
 ) -> str | None:
     """Return a reason string when this mention is not supported by the matn."""
     text = str(mention.get("text") or "").strip()
     if not text:
         return "empty"
     node_type = str(mention.get("type") or "concept")
-    body = matn_body(matn)
-    usable = evidence_usable(mention, matn)
+    body = matn_body(matn) if cut_isnad else matn
+    usable = evidence_usable(mention, matn, cut_isnad=cut_isnad)
 
     if not usable and require_evidence and not _contains(matn, text):
         # No usable span AND the term is not in the text either. A concept may
@@ -121,9 +127,14 @@ def check_mention(
         # concept through untouched.
         return "no evidence and term not in matn"
 
-    if node_type in GROUNDED_TYPES and not _contains(body or matn, text):
-        # The name itself has to be in the speech, not only the isnad.
-        return "entity not in matn"
+    if node_type in GROUNDED_TYPES:
+        if cut_isnad:
+            if not _contains(body or matn, text):
+                return "entity not in matn"
+        elif not usable and not _contains(matn, text):
+            # Tafsir mention labels are Arabic; the unit is usually Persian.
+            # The evidence span has to be in the unit. The Arabic label need not.
+            return "entity not in unit"
     return None
 
 
@@ -168,6 +179,8 @@ def ground_mentions(
     ravis: list[str] | None = None,
     require_evidence: bool = REQUIRE_EVIDENCE,
     quotes: list | None = None,
+    *,
+    cut_isnad: bool = True,
 ) -> tuple[list, list[tuple[str, str]]]:
     """Split mentions into (kept, [(text, reason), ...]).
 
@@ -212,13 +225,19 @@ def ground_mentions(
             rejected.append((text, "quoted scripture, not a topic"))
             logger.info("drop quoted-phrase mention %r", text)
             continue
-        reason = check_mention(mention, matn, require_evidence) if matn else None
+        reason = (
+            check_mention(
+                mention, matn, require_evidence, cut_isnad=cut_isnad
+            )
+            if matn
+            else None
+        )
         if reason:
             rejected.append((text, reason))
             logger.info("drop ungrounded mention %r: %s", text, reason)
             continue
         row = dict(mention)
-        if matn and not evidence_usable(row, matn):
+        if matn and not evidence_usable(row, matn, cut_isnad=cut_isnad):
             row["evidence"] = ""
         kept.append(row)
     return kept, rejected

@@ -169,16 +169,121 @@ def mentions_fill_prompt(is_exhaustive: bool = False) -> str:
     return MENTIONS_FILL_PROMPT
 
 TAFSIR_PROMPT = """\
-You extract one Al-Mizan tafsir unit anchored to a Qur'anic ayah range.
-Copy ayah_anchor from the locator. Extract any quoted hadith.
-Write a two-line Persian summary. Keep tafsir_chunk as the main Arabic/Persian text.
+You extract ONE Al-Mizan unit. The locator is an ayah range plus a section
+(بيان, بحث روايتى, بحث فلسفى, …). Copy ayah_anchor from the locator's range
+only (e.g. "سوره 1 - آیات 1-5"), ignoring the section suffix after |.
+Do NOT invent sura or verse numbers.
 
-Also return `mentions`: what this passage is ABOUT, in the same shape the hadith
-pipeline uses -- text, type (concept | person | place | group | event | work),
-salience 0.0-1.0, and the verbatim evidence span. These resolve into the SAME
-node space as the hadith mentions, which is what lets a tafsir passage and a
-narration on the same subject meet in the graph. Say it plainly: الصبر, not
-صبر المؤمنين.
+Do NOT paste the Folklib unit back. The source is stored in code. You MUST
+return fluent complete Arabic, Persian, and English of THIS unit's commentary,
+and three-language text for every cited hadith.
+Return only:
+  1. ayah_anchor     copy the range from the locator
+  2. mentions        REQUIRED -- prefer 4-12, never []
+  3. quotes          Qur'anic spans only (kind "quran"), the quoted words,
+                     no sura/verse numbers
+  4. cited_hadiths   each روايت: source_work, speaker, span, text_ar,
+                     text_fa, text_en
+  5. tafsir_ar       complete Arabic of THIS unit's commentary
+  6. tafsir_fa       complete fluent Persian of THIS unit's commentary
+  7. tafsir_en       complete English of THIS unit's commentary
+
+WHAT A MENTION IS
+
+A mention is something THIS unit is ABOUT. You report an observation;
+identity across the corpus is decided later. Same shape as hadith:
+  text      Arabic term for the subject (graph labels are Arabic even when
+            the unit is Persian)
+  type      concept | person | place | group | event | work
+  salience  0.0-1.0 (the claim near 1.0; a passing name near 0.2)
+  evidence  verbatim span from THIS unit (Persian is expected and correct)
+
+KEEP vs STRIP  (same rule as hadith)
+
+KEEP the real subject as a unit:
+  - خلق العقل stays خلق العقل
+  - محبة أهل البيت stays the compound when that is what the passage discusses
+STRIP sentence grammar only:
+  - عقل المرء → العقل
+  - صبر المؤمنين → الصبر
+Never emit a bare verb like خلق as a mention by itself.
+
+When a type-noun is qualified by a relative clause that carries the claim,
+that qualifier is the high-salience mention; the bare type-noun is secondary.
+
+ENTITIES
+
+person / place / group / event / work must be named in THIS unit; evidence is
+the words that named them. Do not invent كربلاء, بدر, or a person the unit
+never names.
+  - الجنة, النار, يوم القيامة are concepts, not place/event, unless the unit
+    is treating them as a historical locale or a dated happening
+  - علامه / مؤلف / طباطبائي is NEVER a mention
+  - An Imam/Prophet who is only the speaker of a quoted روايت goes in
+    cited_hadiths.speaker, not as a high-salience person — unless the بيان
+    itself is about that person
+  - Groups the commentary defines (أهل الكتاب, بنو إسرائيل, الشيعة) ARE mentions
+  - A named battle, city, or day in asbāb / history (بدر, أحد, الكوفة, فتح مكة)
+    is event or place with its own mention
+
+QUOTES vs CITED HADITHS
+
+Qur'an in the unit → quotes (words only).
+A روايت ("در کتاب کافی از امام صادق …") → one cited_hadiths object:
+  source_work   الكافي / العيون / نهج البلاغة / مسلم / … as printed
+  speaker       الإمام الصادق / رسول الله / علي … Arabic label
+  span          verbatim citation from THIS unit (usually Persian) — evidence
+  text_fa       fluent Persian of that narration (may match span)
+  text_en       English of that narration
+  text_ar       Arabic of that narration. Copy it when the unit prints Arabic.
+                When the unit only paraphrases in Persian, give the standard
+                Arabic wording of that known report. Do not leave text_ar empty
+                on a real citation. Do not invent a new matn that the sources
+                never carried.
+Do not collapse many روايات into one string.
+
+THREE LANGUAGES (tafsir_ar / tafsir_fa / tafsir_en)
+
+These are translations of Tabatabai's commentary in THIS unit, not abstracts.
+Cover the argument end-to-end: every explanation, objection, and cited report
+you already listed. Forbidden: a 2–4 sentence "summary", ellipsis (`...`),
+"the passage discusses…", or translating only the opening. Do not re-copy
+every mushaf ayah already in `quotes`; do translate his explanation of them.
+tafsir_fa is fluent Persian of the same coverage as tafsir_ar / tafsir_en —
+not a paste of the Folklib source (broken lines, OCR).
+
+INDEX WHAT THIS SECTION ASSERTS. On بيان, index Tabatabai's claim. On
+بحث روايتى, index what the cited narrations are about AND keep cited_hadiths
+complete; do not dump every proper name in a chain as a mention.
+
+EXAMPLES
+
+Locator "سوره 1 - آیات 1-5 | بيان" — unit explains beginning in the name of God
+and that every sura has its own purpose:
+  mentions: البسملة/0.95, ابتداء باسم الله/0.85, الحمد/0.6, الهداية/0.5
+  quotes: {text: "بسم الله الرحمن الرحيم", kind: "quran"}
+  cited_hadiths: []
+  NOT: طباطبائي as a person
+
+Locator "سوره 1 - آیات 1-5 | بحث روايتى" — كافى from Imam Sadiq on three kinds
+of worship (خوف / ثواب / حب):
+  mentions: أقسام العبادة/0.9, عبادة الأحرار/0.85, الشكر/0.5
+  cited_hadiths: [{source_work: "الكافي", speaker: "الإمام الصادق",
+    span: "عبادت سه جور است … عبادت آزادگان",
+    text_fa: "عبادت سه گونه است: ترس، پاداش، محبت — و عبادت آزادگان بهترین است",
+    text_en: "Worship is of three kinds: fear, reward, and love; the worship of the free is best",
+    text_ar: "العبادة ثلاثة: قوم عبدوا الله خوفا … ونحن أهلها"}]
+  NOT: only أقسام العبادة with the three kinds dropped
+  NOT: span alone with text_ar/text_en empty
+  NOT: الإمام الصادق as the tafsir's main person mention
+
+A بيان that names غزوة بدر while explaining an ayah:
+  mentions: بدر/event/0.8, plus the concept the verse is actually about
+  evidence for بدر must be the unit's own words naming it
+
+Empty mentions is invalid. Never fabricate ayah numbers. tafsir_ar,
+tafsir_fa, and tafsir_en must be complete translations of this unit, not
+short summaries.
 """
 
 HISTORY_PROMPT = """\

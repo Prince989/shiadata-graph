@@ -120,26 +120,26 @@ def export_neo4j(state: StateManager, dest: Path | None = None) -> Path:
                     )
                     + "\n"
                 )
-            # quran_refs is injected by the extractor, never by the model, and
-            # uses the same ayah: prefix the tafsir branch writes below, so a
-            # hadith and the tafsir of the verse it cites meet on one node.
+            # quran_refs is injected by the extractor, never by the model.
+            # Tafsir COMMENTS_ON uses the same sura:ayah form as hadith CITES.
             cited: list[str] = []
-            for item in hadith_items(payload):
-                cited.extend(item.get("quran_refs") or [])
-            cited.extend(payload.get("quran_refs") or [])
-            for ref in dict.fromkeys(cited):
-                nodes_seen.add(("ayah", ref))
-                edges.write(
-                    json.dumps(
-                        {
-                            "type": "CITES",
-                            "start": chunk.id,
-                            "end": f"ayah:{ref}",
-                        },
-                        ensure_ascii=False,
+            if chunk.pipeline != "tafsir":
+                for item in hadith_items(payload):
+                    cited.extend(item.get("quran_refs") or [])
+                cited.extend(payload.get("quran_refs") or [])
+                for ref in dict.fromkeys(cited):
+                    nodes_seen.add(("ayah", ref))
+                    edges.write(
+                        json.dumps(
+                            {
+                                "type": "CITES",
+                                "start": chunk.id,
+                                "end": f"ayah:{ref}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
             ravis: list[str] = []
             for item in hadith_items(payload):
                 ravis.extend(item.get("ravis") or [])
@@ -158,18 +158,65 @@ def export_neo4j(state: StateManager, dest: Path | None = None) -> Path:
                     )
                     + "\n"
                 )
-            if chunk.pipeline == "tafsir" and payload.get("ayah_anchor"):
-                edges.write(
-                    json.dumps(
-                        {
-                            "type": "COMMENTS_ON",
-                            "start": chunk.id,
-                            "end": f"ayah:{payload['ayah_anchor']}",
-                        },
-                        ensure_ascii=False,
+            if chunk.pipeline == "tafsir":
+                refs = list(dict.fromkeys(payload.get("quran_refs") or []))
+                for ref in refs:
+                    nodes_seen.add(("ayah", ref))
+                    edges.write(
+                        json.dumps(
+                            {
+                                "type": "COMMENTS_ON",
+                                "start": chunk.id,
+                                "end": f"ayah:{ref}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
+                for ref in dict.fromkeys(payload.get("quran_cites") or []):
+                    nodes_seen.add(("ayah", ref))
+                    edges.write(
+                        json.dumps(
+                            {
+                                "type": "CITES",
+                                "start": chunk.id,
+                                "end": f"ayah:{ref}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                for cited_h in payload.get("cited_hadiths") or []:
+                    if not isinstance(cited_h, dict):
+                        continue
+                    work = str(cited_h.get("source_work") or "").strip()
+                    if work:
+                        nodes_seen.add(("work", work))
+                        edges.write(
+                            json.dumps(
+                                {
+                                    "type": "CITES_WORK",
+                                    "start": chunk.id,
+                                    "end": f"work:{work}",
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                    speaker = str(cited_h.get("speaker") or "").strip()
+                    if speaker:
+                        nodes_seen.add(("person", speaker))
+                        edges.write(
+                            json.dumps(
+                                {
+                                    "type": "QUOTES_SPEAKER",
+                                    "start": chunk.id,
+                                    "end": f"person:{speaker}",
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
         for book_id in sorted(books):
             nodes.write(
                 json.dumps({"id": f"book:{book_id}", "labels": ["Book"], "book_id": book_id})

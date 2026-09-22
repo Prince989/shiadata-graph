@@ -109,6 +109,7 @@ def documents_for(chunks: list[ChunkRecord]) -> list:
         ravis: list[str] = []
         for item in hadith_items(payload) or [payload]:
             ayahs.extend(item.get("quran_refs") or [])
+            ayahs.extend(item.get("quran_cites") or [])
             ravis.extend(item.get("ravis") or [])
         nodes = [n["key"] for n in resolved_nodes_for_chunk(chunk)]
         if not nodes:

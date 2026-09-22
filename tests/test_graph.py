@@ -22,10 +22,23 @@ from src.core.vector_engine import (
     pairs_above_threshold,
     section_nodes_for_chunk,
 )
-from src.extractors.chunkers import hadith_units, page_prefix_and_starts, split_hadith_page, strip_folklib_footnotes
+from src.extractors.chunkers import (
+    hadith_units,
+    mizan_commentary_body,
+    page_prefix_and_starts,
+    split_hadith_page,
+    split_mizan_sections,
+    strip_folklib_footnotes,
+)
 from src.extractors.classification import attach_sections, page_headings, section_nodes
 from src.extractors.epub_parser import ParsedUnit, parse_epub, strip_html
-from src.extractors.quran_refs import match_quran_phrases, page_quran_refs, parse_footnote_ref
+from src.extractors.quran_refs import (
+    expand_mizan_locator,
+    match_quran_phrases,
+    page_quran_refs,
+    parse_footnote_ref,
+    resolve_tafsir_quran_refs,
+)
 from src.extractors.txt_parser import parse_txt
 from src.models import (
     HadithExtraction,
@@ -105,6 +118,153 @@ def test_txt_parser_splits_mizan_ayah_headers():
     units = parse_txt(FIXTURES / "sample_mizan.txt")
     assert units[0].locator == "سوره 1 - آیات 1-5"
     assert "الحمد" in units[0].text
+
+
+def test_expand_mizan_locator_matches_hadith_cites_form():
+    assert expand_mizan_locator("سوره 1 - آیات 1-5") == [
+        "1:1",
+        "1:2",
+        "1:3",
+        "1:4",
+        "1:5",
+    ]
+    assert expand_mizan_locator("سوره 2 - آیه 34") == ["2:34"]
+    assert expand_mizan_locator("سوره 1 - آیات 1-5 | بيان") == [
+        "1:1",
+        "1:2",
+        "1:3",
+        "1:4",
+        "1:5",
+    ]
+
+
+def test_locator_matches_tafsir_ayah_ref():
+    from src.pipelines.runner import locator_matches_page
+
+    loc = "سوره 37 - آیات 71-113 | بيان"
+    assert locator_matches_page(loc, "37:88")
+    assert not locator_matches_page(loc, "37:70")
+    assert locator_matches_page(loc, "سوره 37 - آیات 71-113")
+    assert locator_matches_page(
+        "سوره 37 - آیات 71-113 | بيان 2", "71-113 | بيان 2"
+    )
+    assert not locator_matches_page(loc, "71-113 | بيان 2")
+
+
+def test_mizan_commentary_body_drops_mushaf_preamble():
+    text = "آيات 71 تا 113 سوره صافات\nو لقد ضل قبلهم اكثر الاولين (71)\nو لقد ارسلنا فيهم منذرين (72)\nفانظر كيف كان عاقبة المنذرين (73)\n\nاين آيات غرض سياق سابق را تعقيب نموده مى فرمايد گمراه شدند.\n\nبيان\nتفسير نوح"
+    body = mizan_commentary_body(text)
+    assert "آيات 71 تا" not in body
+    assert "تفسير نوح" in body
+    already = "بيان آيات ابراهيم\nفنظر نظرة فى النجوم"
+    assert mizan_commentary_body(already) == already
+
+
+def test_split_mizan_keeps_sabab_intro_but_drops_mushaf_reprint():
+    sabab = ParsedUnit(
+        locator="سوره 1 - آیات 1-5",
+        text="سبب ابتداء به بسم الله\n\nبيان\nتفسير البسملة\n\nبحث روايتى (ذيل)\nدر کتاب کافی از امام صادق",
+        source_path="tafsir/al-mizan.txt",
+    )
+    parts = split_mizan_sections(sabab)
+    assert [p.locator for p in parts] == [
+        "سوره 1 - آیات 1-5 | بيان",
+        "سوره 1 - آیات 1-5 | بحث روايتى",
+    ]
+    assert "سبب ابتداء" in parts[0].text
+    assert "تفسير البسملة" in parts[0].text
+    assert "کافی" in parts[1].text
+
+    dump = ParsedUnit(
+        locator="سوره 37 - آیات 71-113",
+        text=(
+            "آيات 71 تا 113 سوره صافات\n\n"
+            "و لقد ضل قبلهم اكثر الاولين (71)\n\n"
+            "و لقد ارسلنا فيهم منذرين (72)\n\n"
+            "فانظر كيف كان عاقبة المنذرين (73)\n\n"
+            "قبل از ايشان هم بيشتر اقوام گذشته گمراه شدند (71).\n\n"
+            "اين آيات غرض سياق سابق را تعقيب نموده مى فرمايد گمراه شدند.\n\n"
+            "بيان آيات مربوط به منزلت نوح\nتفسير نوح"
+        ),
+        source_path="tafsir/al-mizan.txt",
+    )
+    nuh = split_mizan_sections(dump)
+    assert nuh[0].locator.endswith("بيان")
+    assert not nuh[0].text.startswith("آيات 71")
+    assert "تفسير نوح" in nuh[0].text
+    assert "غرض سياق" in nuh[0].text
+
+
+def test_resolve_tafsir_quran_refs_clips_banner_and_cites_cross_sura():
+    locator = "سوره 37 - آیات 71-113 | بيان 2"
+    quotes = [
+        {"text": "فنظر نظرة في النجوم", "kind": "quran"},
+        {"text": "قلنا احمل فيها من كل زوجين اثنين", "kind": "quran"},
+    ]
+    preamble = (
+        "و لقد ضل قبلهم اكثر الاولين\n"
+        "و لقد ارسلنا فيهم منذرين\n\n"
+        "بيان\n"
+        "تفسير ابراهيم"
+    )
+    comments, cites = resolve_tafsir_quran_refs(locator, preamble, quotes)
+    assert "37:88" in comments
+    assert "37:71" not in comments
+    assert "37:72" not in comments
+    assert any(ref.startswith("11:") for ref in cites)
+    assert "37:88" not in cites
+
+
+def test_split_mizan_sections_cuts_riwayat_without_bahth_heading():
+    unit = ParsedUnit(
+        locator="سوره 37 - آیات 71-113",
+        text=(
+            "بيان آيات مربوط به ابراهيم\n"
+            "فنظر نظرة فى النجوم\n\n"
+            "رواياتى درباره مراد از قلب سليم\n"
+            "در تفسير قمى\n\n"
+            "حديثى از امام رضا كه مى فرمايد خدا را دو اراده است\n"
+            "براى خدا دو اراده و دو مشيت است"
+        ),
+        source_path="tafsir/al-mizan.txt",
+    )
+    parts = split_mizan_sections(unit)
+    assert [p.locator for p in parts] == [
+        "سوره 37 - آیات 71-113 | بيان",
+        "سوره 37 - آیات 71-113 | بحث روايتى",
+    ]
+    assert "فنظر" in parts[0].text
+    assert "قمى" in parts[1].text
+    assert "امام رضا" in parts[1].text
+    assert "رواياتى" not in parts[0].text
+
+
+def test_resolve_tafsir_quran_refs_picks_duplicate_ayah_in_walk_order():
+    locator = "سوره 37 - آیات 71-113 | بيان"
+    formula = "انه من عبادنا المؤمنين"
+    nuh, nuh_cites = resolve_tafsir_quran_refs(
+        locator,
+        "بيان نوح",
+        [
+            {"text": "سلام على نوح فى العالمين", "kind": "quran"},
+            {"text": formula, "kind": "quran"},
+        ],
+    )
+    assert "37:79" in nuh
+    assert "37:81" in nuh
+    assert "37:111" not in nuh
+    ibrahim, _ = resolve_tafsir_quran_refs(
+        "سوره 37 - آیات 71-113 | بيان 2",
+        "بيان ابراهيم",
+        [
+            {"text": "فنظر نظرة في النجوم", "kind": "quran"},
+            {"text": formula, "kind": "quran"},
+        ],
+    )
+    assert "37:88" in ibrahim
+    assert "37:111" in ibrahim
+    assert "37:81" not in ibrahim
+    assert nuh_cites == []
 
 
 def test_hadith_split_kafi_does_not_glue_bab_title():
@@ -764,10 +924,27 @@ def test_pydantic_tafsir_and_history_schemas():
     tafsir = TafsirExtraction.model_validate(
         {
             "ayah_anchor": "سوره 1 - آیات 1-5",
-            "core_concepts": ["الحمد"],
-            "referenced_hadith": "",
-            "summary_fa": "خط یک\nخط دو",
-            "tafsir_chunk": "متن تفسیر",
+            "mentions": [
+                {
+                    "text": "البسملة",
+                    "type": "concept",
+                    "salience": 0.9,
+                    "evidence": "بسم الله",
+                }
+            ],
+            "cited_hadiths": [
+                {
+                    "source_work": "الكافي",
+                    "speaker": "الإمام الصادق",
+                    "span": "عبادت سه جور است",
+                    "text_ar": "العبادة ثلاثة",
+                    "text_fa": "عبادت سه گونه است",
+                    "text_en": "Worship is of three kinds",
+                }
+            ],
+            "tafsir_ar": "يبدأ الكتاب باسم الله.",
+            "tafsir_fa": "کتاب به نام خدا آغاز می‌شود.",
+            "tafsir_en": "The book opens in the name of God.",
         }
     )
     history = HistoryExtraction.model_validate(
@@ -783,6 +960,19 @@ def test_pydantic_tafsir_and_history_schemas():
         }
     )
     assert tafsir.ayah_anchor.startswith("سوره")
+    assert tafsir.cited_hadiths[0].text_ar.startswith("العبادة")
+    assert tafsir.tafsir_fa.startswith("کتاب")
+    assert "tafsir_chunk" not in TafsirExtraction.model_fields
+    assert "summary_en" not in TafsirExtraction.model_fields
+    assert list(TafsirExtraction.model_fields) == [
+        "ayah_anchor",
+        "mentions",
+        "quotes",
+        "cited_hadiths",
+        "tafsir_ar",
+        "tafsir_fa",
+        "tafsir_en",
+    ]
     assert history.events[0].event_title
 
 
@@ -1188,6 +1378,188 @@ def test_hadith_prompt_asks_for_mentions_not_nodes():
     assert "WHAT IS ASSERTED" in text
     extra = hadith_system_extra("3 - متن\n\n4 - متن آخر طويل بما يكفي للعد.")
     assert "SEPARATE claim" in extra
+
+
+def test_tafsir_prompt_is_a_mention_contract_not_an_echo():
+    text = system_prompt("tafsir")
+    assert "WHAT A MENTION IS" in text
+    assert "KEEP vs STRIP" in text
+    assert "cited_hadiths" in text
+    assert "tafsir_chunk" not in text
+    assert "tafsir_ar" in text
+    assert "tafsir_fa" in text
+    assert "text_ar" in text
+    assert "THREE LANGUAGES" in text
+    assert "علامه / مؤلف" in text
+    assert list(TafsirExtraction.model_fields)[1] == "mentions"
+
+
+def test_process_unit_tafsir_persists_source_not_model_echo(
+    tmp_path: Path, state: StateManager
+):
+    source = "بيان\nآغاز به نام خدا الرحمن الرحيم بما يكفي من الحروف للتجاوز."
+
+    def fake_generate(*, key, prompt, system, model, schema):
+        assert schema is TafsirExtraction
+        return json.dumps(
+            {
+                "ayah_anchor": "سوره 1 - آیات 1-5",
+                "mentions": [
+                    {
+                        "text": "البسملة",
+                        "type": "concept",
+                        "salience": 0.9,
+                        "evidence": "الرحمن الرحيم",
+                    }
+                ],
+                "quotes": [{"text": "بسم الله الرحمن الرحيم", "kind": "quran"}],
+                "tafsir_ar": "يبدأ باسم الله.",
+                "tafsir_fa": "به نام خدا آغاز می‌شود.",
+                "tafsir_en": "Opens in the name of God.",
+            },
+            ensure_ascii=False,
+        )
+
+    agent = GeminiAgent(
+        state,
+        settings=Settings(gemini_min_interval_ms=0),
+        key_pool=KeyPool(state, keys=["test-key"]),
+        generate_fn=fake_generate,
+    )
+    unit = ParsedUnit(
+        "سوره 1 - آیات 1-5 | بيان",
+        source,
+        str(tmp_path / "al-mizan.txt"),
+    )
+    status = process_unit(
+        agent,
+        state,
+        book_id="al-mizan",
+        pipeline="tafsir",
+        unit=unit,
+        output_dir=tmp_path / "phase1",
+        min_chars=10,
+    )
+    assert status == ChunkStatus.PROCESSED_PHASE1
+    written = tmp_path / "phase1" / "al-mizan" / phase1_filename(
+        unit.source_path, unit.locator, "x"
+    )
+    data = json.loads(written.read_text(encoding="utf-8"))
+    assert data["tafsir_chunk"] == source
+    assert "1:1" in data["quran_refs"]
+    assert data["quran_refs"] != ["1:1", "1:2", "1:3", "1:4", "1:5"]
+    assert data["mentions"][0]["text"] == "البسملة"
+
+
+def test_tafsir_finalize_uses_source_text_and_matches_quoted_ayahs():
+    from src.pipelines.tafsir import finalize_payload
+
+    unit = ParsedUnit(
+        locator="سوره 1 - آیات 1-5 | بيان",
+        text="بيان\nآغاز به نام خدا. بسم الله الرحمن الرحيم",
+        source_path="tafsir/al-mizan.txt",
+    )
+    out = finalize_payload(
+        unit,
+        {
+            "ayah_anchor": "سوره 1 - آیات 1-5",
+            "mentions": [
+                {
+                    "text": "البسملة",
+                    "type": "concept",
+                    "salience": 0.9,
+                    "evidence": "بسم الله الرحمن الرحيم",
+                },
+                {
+                    "text": "كربلاء",
+                    "type": "place",
+                    "salience": 0.8,
+                    "evidence": "ليس في الوحدة",
+                },
+            ],
+            "quotes": [{"text": "بسم الله الرحمن الرحيم", "kind": "quran"}],
+            "summary_en": "The book opens in God's name.",
+        },
+    )
+    assert out["tafsir_chunk"] == unit.text
+    assert out["ayah_anchor"] == "سوره 1 - آیات 1-5"
+    assert out["quran_refs"] == ["1:1"]
+    assert "1:2" not in out["quran_refs"]
+    labels = {m["text"] for m in out["mentions"]}
+    assert "البسملة" in labels
+    assert "كربلاء" not in labels
+
+
+def test_tafsir_grounding_allows_arabic_label_on_persian_span():
+    from src.pipelines.grounding import ground_mentions
+
+    unit = "در داستان غزوه بدر سخن مى گويد"
+    kept, rejected = ground_mentions(
+        [
+            {
+                "text": "بدر",
+                "type": "event",
+                "salience": 0.8,
+                "evidence": "غزوه بدر",
+            }
+        ],
+        unit,
+        cut_isnad=False,
+    )
+    assert [m["text"] for m in kept] == ["بدر"]
+    assert rejected == []
+
+
+def test_tafsir_export_comments_on_sura_ayah(tmp_path: Path, state: StateManager):
+    from src.core.neo4j_export import export_neo4j
+    from src.pipelines.llm_processor import chunk_id
+
+    locator = "سوره 1 - آیات 1-5 | بيان"
+    text = "بيان\nتفسير البسملة"
+    cid = chunk_id("al-mizan", locator, text)
+    state.upsert_chunks(
+        [
+            {
+                "id": cid,
+                "book_id": "al-mizan",
+                "pipeline": "tafsir",
+                "locator": locator,
+                "source_path": "tafsir/al-mizan.txt",
+                "text": text,
+            }
+        ]
+    )
+    state.mark(
+        cid,
+        ChunkStatus.PROCESSED_PHASE1,
+        payload={
+            "ayah_anchor": "سوره 1 - آیات 1-5",
+            "quran_refs": ["1:1"],
+            "quran_cites": ["11:40"],
+            "mentions": [],
+            "cited_hadiths": [
+                {
+                    "source_work": "الكافي",
+                    "speaker": "الإمام الصادق",
+                    "span": "عبادت سه جور است",
+                }
+            ],
+            "tafsir_chunk": text,
+        },
+    )
+    dest = export_neo4j(state, dest=tmp_path / "neo4j")
+    edges = [
+        json.loads(line)
+        for line in (dest / "edges.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    comments = {e["end"] for e in edges if e["type"] == "COMMENTS_ON"}
+    cites = {e["end"] for e in edges if e["type"] == "CITES"}
+    assert comments == {"ayah:1:1"}
+    assert cites == {"ayah:11:40"}
+    assert any(
+        e["type"] == "CITES_WORK" and e["end"] == "work:الكافي" for e in edges
+    )
 
 
 def test_schema_forbids_the_model_from_inventing_an_ayah_node():
