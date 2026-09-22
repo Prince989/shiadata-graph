@@ -46,9 +46,9 @@ class LlmKey:
     index: int
 
 
-def key_id_for(secret: str, index: int) -> str:
+def key_id_for(secret: str, index: int, prefix: str = "gemini") -> str:
     digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:10]
-    return f"gemini-{index}-{digest}"
+    return f"{prefix}-{index}-{digest}"
 
 
 def _pacific_tz():
@@ -94,20 +94,29 @@ class KeyPool:
     ):
         self.settings = settings or get_settings()
         self.state = state
-        secrets = keys if keys is not None else self.settings.google_api_keys
+        self.provider = str(getattr(self.settings, "llm_provider", "gemini") or "gemini")
+        self._key_prefix = "groq" if self.provider == "groq" else "gemini"
+        if keys is not None:
+            secrets = keys
+        elif self.provider == "groq":
+            secrets = list(self.settings.groq_api_keys)
+        else:
+            secrets = list(self.settings.google_api_keys)
         self._keys = [
-            LlmKey(id=key_id_for(secret, i), secret=secret, index=i)
+            LlmKey(id=key_id_for(secret, i, self._key_prefix), secret=secret, index=i)
             for i, secret in enumerate(secrets)
         ]
         self._rr = 0
+        label = "Groq" if self.provider == "groq" else "Gemini"
         if not self._keys:
-            logger.warning("No Google API keys configured")
+            logger.warning("No %s API keys configured", label)
         elif len(self._keys) == 1:
             logger.warning(
-                "Only one distinct Gemini key. Rotation is failover only, not extra quota."
+                "Only one distinct %s key. Rotation is failover only, not extra quota.",
+                label,
             )
         else:
-            logger.info("Loaded %d distinct Gemini key(s)", len(self._keys))
+            logger.info("Loaded %d distinct %s key(s)", len(self._keys), label)
         self.clear_quota_locks_for_new_pacific_day()
         self._log_blocked_summary()
 
@@ -144,6 +153,7 @@ class KeyPool:
         now = int(time.time() * 1000)
         auth_ns: list[int] = []
         quota_ns: list[int] = []
+        rate_ns: list[tuple[int, int]] = []
         for key in self._keys:
             record = self.state.get_cooldown(key.id)
             if not record or self._is_healthy(key.id, now):
@@ -152,6 +162,9 @@ class KeyPool:
                 auth_ns.append(key.index + 1)
             elif record["reason"] == FailureKind.QUOTA_EXHAUSTED.value:
                 quota_ns.append(key.index + 1)
+            elif record["reason"] == FailureKind.RATE_LIMITED.value:
+                left = max(0, int(record["retry_at_ms"]) - now)
+                rate_ns.append((key.index + 1, left))
         if auth_ns:
             logger.warning(
                 "Skipping %d auth-invalid key(s) until cooldown ends or state is cleared: %s",
@@ -164,11 +177,21 @@ class KeyPool:
                 len(quota_ns),
                 quota_ns if len(quota_ns) <= 12 else f"{quota_ns[:12]}…",
             )
+        if rate_ns:
+            logger.info(
+                "%s key(s) still on short 429 cooldown: %s",
+                "Groq" if self.provider == "groq" else "Gemini",
+                ", ".join(f"{n} ({left / 1000:.0f}s left)" for n, left in rate_ns),
+            )
 
     def acquire(self) -> LlmKey:
         n = len(self._keys)
         if n == 0:
-            raise AllKeysExhausted("No Gemini API keys configured.")
+            raise AllKeysExhausted(
+                "No Groq API keys configured."
+                if self.provider == "groq"
+                else "No Gemini API keys configured."
+            )
         max_wait = int(getattr(self.settings, "key_acquire_wait_max_ms", 300_000))
         deadline = int(time.time() * 1000) + max_wait
         while True:
@@ -193,12 +216,23 @@ class KeyPool:
                         else:
                             self.state.clear_cooldown(candidate.id)
                     logger.info(
-                        "Using Gemini key %d/%d (%s)",
+                        "Using %s key %d/%d (%s)",
+                        "Groq" if self.provider == "groq" else "Gemini",
                         candidate.index + 1,
                         n,
                         candidate.id,
                     )
                     return candidate
+                record = self.state.get_cooldown(candidate.id) or {}
+                left_ms = max(0, int(record.get("retry_at_ms") or 0) - now)
+                logger.info(
+                    "Skipping %s key %d/%d (%s, %ss left)",
+                    "Groq" if self.provider == "groq" else "Gemini",
+                    candidate.index + 1,
+                    n,
+                    record.get("reason") or "cooling",
+                    max(1, left_ms // 1000) if left_ms else 0,
+                )
             retry_at = self._soonest_waitable_retry_at()
             if retry_at is None:
                 raise AllKeysExhausted(self._unusable_stop_message(now) or FREE_TIER_TODAY)
@@ -207,7 +241,11 @@ class KeyPool:
                 continue
             if now + wait_ms > deadline:
                 break
-            logger.info("All Gemini keys cooling; waiting %s ms", wait_ms)
+            logger.info(
+                "All %s keys cooling; waiting %s ms",
+                "Groq" if self.provider == "groq" else "Gemini",
+                wait_ms,
+            )
             time.sleep(wait_ms / 1000.0)
         raise AllKeysExhausted(
             "All Gemini keys are cooling or disabled. State is saved; resume later."
@@ -369,8 +407,9 @@ class KeyPool:
         previous = self.state.get_cooldown(key.id)
         if kind == FailureKind.RATE_LIMITED:
             strikes = self._next_429_strikes(previous, now)
-            # After more than three 429 hits this Pacific day → overnight lock.
-            if strikes > 3:
+            # Gemini free-tier: more than three 429s this Pacific day → overnight.
+            # Groq 429 is a per-minute output budget; never overnight-lock it.
+            if strikes > 3 and self.provider != "groq":
                 kind = FailureKind.QUOTA_EXHAUSTED
                 retry_after_ms = None
         elif previous and not self._is_healthy(key.id, now):

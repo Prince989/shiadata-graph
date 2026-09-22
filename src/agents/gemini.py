@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from typing import Any, TypeVar
 
 from google import genai
@@ -55,6 +57,24 @@ MENTIONS_FILL_RETRY = (
     "and evidence (verbatim matn span). Do NOT return mentions:[]. "
     "Do NOT return hadith_fa/hadith_en/ravis on this call."
 )
+
+TAFSIR_RETRY = (
+    "\n\nYour previous JSON failed validation. Emit TafsirExtraction JSON only.\n"
+    "Do NOT echo the unit. mentions REQUIRED (prefer 4-12). Each mention is "
+    "{text, type, salience, evidence}. text is an Arabic label; evidence is a "
+    "verbatim span from THIS unit. quotes are Qur'anic spans only. "
+    "cited_hadiths: source_work, speaker, span, text_ar, text_fa, text_en "
+    "(never leave text_ar/text_en empty on a real citation). "
+    "tafsir_ar, tafsir_fa, and tafsir_en are COMPLETE translations of this unit, "
+    "not summaries. tafsir_fa is fluent Persian, not a paste of the source."
+)
+
+GROQ_JSON_TAIL = (
+    "\nReturn JSON only matching the requested schema. Do not wrap in markdown. "
+    "Do not return the Arabic matn."
+)
+
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int | None]:
@@ -142,6 +162,23 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
     return None, None
 
 
+def _short_provider_error(exc: BaseException) -> str:
+    """One-line Groq/Gemini error for logs (status reason, not the full JSON)."""
+    text = str(exc or "").strip()
+    try:
+        data = json.loads(text)
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            code = str(err.get("code") or "").strip()
+            msg = str(err.get("message") or "").strip()
+            if code and msg:
+                return f"{code}: {msg[:240]}"
+            return (msg or code or text)[:280]
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return re.sub(r"\s+", " ", text)[:280]
+
+
 def _parse_retry_after(text: str) -> int | None:
     patterns = (
         r"please retry in (\d+(?:\.\d+)?)\s*ms",
@@ -174,15 +211,22 @@ class GeminiAgent:
         self.pool = key_pool or KeyPool(state, self.settings)
         self._generate_fn = generate_fn
         self._last_call_at: float | None = None
+        self._last_call_at_by_key: dict[str, float] = {}
         self._skip_min_interval = False
         # Optional Phase1DayReport (or any object with record_http).
         self.day_report = day_report
 
     def _configured_models(self) -> list[str]:
+        if self._is_groq():
+            model = (self.settings.groq_model or "").strip()
+            return [model] if model else ["qwen/qwen3.8-27b"]
         models = [m for m in (self.settings.gemini_models or []) if m]
         if not models and self.settings.gemini_model:
             models = [self.settings.gemini_model]
         return models or ["gemini-3.6-flash"]
+
+    def _is_groq(self) -> bool:
+        return str(getattr(self.settings, "llm_provider", "gemini") or "gemini") == "groq"
 
     def _models_for_call(self, model: str | None) -> list[str]:
         if model:
@@ -193,6 +237,8 @@ class GeminiAgent:
         name = getattr(schema, "__name__", "") if schema is not None else ""
         if name in {"MentionsFill", "MentionsFillExhaustive"}:
             return MENTIONS_FILL_RETRY
+        if name == "TafsirExtraction":
+            return TAFSIR_RETRY
         return COMPACT_JSON_RETRY
 
     def complete(
@@ -258,9 +304,14 @@ class GeminiAgent:
                         f"{sys}\n\nPrevious attempt failed validation:\n"
                         f"{last_error}\nFix every listed error in this reply."
                     )
-            self._wait_min_interval()
+            self._wait_min_interval(key)
             try:
-                logger.info("Gemini model %s on %s", current_model, key.id)
+                logger.info(
+                    "%s model %s on %s",
+                    "Groq" if self._is_groq() else "Gemini",
+                    current_model,
+                    key.id,
+                )
                 try:
                     try:
                         text = self._call_once(key, prompt, sys, current_model, schema)
@@ -269,8 +320,16 @@ class GeminiAgent:
                         self._record_http(key, 200)
                         raise
                     self._record_http(key, 200)
+                    logger.info(
+                        "HTTP 200 %s key %d/%d (%s) model=%s",
+                        "Groq" if self._is_groq() else "Gemini",
+                        key.index + 1,
+                        self.pool.pool_size(),
+                        key.id,
+                        current_model,
+                    )
                 finally:
-                    self._mark_call()
+                    self._mark_call(key)
                 if schema is not None:
                     data = json.loads(text) if isinstance(text, str) else text
                     if isinstance(data, str):
@@ -294,21 +353,46 @@ class GeminiAgent:
                 kind, retry_ms = classify_provider_error(exc)
                 if kind is None:
                     raise
+                if (
+                    kind == FailureKind.RATE_LIMITED
+                    and self._is_groq()
+                    and not retry_ms
+                ):
+                    retry_ms = int(
+                        getattr(self.settings, "groq_min_interval_ms", 75_000) or 75_000
+                    )
                 if kind == FailureKind.SERVER_ERROR:
+                    status = 503
                     self._record_http(key, 503)
                 elif kind in {FailureKind.RATE_LIMITED, FailureKind.QUOTA_EXHAUSTED}:
+                    status = 429
                     self._record_http(key, 429)
                     # Day-report 429 count is the source of truth (survives short
                     # cooldowns / successes). Lock overnight after more than 3.
                     if (
                         kind == FailureKind.RATE_LIMITED
+                        and not self._is_groq()
                         and self._day_429_count(key) > 3
                     ):
                         kind = FailureKind.QUOTA_EXHAUSTED
                         retry_ms = None
                 elif kind == FailureKind.AUTH_INVALID:
+                    status = 401
                     self._record_http(key, 401)
-                logger.warning("Gemini call failed on %s (%s): %s", key.id, current_model, exc)
+                elif kind == FailureKind.TIMEOUT:
+                    status = 0
+                else:
+                    status = 0
+                logger.warning(
+                    "HTTP %s %s key %d/%d (%s) model=%s: %s",
+                    status or kind.value,
+                    "Groq" if self._is_groq() else "Gemini",
+                    key.index + 1,
+                    self.pool.pool_size(),
+                    key.id,
+                    current_model,
+                    _short_provider_error(exc),
+                )
                 if kind == FailureKind.SERVER_ERROR:
                     msg = str(exc).lower()
                     compact = msg.replace("_", "").replace("-", "").replace(" ", "")
@@ -380,21 +464,41 @@ class GeminiAgent:
             return int(count(key.index))
         return 0
 
-    def _wait_min_interval(self) -> None:
+    def _wait_min_interval(self, key: LlmKey | None = None) -> None:
         if self._skip_min_interval:
             self._skip_min_interval = False
             return
-        interval_ms = int(getattr(self.settings, "gemini_min_interval_ms", 0) or 0)
-        if interval_ms <= 0 or self._last_call_at is None:
+        if self._is_groq():
+            interval_ms = int(getattr(self.settings, "groq_min_interval_ms", 0) or 0)
+            last_at = (
+                self._last_call_at_by_key.get(key.id) if key is not None else None
+            )
+        else:
+            interval_ms = int(getattr(self.settings, "gemini_min_interval_ms", 0) or 0)
+            last_at = self._last_call_at
+        if interval_ms <= 0 or last_at is None:
             return
-        wait_s = interval_ms / 1000.0 - (time.monotonic() - self._last_call_at)
+        wait_s = interval_ms / 1000.0 - (time.monotonic() - last_at)
         if wait_s <= 0:
             return
-        logger.info("Waiting %.1fs before next Gemini call", wait_s)
+        if self._is_groq() and key is not None:
+            logger.info(
+                "Waiting %.1fs before next Groq call on key %d/%d (%s)",
+                wait_s,
+                key.index + 1,
+                self.pool.pool_size(),
+                key.id,
+            )
+        else:
+            logger.info("Waiting %.1fs before next Gemini call", wait_s)
         time.sleep(wait_s)
 
-    def _mark_call(self) -> None:
-        self._last_call_at = time.monotonic()
+    def _mark_call(self, key: LlmKey | None = None) -> None:
+        now = time.monotonic()
+        if self._is_groq() and key is not None:
+            self._last_call_at_by_key[key.id] = now
+            return
+        self._last_call_at = now
 
     def _call_once(
         self,
@@ -409,9 +513,16 @@ class GeminiAgent:
                 key=key,
                 prompt=prompt,
                 system=system,
-                model=model or self.settings.gemini_model,
+                model=model
+                or (
+                    self.settings.groq_model
+                    if self._is_groq()
+                    else self.settings.gemini_model
+                ),
                 schema=schema,
             )
+        if self._is_groq():
+            return self._call_groq(key, prompt, system, model, schema)
         previous = os.environ.get("GOOGLE_API_KEY")
         os.environ["GOOGLE_API_KEY"] = key.secret
         try:
@@ -442,6 +553,76 @@ class GeminiAgent:
         if not text:
             raise StructuredOutputError("empty Gemini response")
         return text
+
+    def _call_groq(
+        self,
+        key: LlmKey,
+        prompt: str,
+        system: str | None,
+        model: str | None,
+        schema: type[BaseModel] | None,
+    ) -> str:
+        sys = system or ""
+        if schema is not None:
+            sys = f"{sys}{GROQ_JSON_TAIL}"
+        messages: list[dict[str, str]] = []
+        if sys.strip():
+            messages.append({"role": "system", "content": sys})
+        messages.append({"role": "user", "content": prompt})
+        body = json.dumps(
+            {
+                "model": model or self.settings.groq_model,
+                "messages": messages,
+                "temperature": 0.6,
+                "max_completion_tokens": int(
+                    getattr(self.settings, "groq_max_completion_tokens", 16_384)
+                    or 16_384
+                ),
+                "top_p": 0.95,
+                "reasoning_effort": str(
+                    getattr(self.settings, "groq_reasoning_effort", "medium")
+                    or "medium"
+                ),
+                "stream": False,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            GROQ_CHAT_URL,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {key.secret}",
+                "Content-Type": "application/json",
+                "User-Agent": "shiadata-graph",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.settings.gemini_timeout_s) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", "replace")
+            text = err_body or str(exc)
+            if exc.code == 429:
+                raise RateLimited(text) from exc
+            if exc.code in {401, 403}:
+                raise AuthInvalid(text) from exc
+            if exc.code in {404, 500, 502, 503, 504}:
+                raise ProviderServerError(text) from exc
+            raise ProviderServerError(f"HTTP {exc.code}: {text}") from exc
+        except urllib.error.URLError as exc:
+            raise ProviderServerError(str(exc)) from exc
+        choices = payload.get("choices") or []
+        if not choices:
+            raise StructuredOutputError("empty Groq response")
+        choice = choices[0] or {}
+        finish = str(choice.get("finish_reason") or "").lower()
+        if finish in {"length", "max_tokens"}:
+            raise StructuredOutputError(f"response truncated ({finish})")
+        message = choice.get("message") or {}
+        text = message.get("content")
+        if not text:
+            raise StructuredOutputError("empty Groq response")
+        return str(text)
 
 
 def _finish_reason_name(response: Any) -> str:

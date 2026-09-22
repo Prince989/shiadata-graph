@@ -49,6 +49,32 @@ class Mention(BaseModel):
     salience: float = Field(default=0.5, ge=0.0, le=1.0)
     evidence: str = ""
 
+    @field_validator("salience", mode="before")
+    @classmethod
+    def _parse_salience(cls, value: object) -> float:
+        """Qwen often emits high/medium/low instead of 0.0-1.0."""
+        if isinstance(value, bool):
+            return 0.9 if value else 0.3
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value or "").strip().lower().replace("_", " ")
+        words = {
+            "very high": 0.95,
+            "high": 0.9,
+            "primary": 0.9,
+            "medium": 0.6,
+            "moderate": 0.6,
+            "low": 0.3,
+            "secondary": 0.4,
+            "very low": 0.2,
+        }
+        if text in words:
+            return words[text]
+        try:
+            return float(text)
+        except ValueError:
+            return 0.5
+
     @field_validator("text")
     @classmethod
     def _clean_text(cls, value: str) -> str:

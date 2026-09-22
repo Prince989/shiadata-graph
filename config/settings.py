@@ -20,10 +20,13 @@ _KEY_PATTERNS = (
     re.compile(r"^GOOGLE_API_KEY_?(\d*)$"),
     re.compile(r"^GEMINI_API_KEY_?(\d*)$"),
 )
+_GROQ_KEY_PATTERN = re.compile(r"^GROQ_API_KEY_?(\d*)$")
 
 DEFAULT_GEMINI_MODELS = (
     "gemini-3.6-flash",
 )
+DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
+VALID_LLM_PROVIDERS = ("gemini", "groq")
 
 
 def parse_gemini_models(raw: str) -> list[str]:
@@ -80,6 +83,42 @@ def collect_google_keys(env: dict[str, str] | None = None) -> list[str]:
     return ordered
 
 
+def collect_groq_keys(env: dict[str, str] | None = None) -> list[str]:
+    """Collect Groq secrets from GROQ_API_KEY / GROQ_API_KEY1… env vars.
+
+    Duplicate secret values are collapsed once, in index order. Bare
+    GROQ_API_KEY is index 0 (same slot as GROQ_API_KEY0).
+    """
+    sources = env or collect_env_maps()
+    found: dict[int, str] = {}
+    for name, value in sources.items():
+        secret = (value or "").strip()
+        if not secret:
+            continue
+        match = _GROQ_KEY_PATTERN.match(name)
+        if not match:
+            continue
+        index = int(match.group(1)) if match.group(1) else 0
+        found[index] = secret
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for index in sorted(found):
+        key = found[index]
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def parse_llm_provider(raw: object) -> str:
+    value = str(raw or "gemini").strip().lower()
+    if value not in VALID_LLM_PROVIDERS:
+        raise ValueError(
+            f"LLM_PROVIDER must be one of {', '.join(VALID_LLM_PROVIDERS)}"
+        )
+    return value
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(LOCAL_ENV) if LOCAL_ENV.exists() else None,
@@ -89,9 +128,15 @@ class Settings(BaseSettings):
     )
 
     openai_api_key: str = ""
+    llm_provider: str = "gemini"
     google_api_keys: list[str] = Field(default_factory=list)
+    groq_api_keys: list[str] = Field(default_factory=list)
     gemini_model: str = DEFAULT_GEMINI_MODELS[0]
     gemini_models: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    groq_model: str = DEFAULT_GROQ_MODEL
+    groq_reasoning_effort: str = "medium"
+    groq_max_completion_tokens: int = 16_384
+    groq_min_interval_ms: int = 75_000
     embedding_model: str = "text-embedding-3-small"
     log_level: str = "INFO"
 
@@ -119,6 +164,11 @@ class Settings(BaseSettings):
     skip_min_chars: int = 40
     gemini_max_output_tokens: int = 65_536
 
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _parse_llm_provider_env(cls, value: object) -> str:
+        return parse_llm_provider(value)
+
     @field_validator("gemini_models", mode="before")
     @classmethod
     def _parse_gemini_models_env(cls, value: object) -> object:
@@ -134,6 +184,15 @@ class Settings(BaseSettings):
         collected = collect_google_keys(env)
         if collected:
             object.__setattr__(self, "google_api_keys", collected)
+        groq_keys = collect_groq_keys(env)
+        if groq_keys:
+            object.__setattr__(self, "groq_api_keys", groq_keys)
+        if os.environ.get("LLM_PROVIDER"):
+            object.__setattr__(
+                self, "llm_provider", parse_llm_provider(os.environ["LLM_PROVIDER"])
+            )
+        if env.get("GROQ_MODEL"):
+            object.__setattr__(self, "groq_model", env["GROQ_MODEL"].strip())
         models: list[str] = []
         if self.gemini_models:
             models = [str(m).strip() for m in self.gemini_models if str(m).strip()]
@@ -154,3 +213,11 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def apply_llm_provider(provider: str | None) -> Settings:
+    """CLI override: set LLM_PROVIDER and rebuild the cached Settings."""
+    if provider:
+        os.environ["LLM_PROVIDER"] = parse_llm_provider(provider)
+        get_settings.cache_clear()
+    return get_settings()

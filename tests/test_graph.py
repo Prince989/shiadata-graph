@@ -673,10 +673,16 @@ def test_gemini_waits_20s_between_calls(state: StateManager, monkeypatch: pytest
     def fake_generate(**_kwargs):
         return "ok"
 
+    settings = Settings(
+        _env_file=None,
+        llm_provider="gemini",
+        gemini_min_interval_ms=20_000,
+        gemini_max_attempts=1,
+    )
     agent = GeminiAgent(
         state,
-        settings=Settings(gemini_min_interval_ms=20_000, gemini_max_attempts=1),
-        key_pool=KeyPool(state, keys=["k"]),
+        settings=settings,
+        key_pool=KeyPool(state, settings, keys=["k"]),
         generate_fn=fake_generate,
     )
     assert agent.complete("a") == "ok"
@@ -692,10 +698,16 @@ def test_gemini_min_interval_actually_sleeps(state: StateManager):
     def fake_generate(**_kwargs):
         return "ok"
 
+    settings = Settings(
+        _env_file=None,
+        llm_provider="gemini",
+        gemini_min_interval_ms=400,
+        gemini_max_attempts=1,
+    )
     agent = GeminiAgent(
         state,
-        settings=Settings(gemini_min_interval_ms=400, gemini_max_attempts=1),
-        key_pool=KeyPool(state, keys=["k"]),
+        settings=settings,
+        key_pool=KeyPool(state, settings, keys=["k"]),
         generate_fn=fake_generate,
     )
     t0 = time_mod.monotonic()
@@ -715,15 +727,18 @@ def test_gemini_503_skips_to_next_key(state: StateManager, monkeypatch: pytest.M
             raise RuntimeError("503 UNAVAILABLE. high demand")
         return "ok"
 
+    settings = Settings(
+        _env_file=None,
+        llm_provider="gemini",
+        gemini_min_interval_ms=0,
+        gemini_max_attempts=3,
+        gemini_models=["gemini-3.6-flash"],
+        key_cooldown_base_ms=1_000,
+    )
     agent = GeminiAgent(
         state,
-        settings=Settings(
-            gemini_min_interval_ms=0,
-            gemini_max_attempts=3,
-            gemini_models=["gemini-3.6-flash"],
-            key_cooldown_base_ms=1_000,
-        ),
-        key_pool=KeyPool(state, keys=["a", "b"]),
+        settings=settings,
+        key_pool=KeyPool(state, settings, keys=["a", "b"]),
         generate_fn=fake_generate,
     )
     assert agent.complete("x") == "ok"

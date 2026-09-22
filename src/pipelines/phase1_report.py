@@ -139,10 +139,14 @@ class Phase1DayReport:
         report_dir: Path | None = None,
         *,
         live: bool = True,
+        provider: str = "gemini",
+        model: str = "",
     ):
         self.day = day or pacific_calendar_date()
         self.report_dir = report_dir or REPORT_DIR
         self.live = live
+        self.provider = str(provider or "gemini").strip().lower() or "gemini"
+        self.model = str(model or "").strip()
         self._keys: dict[int, _KeyStats] = {}
         self._last_ok_key: int | None = None
         self._key_pool = None
@@ -175,13 +179,20 @@ class Phase1DayReport:
             return None
         return self._key_pool
 
+    def _report_stem(self) -> str:
+        day = self.day.isoformat()
+        if self.provider == "groq":
+            slug = re.sub(r"[^\w.\-]+", "-", self.model or "qwen").strip("-")
+            return f"{day}-{slug}"
+        return day
+
     @property
     def json_path(self) -> Path:
-        return self.report_dir / f"{self.day.isoformat()}.json"
+        return self.report_dir / f"{self._report_stem()}.json"
 
     @property
     def md_path(self) -> Path:
-        return self.report_dir / f"{self.day.isoformat()}.md"
+        return self.report_dir / f"{self._report_stem()}.md"
 
     def _key(self, key_no: int) -> _KeyStats:
         # Display as 1-based key number (matches "Using Gemini key 1/4").
@@ -274,9 +285,11 @@ class Phase1DayReport:
         if pool is None:
             return
         # Heal missed escalations: day-report 429 > 3 ⇒ overnight lock.
-        over = self.key_indexes_over_429(3)
-        if over:
-            pool.lock_indexes_for_day(over)
+        # Groq 429 is a per-minute token budget; never overnight-lock from it.
+        if self.provider != "groq":
+            over = self.key_indexes_over_429(3)
+            if over:
+                pool.lock_indexes_for_day(over)
         labels = pool.lock_labels()
         for key_no, label in labels.items():
             if label:
@@ -293,6 +306,8 @@ class Phase1DayReport:
         self.report_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "date": self.day.isoformat(),
+            "provider": self.provider,
+            "model": self.model,
             "pacific_day_start_ms": pacific_day_start_ms(),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "keys": {str(k): v.to_dict() for k, v in sorted(self._keys.items())},
@@ -308,6 +323,13 @@ class Phase1DayReport:
     def render_markdown(payload: dict) -> str:
         day = payload.get("date") or ""
         updated = payload.get("updated_at") or ""
+        provider = str(payload.get("provider") or "").strip()
+        model = str(payload.get("model") or "").strip()
+        title = f"# Phase 1 - {day}"
+        if model:
+            title = f"{title} — {model}"
+        elif provider:
+            title = f"{title} — {provider}"
         keys = payload.get("keys") or {}
 
         headers = ["key", "503", "200", "429", "401", "lock", "hadiths"]
@@ -346,17 +368,24 @@ class Phase1DayReport:
                     hadith_sections.append("")
 
         lines = [
-            f"# Phase 1 - {day}",
+            title,
             "",
             f"Updated `{updated}`",
             "",
+        ]
+        if provider or model:
+            lines.append(f"provider `{provider or '-'}`  model `{model or '-'}`")
+            lines.append("")
+        lines.extend(
+            [
             "_lock: `-` free, `quota` overnight, `auth` dead, `rate` short 429, `wait` net/503_",
             "",
             "```",
             *_ascii_table(headers, rows, aligns),
             "```",
             "",
-        ]
+            ]
+        )
         if hadith_sections:
             lines.append("## Processed hadiths")
             lines.append("")

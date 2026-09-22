@@ -14,7 +14,7 @@ from pathlib import Path
 import typer
 
 from config.paths import OUTPUT_DIR
-from config.settings import get_settings
+from config.settings import apply_llm_provider, get_settings
 from src.agents.embeddings import EmbeddingAgent
 from src.agents.errors import AllKeysExhausted, ProviderServerError
 from src.agents.gemini import GeminiAgent
@@ -39,9 +39,16 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 
 def _setup_logging() -> None:
     settings = get_settings()
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        encoding="utf-8",
+        errors="replace",
+        force=True,
     )
 
 
@@ -51,6 +58,16 @@ def _stack(day_report: Phase1DayReport | None = None) -> tuple[StateManager, Gem
     gemini = GeminiAgent(state, settings, day_report=day_report)
     embeddings = EmbeddingAgent(settings, state)
     return state, gemini, embeddings
+
+
+def _phase1_report() -> Phase1DayReport:
+    settings = get_settings()
+    model = (
+        settings.groq_model
+        if settings.llm_provider == "groq"
+        else settings.gemini_model
+    )
+    return Phase1DayReport(provider=settings.llm_provider, model=model)
 
 
 @app.command("run-phase1")
@@ -76,10 +93,16 @@ def phase1(
         "--volume",
         help="With --page, restrict to جلد N (e.g. --volume 1)",
     ),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="LLM backend for this command: gemini or groq (overrides LLM_PROVIDER)",
+    ),
 ) -> None:
-    """Parse a book and run Gemini structured extraction."""
+    """Parse a book and run structured extraction."""
     _setup_logging()
-    report = Phase1DayReport()
+    apply_llm_provider(provider)
+    report = _phase1_report()
     typer.echo(
         f"phase1 day report (live, Pacific free-tier day {report.day.isoformat()}): "
         f"{report.md_path}"
@@ -102,7 +125,7 @@ def phase1(
         raise typer.Exit(code=2) from exc
     except ProviderServerError as exc:
         typer.echo(
-            "Gemini temporarily unavailable (503/5xx). "
+            "LLM provider temporarily unavailable (503/5xx). "
             "Progress saved — re-run the same command later.\n"
             f"{exc}",
             err=True,
@@ -118,9 +141,15 @@ def phase1(
 @app.command("run-phase2")
 def phase2(
     book: str = typer.Option(..., "--book"),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="LLM backend for this command: gemini or groq (overrides LLM_PROVIDER)",
+    ),
 ) -> None:
     """Embed, canonicalise duplicates, and classify SUPPORTS/CONTRADICTS/EXCEPTS."""
     _setup_logging()
+    apply_llm_provider(provider)
     state, gemini, embeddings = _stack()
     try:
         stats = run_phase2(book, state, gemini, embeddings)
@@ -129,7 +158,7 @@ def phase2(
         raise typer.Exit(code=2) from exc
     except ProviderServerError as exc:
         typer.echo(
-            "Gemini temporarily unavailable (503/5xx). "
+            "LLM provider temporarily unavailable (503/5xx). "
             "Progress saved — re-run the same command later.\n"
             f"{exc}",
             err=True,
@@ -160,8 +189,11 @@ def status(
     state = StateManager(settings.state_db)
     typer.echo(state.counts(book))
     typer.echo(
+        f"provider={settings.llm_provider} "
         f"gemini_keys={len(settings.google_api_keys)} "
-        f"models={','.join(settings.gemini_models)}"
+        f"groq_keys={len(settings.groq_api_keys)} "
+        f"models={','.join(settings.gemini_models)} "
+        f"groq_model={settings.groq_model}"
     )
     typer.echo(f"embed_model={settings.embedding_model}")
     typer.echo(f"raw_data={settings.raw_data_dir}")
@@ -265,6 +297,11 @@ def adjudicate_cmd(
     apply: bool = typer.Option(False, "--apply", help="Write accepted verdicts to the catalog"),
     limit: int | None = typer.Option(None, "--limit", help="Max orphans to ask about"),
     ask: bool = typer.Option(True, "--ask/--no-ask", help="Call Gemini for uncached orphans"),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="LLM backend for this command: gemini or groq (overrides LLM_PROVIDER)",
+    ),
 ) -> None:
     """Layer 4: judge the labels no catalog or morphology could resolve.
 
@@ -273,6 +310,7 @@ def adjudicate_cmd(
     and replay the cache without spending anything.
     """
     _setup_logging()
+    apply_llm_provider(provider)
     from src.pipelines import adjudicate as adj
 
     orphans = adj.find_orphans()
@@ -300,6 +338,11 @@ def enrich_aliases(
     apply: bool = typer.Option(False, "--apply", help="Write config/derived_aliases.yaml"),
     limit: int | None = typer.Option(None, "--limit", help="Max concepts to ask about"),
     ask: bool = typer.Option(False, "--ask/--no-ask", help="Call Gemini for uncached concepts"),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="LLM backend for this command: gemini or groq (overrides LLM_PROVIDER)",
+    ),
 ) -> None:
     """Find the other wordings each concept is written in.
 
@@ -314,6 +357,7 @@ def enrich_aliases(
     the cache and see the plan for free.
     """
     _setup_logging()
+    apply_llm_provider(provider)
     from src.pipelines import aliases as al
 
     concepts = al.catalog_concepts()
