@@ -7,12 +7,35 @@ is still open. Project root: `D:\shiadata.dev\shiadata-graph`.
 
 An ETL that turns classical Shi'i hadith books (Folklib-format `.txt`, al-Kafi
 vols 1–8 on disk) into a knowledge graph. Phase 1 sends each printed page to
-Gemini for structured extraction (Arabic matn, Persian/English translations,
-isnad, and `semantic_nodes`). Phase 2 embeds, deduplicates, and classifies
-edges. `export-neo4j` writes JSONL + Cypher.
+an LLM for structured extraction (Arabic matn, Persian/English translations,
+isnad, and **mentions**). Identity of those mentions is a later pass.
+Phase 2 embeds hadiths, deduplicates narrations, and classifies edges.
+`export-neo4j` writes JSONL + Cypher.
 
-`semantic_nodes` are the graph's topic nodes. They are what makes two hadiths in
-two different books reachable from each other.
+## Node identity (agreed workflow)
+
+Mentions become nodes. A node is not removed because it is rare, and it is not
+absorbed into another wording at extraction time.
+
+1. **Unresolved nodes.** One node per distinct mention surface. A compound may
+   be a **child** of a known parent (`عقل المرء` → `العقل`). The child stays.
+   Catalog aliases and shared Arabic roots are not a reason to delete the
+   surface here.
+2. **Pre-phase 2.** Embed each unresolved node together with the hadith (the
+   evidence span inside the matn) so the sense is the sentence, not the label.
+   Cluster that embedding and **merge same-meaning nodes**
+   (`محبة أهل البيت` with `إرادة أهل البيت`). Merge adds a shared parent; both
+   original labels remain as children.
+3. **Phase 2** uses the merged keys when it compares hadiths. It does not
+   invent synonymy.
+
+`resolve-nodes` in the tree still clusters by catalog and root signature. That
+pass should only emit unresolved nodes plus parent links. The synonym merge is
+the embedding step, and it is not implemented yet.
+
+The sections below record how the graph got here (closed vocabulary, then
+mentions). Where they say a string is collapsed into a catalog term, that is
+the old gate. The workflow above replaces it for graph membership.
 
 ## The problem that was diagnosed
 

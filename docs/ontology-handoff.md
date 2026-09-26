@@ -149,10 +149,19 @@ actually call Gemini; add `--apply` to write accepted verdicts.
 python main.py resolve-nodes
 ```
 
-Separate pass, runs between phase 1 and phase 2. Resolves every mention in the
-corpus into canonical nodes. Identity is a property of the **whole corpus** —
-knowing `عقل المرء` is `العقل` requires having seen `العقل` elsewhere — so it
-cannot be settled while extracting a single page.
+Separate pass, between phase 1 and phase 2. It turns mentions into
+**unresolved nodes**: one node per distinct surface. A node is not deleted and
+is not merged into another label here. A narrower wording becomes a **child**
+of a broader one (`عقل المرء` under `العقل`) only after the parent has been
+seen elsewhere in the corpus, which a single page cannot know. Both nodes stay.
+
+Same-meaning labels with different wording are a later step, still before
+phase 2: embed each unresolved node together with the hadith (or evidence span)
+that produced it, then merge the cluster (`محبة أهل البيت` with
+`إرادة أهل البيت`). The original labels remain children of the merged node.
+Phase 2 compares hadiths; it does not decide node synonymy. Today's
+`resolve-nodes` still clusters by catalog and morphology; that clustering
+should stop at parent links, and the synonym merge is not implemented yet.
 
 ---
 
@@ -160,9 +169,11 @@ cannot be settled while extracting a single page.
 
 Every one of these is a bug that shipped. Do not undo them without reading why.
 
-**Mentions vs nodes.** The model reports *observations* on a page. Identity is
-resolved corpus-wide afterwards, never during extraction. This is why
-`resolve-nodes` is its own phase.
+**Mentions vs unresolved nodes vs merged nodes.** The model reports
+*observations* on a page. `resolve-nodes` keeps each surface as its own node
+and may only attach a parent. Same-meaning merges happen afterwards, from
+embeddings of the node inside its hadith, and they keep the original labels as
+children. Neither step runs during extraction.
 
 **Fixes go in the scripts, not the prompt.** A standing constraint from the
 project owner. With thousands of narrations, encoding exceptions in the prompt

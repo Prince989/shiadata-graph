@@ -161,12 +161,20 @@ and `entities.yaml` now express only what clustering *cannot* discover:
 `قتل النفس` → `الانتحار` share no root and no letters, so only a human-written
 alias joins them.
 
-**3. Compound parent.** A multi-word mention always keeps its own identity.
-If a known topic is named inside it, `parent` points there: `عقل المرء` hangs
-under `العقل`. `df` is statistical weight for Phase 2 ranking / IDF — never a
-reason to delete or absorb the node. Incremental ingest (Al-Kafi now, more
-volumes later) means today's `df=1` may be next month's `df=15`.
+**3. Compound parent — unresolved nodes.** A mention always keeps its own
+identity. These nodes are **unresolved nodes**: nothing is deleted or merged
+into another label at this step. If a known topic is named inside a compound,
+`parent` points there and the mention stays a child: `عقل المرء` hangs under
+`العقل`. `df` is statistical weight for ranking / IDF — never a reason to
+delete or absorb the node. Incremental ingest (Al-Kafi now, more volumes later)
+means today's `df=1` may be next month's `df=15`.
 `compound_threshold()` remains in the API but is unused for keep-vs-fold.
+
+Same-meaning labels that share no parent wording (`محبة أهل البيت` and
+`إرادة أهل البيت`) are **not** joined here. Root-signature and curated-alias
+collapses in the current resolver are stronger than this rule; the agreed
+workflow is parent links only, with synonym merge deferred to the embedding
+step below.
 
 Concepts and entities use **different identity rules**, which matters:
 - concept compounds are *narrower topics* → keep the node, set `parent`
@@ -319,15 +327,24 @@ primary/secondary onto salience.
 ## Pipeline
 
 ```
-run-phase1     → mentions per hadith
-resolve-nodes  → corpus-wide identity, writes nodes back + data/output/phase1/nodes.json
-run-phase2     → candidate pairs → LLM relation judgement
+run-phase1       → mentions per hadith
+resolve-nodes    → unresolved nodes (one per mention surface; parent/child only)
+                   writes nodes back + data/output/phase1/nodes.json
+pre-phase 2      → embed each unresolved node with its hadith / evidence span;
+                   merge same-meaning nodes; keep both labels as children
+run-phase2       → hadith embed, duplicate narrations, SUPPORTS/CONTRADICTS/EXCEPTS
 export-neo4j
 ```
 
 `resolve-nodes` **must** be a separate pass: hanging `عقل المرء` under `العقل`
 requires having seen `العقل` elsewhere, which per-page extraction cannot do.
-Both remain distinct nodes.
+Both remain distinct nodes. It must not treat that parent link as a merge.
+
+The synonym merge is its own step, before Phase 2, because two labels can mean
+the same thing with no shared word (`محبة أهل البيت` / `إرادة أهل البيت`).
+The embedding is of the node **in the hadith**, not of the label alone.
+Phase 2 does not decide that synonymy. The embedding merge is not implemented
+yet; today's `resolve-nodes` still clusters by catalog and morphology.
 
 `python check_nodes.py` demonstrates all of it on real data, free and instantly.
 

@@ -1,8 +1,28 @@
 # shiadata-graph
 
 Resumable ETL for Shia classical texts: parse the local corpus, extract structured
-records with Gemini 3.5 Flash, embed with OpenAI, canonicalise duplicate hadiths,
-classify SUPPORTS / CONTRADICTS / EXCEPTS edges, and export Neo4j-ready JSONL.
+records, turn mentions into graph nodes, embed with OpenAI, canonicalise duplicate
+hadiths, classify SUPPORTS / CONTRADICTS / EXCEPTS edges, and export Neo4j-ready JSONL.
+
+## Node identity
+
+Phase 1 writes **mentions** (what this narration is about). It does not decide
+which mentions are the same idea.
+
+1. **Unresolved nodes.** Each distinct mention stays its own node. Nothing is
+   deleted or folded into another label. A narrower wording may be linked as a
+   **child** of a broader one (`عقل المرء` under `العقل`). Both nodes remain.
+2. **Pre-phase 2 merge.** Those unresolved nodes are embedded **with the hadith
+   (or evidence span) that produced them**, not as bare labels. Nodes that mean
+   the same thing in that context are merged (`محبة أهل البيت` and
+   `إرادة أهل البيت`). The original wordings stay as children of the merged
+   node; the merge does not erase them.
+3. **Phase 2** embeds hadiths, confirms duplicate narrations, and classifies
+   SUPPORTS / CONTRADICTS / EXCEPTS. It does not decide node synonymy.
+
+`resolve-nodes` today still clusters by catalog and morphology. The two-step
+identity above is the workflow those clusters must follow; synonym merges belong
+in the embedding step, not in per-page extraction.
 
 ## Agents (reuse these; do not open SDK clients in new phases)
 

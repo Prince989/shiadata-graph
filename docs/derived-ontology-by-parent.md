@@ -1,5 +1,11 @@
 # Derived ontology — 1550 concepts grouped by parent
 
+Chapter-heading catalog, not the hadith mention graph. Mentions become
+unresolved nodes and stay even when rare; a parent link does not delete the
+child. Same-meaning mention labels (`محبة أهل البيت` / `إرادة أهل البيت`) are
+merged in a pre-phase-2 embedding of the node inside its hadith. The groups
+below are printed kitab/bab topics.
+
 Generated from `config/derived_ontology.yaml`. `xN` = how many headings proposed the term.
 
 `broader` means **is a kind of**, not *was printed under*. An edge survives only when

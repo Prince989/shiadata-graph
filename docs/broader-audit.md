@@ -1,5 +1,11 @@
 # `broader` audit — IS-A verdicts
 
+This file audits **kitab/bab headings** in `derived_ontology.yaml`. It is not
+the mention graph. Mention surfaces become unresolved nodes (kept, optionally a
+child of a parent). Same-meaning mention labels are merged later by embedding
+each node with its hadith, before phase 2. A `broader` edge here is "is a kind
+of" between chapter topics, not that embedding merge.
+
 Audit of every surviving `broader` edge in `config/derived_ontology.yaml` after
 the majority-vote rewrite. **831 edges across 41 parents.**
 
