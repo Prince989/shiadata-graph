@@ -56,7 +56,15 @@ class Mention(BaseModel):
         if isinstance(value, bool):
             return 0.9 if value else 0.3
         if isinstance(value, (int, float)):
-            return float(value)
+            number = float(value)
+            if number > 1.0:
+                # Qwen often uses a 1-5 scale instead of 0-1.
+                if number <= 5.0:
+                    return round(number / 5.0, 4)
+                return 1.0
+            if number < 0.0:
+                return 0.0
+            return number
         text = str(value or "").strip().lower().replace("_", " ")
         words = {
             "very high": 0.95,

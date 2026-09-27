@@ -18,6 +18,36 @@ HADITH_START_RE = re.compile(
     re.MULTILINE,
 )
 
+# Kulayni headings and Folklib colophons are not matn. A last `N -` on a page
+# used to run to the banner, so hadith 9 swallowed the next باب and hadith 5
+# swallowed "تم كتاب العشرة" plus the editor's thanks.
+_NUMBER_PREFIX = r"(?:[٠-٩0-9]{1,4}\s*[ـ\-–—]\s*)?"
+_HEADING_LINE = re.compile(
+    rf"^{_NUMBER_PREFIX}(?:كِتَابُ|كتاب|بَابُ|بَابٌ|باب)(?:\s|$)"
+)
+_COLOPHON_LINE = re.compile(
+    r"^(?:"
+    r"(?:تَمَّ|تم)\s+(?:كِتَابُ|كتاب)|"
+    r"\(?\s*هذا آخر|"
+    r"شكر\s+و\s+تقدير|"
+    r"أقد[ّ]?م شكري|"
+    r"على أكبر الغفار|"
+    r"\(فى تأييد|"
+    r"قد كن[ّ]?ا وعدنا"
+    r")"
+)
+_EDITORIAL_PAGE = re.compile(
+    r"شكر\s+و\s+تقدير|"
+    r"(?:تَمَّ|تم)\s+(?:كِتَابُ|كتاب)|"
+    r"هذا آخر|"
+    r"فى تأييد|"
+    r"قد كن[ّ]?ا وعدنا|"
+    r"أقد[ّ]?م شكري|"
+    r"العلّامة الطباطبائي"
+)
+_MAX_HEADING_JOIN = 2
+_MAX_HEADING_CHARS = 120
+
 _MIN_HADITH_CHARS = 20
 
 # Folklib editor notes: ASCII [1] at line start. Do not touch Wasa'il "[ ١٥٤٩٥ ]".
@@ -128,25 +158,133 @@ def strip_folklib_footnotes(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", joined).strip()
 
 
+def _heading_candidate(stripped: str) -> bool:
+    if not stripped or len(stripped) > _MAX_HEADING_CHARS:
+        return False
+    if not _HEADING_LINE.match(stripped):
+        return False
+    if re.search(r"[،.؛!؟]", stripped):
+        return False
+    return True
+
+
+def _colophon_line(stripped: str) -> bool:
+    return bool(stripped and _COLOPHON_LINE.match(stripped))
+
+
+def _start_token(stripped: str) -> str | None:
+    match = HADITH_START_RE.match(stripped)
+    if not match:
+        return None
+    return (match.group("kafi") or match.group("wasail") or match.group(0)).strip()
+
+
+def _apply_heading_title(title: str, kitab: str, bab: str) -> tuple[str, str]:
+    if _HEADING_LINE.match(title) and re.match(
+        rf"^{_NUMBER_PREFIX}(?:كِتَابُ|كتاب)(?:\s|$)", title
+    ):
+        return title, ""
+    return kitab, title
+
+
+def split_page_structure(
+    text: str,
+    kitab: str = "",
+    bab: str = "",
+) -> tuple[str, list[tuple[str, str, str, str]]]:
+    """Leading matn (continuation) plus (token, body, kitab, bab) starts.
+
+    Headings and colophons are not part of any body. A باب between 9 - and 1 -
+    closes 9, updates bab, and 1 inherits the new chapter.
+    """
+    lines = (text or "").splitlines()
+    leading_lines: list[str] = []
+    starts: list[tuple[str, str, str, str]] = []
+    mode = "leading"
+    token: str | None = None
+    body_lines: list[str] = []
+    heading_join = 0
+    heading_title = ""
+    cur_kitab, cur_bab = kitab, bab
+
+    def flush_hadith() -> None:
+        nonlocal token, body_lines
+        if token is None:
+            return
+        body = "\n".join(body_lines).strip()
+        if body:
+            starts.append((token, body, cur_kitab, cur_bab))
+        token = None
+        body_lines = []
+
+    def commit_heading() -> None:
+        nonlocal heading_join, heading_title, cur_kitab, cur_bab
+        if heading_title:
+            cur_kitab, cur_bab = _apply_heading_title(
+                re.sub(r"\s+", " ", heading_title).strip(), cur_kitab, cur_bab
+            )
+        heading_join = 0
+        heading_title = ""
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        start = _start_token(stripped) if stripped else None
+        if start:
+            commit_heading()
+            if mode == "hadith":
+                flush_hadith()
+            mode = "hadith"
+            token = start
+            body_lines = [line]
+            i += 1
+            continue
+        if stripped and (_colophon_line(stripped) or _heading_candidate(stripped)):
+            if mode == "hadith":
+                flush_hadith()
+            mode = "struct"
+            if _heading_candidate(stripped):
+                heading_title = stripped
+                heading_join = _MAX_HEADING_JOIN
+            else:
+                commit_heading()
+            i += 1
+            continue
+        if heading_join > 0 and stripped:
+            if _colophon_line(stripped) or _heading_candidate(stripped):
+                commit_heading()
+                continue
+            heading_title = f"{heading_title} {stripped}"
+            heading_join -= 1
+            if heading_join == 0:
+                commit_heading()
+            i += 1
+            continue
+        if heading_join > 0 and not stripped:
+            i += 1
+            continue
+        if mode == "leading":
+            leading_lines.append(line)
+        elif mode == "hadith":
+            body_lines.append(line)
+        i += 1
+    commit_heading()
+    if mode == "hadith":
+        flush_hadith()
+    leading = "\n".join(leading_lines).strip()
+    return leading, starts
+
+
 def page_prefix_and_starts(text: str) -> tuple[str, list[tuple[str, str]]]:
     """Split a page into leading text (before the first numbered start) and starts.
 
     Unlike split_hadith_page, the prefix is kept: on a continuation page it is the
-    rest of the previous hadith, not a bab title to drop.
+    rest of the previous hadith, not a bab title to drop. Headings/colophons are
+    stripped from both the prefix and each body.
     """
-    matches = list(HADITH_START_RE.finditer(text))
-    if not matches:
-        return text.strip(), []
-    leading = text[: matches[0].start()].strip()
-    starts: list[tuple[str, str]] = []
-    for i, match in enumerate(matches):
-        token = (match.group("kafi") or match.group("wasail") or match.group(0)).strip()
-        start = match.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
-        if body:
-            starts.append((token, body))
-    return leading, starts
+    leading, starts = split_page_structure(text)
+    return leading, [(token, body) for token, body, _k, _b in starts]
 
 
 def split_hadith_page(text: str) -> list[tuple[str, str]]:
@@ -155,13 +293,28 @@ def split_hadith_page(text: str) -> list[tuple[str, str]]:
     return [(token, body) for token, body in starts if len(body) >= _MIN_HADITH_CHARS]
 
 
+def is_editorial_page(text: str) -> bool:
+    """True for afterword / thanks / Tabataba'i dumps, not a hadith page.
+
+    A real hadith page may *end* with `تم كتاب…`; those markers in the prefix
+    (before any numbered start) mean the page is apparatus, not matn.
+    """
+    stripped = (text or "").strip()
+    if not stripped or not _EDITORIAL_PAGE.search(stripped):
+        return False
+    leading, _starts = split_page_structure(stripped)
+    return bool(_EDITORIAL_PAGE.search(leading or stripped[:500]))
+
+
 def next_page_continues(next_text: str | None) -> bool:
     """True if the following page still belongs to the hadith that ended the previous page."""
     if not next_text or not next_text.strip():
         return False
     leading, starts = page_prefix_and_starts(next_text)
+    if leading and _EDITORIAL_PAGE.search(leading):
+        return False
     if not starts:
-        return True
+        return not _EDITORIAL_PAGE.search(next_text)
     return bool(leading)
 
 
@@ -198,6 +351,8 @@ def hadith_units(units: list[ParsedUnit]) -> list[ParsedUnit]:
         # both the footnote bodies and the inline [n] markers linking them to a
         # hadith. `text` has had both deleted.
         refs = page_quran_refs(raw)
+        if started and is_editorial_page(text):
+            continue
         pieces = split_hadith_page(text)
         if pieces:
             started = True

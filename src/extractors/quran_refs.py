@@ -346,6 +346,19 @@ def match_quran(text: str) -> list[str]:
     for ref in match_quran_roots(text):
         if ref not in found:
             found.append(ref)
+    squashed = fold(text).replace(" ", "")
+    basmala = fold("بسم الله الرحمن الرحيم").replace(" ", "")
+    if basmala and basmala in squashed:
+        # The formula opens every sura in the mushaf; a lone basmala is 1:1,
+        # not البقرة:1 / آل عمران:1.
+        extra = squashed.replace(basmala, "")
+        if len(extra) < 24:
+            return [ref for ref in found if ref == "1:1"] or ["1:1"]
+        found = [
+            ref
+            for ref in found
+            if ref == "1:1" or not (ref.endswith(":1") and ref != "1:1")
+        ]
     return found
 
 

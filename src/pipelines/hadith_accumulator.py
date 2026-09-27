@@ -5,7 +5,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from src.extractors.chunkers import next_page_continues, page_prefix_and_starts, strip_folklib_footnotes
+from src.extractors.chunkers import (
+    next_page_continues,
+    page_prefix_and_starts,
+    split_page_structure,
+    strip_folklib_footnotes,
+)
 from src.pipelines.ontology import enforce_node_policy, semantic_nodes_of
 
 
@@ -306,7 +311,7 @@ def consume_page(
     kitab, bab = section or ("", "")
     text = strip_folklib_footnotes(text)
     next_text = strip_folklib_footnotes(next_text) if next_text else next_text
-    leading, starts = page_prefix_and_starts(text)
+    leading, starts = split_page_structure(text, kitab, bab)
     buf = buffer
 
     if buf and leading:
@@ -333,14 +338,18 @@ def consume_page(
         flushed.append(buf.assemble())
         buf = None
 
-    for i, (token, body) in enumerate(starts):
+    for i, (token, body, item_kitab, item_bab) in enumerate(starts):
         item = match_gemini_item(gemini_items, token)
         slice_ = _slice_from_item(token, body, locator, item, refs.get(token))
         is_last = i == len(starts) - 1
         hold = is_last and next_page_continues(next_text)
         if hold:
             buf = OpenHadith(
-                marker=token, page_start=locator, page_end=locator, kitab=kitab, bab=bab
+                marker=token,
+                page_start=locator,
+                page_end=locator,
+                kitab=item_kitab,
+                bab=item_bab,
             )
             buf.append_slice(
                 locator,
@@ -356,7 +365,7 @@ def consume_page(
                 is_encyclopedic=bool(slice_.get("is_encyclopedic")),
             )
         else:
-            flushed.append(_single(slice_, locator, kitab, bab))
+            flushed.append(_single(slice_, locator, item_kitab, item_bab))
 
     if not starts and buf and not next_page_continues(next_text):
         flushed.append(buf.assemble())

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from config.paths import RAW_EPUBS_DIR
 from config.settings import Settings
 from src.agents.errors import AllKeysExhausted, RateLimited, StructuredOutputError
 from src.agents.gemini import GeminiAgent
@@ -24,22 +25,26 @@ from src.core.vector_engine import (
 )
 from src.extractors.chunkers import (
     hadith_units,
+    is_editorial_page,
     mizan_commentary_body,
+    next_page_continues,
     page_prefix_and_starts,
     split_hadith_page,
     split_mizan_sections,
+    split_page_structure,
     strip_folklib_footnotes,
 )
 from src.extractors.classification import attach_sections, page_headings, section_nodes
 from src.extractors.epub_parser import ParsedUnit, parse_epub, strip_html
+from src.extractors.txt_parser import parse_txt
 from src.extractors.quran_refs import (
     expand_mizan_locator,
+    match_quran,
     match_quran_phrases,
     page_quran_refs,
     parse_footnote_ref,
     resolve_tafsir_quran_refs,
 )
-from src.extractors.txt_parser import parse_txt
 from src.models import (
     HadithExtraction,
     HadithPageExtraction,
@@ -1102,12 +1107,19 @@ def test_book_classification_is_inherited_by_every_page():
     ]
     tagged = attach_sections(pages)
     assert tagged[0].kitab == ""
-    assert tagged[1].kitab == "كِتَابُ الْعَقْلِ وَ الْجَهْلِ"
+    # Headings on a page apply to starts on that page, not to the unit stamp.
+    # The unit carries the section in force at the *start* of the page.
+    assert tagged[1].kitab == ""
     # A heading governs every later page until the next one, so hadith 2
     # inherits it without the heading being reprinted.
     assert tagged[2].kitab == "كِتَابُ الْعَقْلِ وَ الْجَهْلِ"
-    # Wrapped title reassembled from the line the typesetter split it onto.
-    assert tagged[3].bab == "بَابُ طِينَةِ الْمُؤْمِنِ وَ الْكَافِرِ"
+    assert tagged[3].kitab == "كِتَابُ الْعَقْلِ وَ الْجَهْلِ"
+    assert tagged[3].bab == ""
+    from src.extractors.chunkers import split_page_structure
+
+    _lead, starts = split_page_structure(pages[3].text, tagged[3].kitab, tagged[3].bab)
+    assert starts
+    assert "طِينَةِ" in starts[0][3]
 
 
 def test_prose_beginning_with_kitab_is_not_a_heading():
@@ -2231,6 +2243,76 @@ def test_accumulator_merges_cross_page_hadiths_and_holds_buffer(state: StateMana
     assert [r["marker"] for r in flushed3] == ["3-"]
     assert buf is None
     assert "تتمة الثالث" in flushed3[0]["hadith"]
+
+
+def test_kafi_vol2_672_675_clips_bab_and_colophon():
+    """Real Folklib pages: last numbered start must not swallow the next باب
+    or تم كتاب العشرة / Tabataba'i page 675.
+    """
+    import re
+
+    path = RAW_EPUBS_DIR / "hadith" / "al-kafi-2.txt"
+    if not path.exists():
+        pytest.skip("al-kafi-2.txt is not in the checkout")
+    raw_units = parse_txt(path)
+    by_loc = {u.locator: u for u in raw_units}
+    page675 = by_loc["جلد 2 - صفحه 675"].text
+    assert is_editorial_page(strip_folklib_footnotes(page675))
+    assert next_page_continues(page675) is False
+
+    units = [u for u in hadith_units(raw_units) if re.search(r"صفحه 67[2-5]\s*$", u.locator)]
+    assert [u.locator for u in units] == [
+        "جلد 2 - صفحه 672",
+        "جلد 2 - صفحه 673",
+        "جلد 2 - صفحه 674",
+    ]
+
+    flushed: list[dict] = []
+    buf = None
+    for i, unit in enumerate(units):
+        nxt = units[i + 1].text if i + 1 < len(units) else page675
+        complete, buf = consume_page(
+            unit.locator,
+            unit.text,
+            [],
+            buf,
+            nxt,
+            unit.quran_refs,
+            (unit.kitab, unit.bab),
+        )
+        flushed.extend(complete)
+    if buf:
+        flushed.append(buf.assemble())
+
+    nine = next(
+        h
+        for h in flushed
+        if h["marker"].replace(" ", "") == "9-" and "673" in h["locator"]
+    )
+    assert "إِحْرَاق" not in nine["hadith"]
+    assert "بَابُ" not in nine["hadith"]
+    assert "إِحْرَاق" not in nine["bab"]
+
+    one = next(h for h in flushed if "الْقَرَاطِيسِ تَجْتَمِعُ" in h["hadith"])
+    assert one["page_start"] == "جلد 2 - صفحه 673"
+    assert one["page_end"] == "جلد 2 - صفحه 674"
+    assert "إِحْرَاق" in one["bab"]
+
+    five = next(h for h in flushed if "اغْسِلْهَا" in h["hadith"])
+    assert "تَمَّ" not in five["hadith"] and "تم كتاب" not in five["hadith"]
+    assert "شكر" not in five["hadith"]
+    assert "الطباطبائي" not in five["hadith"]
+    assert "675" not in five["page_end"]
+    assert "اغْسِلْهَا" in five["hadith"]
+
+    three = next(h for h in flushed if "لَا تَكْتُبْ" in h["hadith"] and "بِسْمِ" in h["hadith"])
+    assert set(three.get("quran_refs") or []) <= {"1:1"}
+
+
+def test_basmala_alone_is_fatiha_not_every_sura_opener():
+    refs = match_quran("لَا تَكْتُبْ بِسْمِ اللَّهِ الرَّحْمنِ الرَّحِيمِ لِفُلَانٍ")
+    assert "2:1" not in refs
+    assert "3:1" not in refs
 
 
 def test_unify_only_when_multipage(state: StateManager):

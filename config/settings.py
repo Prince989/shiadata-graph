@@ -137,6 +137,7 @@ class Settings(BaseSettings):
     groq_reasoning_effort: str = "medium"
     groq_max_completion_tokens: int = 16_384
     groq_min_interval_ms: int = 75_000
+    groq_key_switch_delay_ms: int = 30_000
     embedding_model: str = "text-embedding-3-small"
     log_level: str = "INFO"
 

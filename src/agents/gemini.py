@@ -212,6 +212,7 @@ class GeminiAgent:
         self._generate_fn = generate_fn
         self._last_call_at: float | None = None
         self._last_call_at_by_key: dict[str, float] = {}
+        self._last_groq_key_id: str | None = None
         self._skip_min_interval = False
         # Optional Phase1DayReport (or any object with record_http).
         self.day_report = day_report
@@ -468,37 +469,73 @@ class GeminiAgent:
         if self._skip_min_interval:
             self._skip_min_interval = False
             return
+        now = time.monotonic()
         if self._is_groq():
+            waits: list[tuple[str, float]] = []
             interval_ms = int(getattr(self.settings, "groq_min_interval_ms", 0) or 0)
             last_at = (
                 self._last_call_at_by_key.get(key.id) if key is not None else None
             )
-        else:
-            interval_ms = int(getattr(self.settings, "gemini_min_interval_ms", 0) or 0)
-            last_at = self._last_call_at
+            if interval_ms > 0 and last_at is not None:
+                key_wait = interval_ms / 1000.0 - (now - last_at)
+                if key_wait > 0:
+                    waits.append(("key", key_wait))
+            switch_ms = int(
+                getattr(self.settings, "groq_key_switch_delay_ms", 0) or 0
+            )
+            if (
+                switch_ms > 0
+                and key is not None
+                and self._last_groq_key_id is not None
+                and self._last_groq_key_id != key.id
+            ):
+                elapsed = (
+                    now - self._last_call_at
+                    if self._last_call_at is not None
+                    else 0.0
+                )
+                switch_wait = switch_ms / 1000.0 - elapsed
+                if switch_wait > 0:
+                    waits.append(("switch", switch_wait))
+            if not waits:
+                return
+            reason, wait_s = max(waits, key=lambda item: item[1])
+            if reason == "switch" and key is not None:
+                logger.info(
+                    "Waiting %.1fs before switching Groq key %d/%d (%s)",
+                    wait_s,
+                    key.index + 1,
+                    self.pool.pool_size(),
+                    key.id,
+                )
+            elif key is not None:
+                logger.info(
+                    "Waiting %.1fs before next Groq call on key %d/%d (%s)",
+                    wait_s,
+                    key.index + 1,
+                    self.pool.pool_size(),
+                    key.id,
+                )
+            else:
+                logger.info("Waiting %.1fs before next Groq call", wait_s)
+            time.sleep(wait_s)
+            return
+        interval_ms = int(getattr(self.settings, "gemini_min_interval_ms", 0) or 0)
+        last_at = self._last_call_at
         if interval_ms <= 0 or last_at is None:
             return
-        wait_s = interval_ms / 1000.0 - (time.monotonic() - last_at)
+        wait_s = interval_ms / 1000.0 - (now - last_at)
         if wait_s <= 0:
             return
-        if self._is_groq() and key is not None:
-            logger.info(
-                "Waiting %.1fs before next Groq call on key %d/%d (%s)",
-                wait_s,
-                key.index + 1,
-                self.pool.pool_size(),
-                key.id,
-            )
-        else:
-            logger.info("Waiting %.1fs before next Gemini call", wait_s)
+        logger.info("Waiting %.1fs before next Gemini call", wait_s)
         time.sleep(wait_s)
 
     def _mark_call(self, key: LlmKey | None = None) -> None:
         now = time.monotonic()
+        self._last_call_at = now
         if self._is_groq() and key is not None:
             self._last_call_at_by_key[key.id] = now
-            return
-        self._last_call_at = now
+            self._last_groq_key_id = key.id
 
     def _call_once(
         self,

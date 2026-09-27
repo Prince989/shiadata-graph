@@ -217,6 +217,7 @@ def attach_sections(units: list[ParsedUnit]) -> list[ParsedUnit]:
     kitab = ""
     bab = ""
     for unit in units:
+        incoming_kitab, incoming_bab = kitab, bab
         for level, title in page_headings(unit.text):
             if level == "kitab":
                 kitab, bab = title, ""
@@ -229,8 +230,8 @@ def attach_sections(units: list[ParsedUnit]) -> list[ParsedUnit]:
                 text=unit.text,
                 source_path=unit.source_path,
                 quran_refs=unit.quran_refs,
-                kitab=kitab,
-                bab=bab,
+                kitab=incoming_kitab,
+                bab=incoming_bab,
             )
         )
     return out

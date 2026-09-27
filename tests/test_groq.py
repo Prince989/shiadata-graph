@@ -32,6 +32,7 @@ def _groq_settings(**kwargs) -> Settings:
         llm_provider="groq",
         groq_api_keys=["k"],
         groq_min_interval_ms=0,
+        groq_key_switch_delay_ms=0,
         groq_model="qwen/qwen3.8-27b",
         groq_reasoning_effort="medium",
         groq_max_completion_tokens=16384,
@@ -47,7 +48,8 @@ def test_mention_salience_accepts_qwen_words():
     assert Mention(text="العقل", salience="medium").salience == 0.6
     assert Mention(text="العقل", salience="low").salience == 0.3
     assert Mention(text="العقل", salience="primary").salience == 0.9
-    assert Mention(text="العقل", salience="0.85").salience == 0.85
+    assert Mention(text="العقل", salience=5).salience == 1.0
+    assert Mention(text="العقل", salience=3).salience == 0.6
     assert Mention(text="العقل", salience=0.7).salience == 0.7
     assert Settings.model_fields["llm_provider"].default == "gemini"
 
@@ -184,6 +186,62 @@ def test_groq_does_not_wait_between_different_keys(
     agent.complete("one")
     agent.complete("two")
     agent.complete("three")
+    assert slept == []
+
+
+def test_groq_waits_between_key_switches(
+    state: StateManager, monkeypatch: pytest.MonkeyPatch
+):
+    slept: list[float] = []
+    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: slept.append(s))
+
+    def fake_generate(**_kwargs):
+        return "ok"
+
+    settings = _groq_settings(
+        groq_min_interval_ms=0,
+        groq_key_switch_delay_ms=400,
+        gemini_min_interval_ms=20_000,
+    )
+    agent = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, settings, keys=["a", "b", "c"]),
+        generate_fn=fake_generate,
+    )
+    agent.complete("one")
+    agent.complete("two")
+    agent.complete("three")
+    assert len(slept) == 2
+    assert slept[0] >= 0.3
+    assert slept[1] >= 0.3
+
+
+def test_groq_same_key_retry_skips_switch_delay(
+    state: StateManager, monkeypatch: pytest.MonkeyPatch
+):
+    slept: list[float] = []
+    monkeypatch.setattr("src.agents.gemini.time.sleep", lambda s: slept.append(s))
+    calls = {"n": 0}
+
+    def fake_generate(**_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StructuredOutputError("bad json")
+        return "ok"
+
+    settings = _groq_settings(
+        groq_min_interval_ms=0,
+        groq_key_switch_delay_ms=400,
+        gemini_max_attempts=3,
+    )
+    agent = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, settings, keys=["only"]),
+        generate_fn=fake_generate,
+    )
+    agent.complete("one")
     assert slept == []
 
 
