@@ -28,6 +28,7 @@ from src.agents.errors import (
     ProviderServerError,
     QuotaExhausted,
     RateLimited,
+    RequestTooLarge,
     StructuredOutputError,
 )
 
@@ -69,12 +70,53 @@ TAFSIR_RETRY = (
     "not summaries. tafsir_fa is fluent Persian, not a paste of the source."
 )
 
+TAFSIR_REFORMATION_RETRY = (
+    "\n\nYour previous JSON failed validation. Return only the two translation "
+    "fields requested. Complete commentary, no ellipsis, no mentions, no ayah numbers."
+)
+
 GROQ_JSON_TAIL = (
     "\nReturn JSON only matching the requested schema. Do not wrap in markdown. "
     "Do not return the Arabic matn."
 )
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def coerce_structured_text(raw: object) -> str:
+    """Turn a model reply into a JSON object string (strip fences / leading prose)."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```\s*$", "", text)
+        text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _groq_message_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            else:
+                parts.append(str(part))
+        content = "".join(parts)
+    text = str(content or "").strip()
+    if text:
+        return text
+    for key in ("reasoning", "reasoning_content"):
+        extra = message.get(key)
+        if extra:
+            return str(extra)
+    return ""
 
 
 def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int | None]:
@@ -86,6 +128,8 @@ def classify_provider_error(exc: BaseException) -> tuple[FailureKind | None, int
     if isinstance(exc, AuthInvalid):
         return FailureKind.AUTH_INVALID, None
     if isinstance(exc, StructuredOutputError):
+        return None, None
+    if isinstance(exc, RequestTooLarge):
         return None, None
     text = str(exc)
     raw_status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -206,6 +250,9 @@ class GeminiAgent:
         key_pool: KeyPool | None = None,
         generate_fn=None,
         day_report=None,
+        groq_temperature: float | None = None,
+        groq_reasoning_effort: str | None = None,
+        groq_max_completion_tokens: int | None = None,
     ):
         self.settings = settings or get_settings()
         self.pool = key_pool or KeyPool(state, self.settings)
@@ -216,6 +263,10 @@ class GeminiAgent:
         self._skip_min_interval = False
         # Optional Phase1DayReport (or any object with record_http).
         self.day_report = day_report
+        # None → hadith Phase 1 defaults (temperature 0.6, settings.groq_reasoning_effort).
+        self.groq_temperature = groq_temperature
+        self.groq_reasoning_effort = groq_reasoning_effort
+        self.groq_max_completion_tokens = groq_max_completion_tokens
 
     def _configured_models(self) -> list[str]:
         if self._is_groq():
@@ -240,6 +291,8 @@ class GeminiAgent:
             return MENTIONS_FILL_RETRY
         if name == "TafsirExtraction":
             return TAFSIR_RETRY
+        if name == "TafsirReformation":
+            return TAFSIR_REFORMATION_RETRY
         return COMPACT_JSON_RETRY
 
     def complete(
@@ -263,9 +316,10 @@ class GeminiAgent:
         """JSON completion validated into `schema`. Phase 1 and Phase 2 both use this."""
         raw = self._run(prompt, system=system, model=model, schema=schema)
         try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
+            blob = coerce_structured_text(raw) if isinstance(raw, str) else raw
+            data = json.loads(blob) if isinstance(blob, str) else blob
             if isinstance(data, str):
-                data = json.loads(data)
+                data = json.loads(coerce_structured_text(data))
             return schema.model_validate(data)
         except (ValidationError, json.JSONDecodeError) as exc:
             raise StructuredOutputError(str(exc)) from exc
@@ -316,9 +370,10 @@ class GeminiAgent:
                 try:
                     try:
                         text = self._call_once(key, prompt, sys, current_model, schema)
-                    except StructuredOutputError:
-                        # Empty / truncated replies still used a successful HTTP slot.
-                        self._record_http(key, 200)
+                    except StructuredOutputError as exc:
+                        # Empty / truncated 200 replies still used a successful HTTP slot.
+                        if getattr(exc, "record_http_200", True):
+                            self._record_http(key, 200)
                         raise
                     self._record_http(key, 200)
                     logger.info(
@@ -332,9 +387,10 @@ class GeminiAgent:
                 finally:
                     self._mark_call(key)
                 if schema is not None:
+                    text = coerce_structured_text(text)
                     data = json.loads(text) if isinstance(text, str) else text
                     if isinstance(data, str):
-                        data = json.loads(data)
+                        data = json.loads(coerce_structured_text(data))
                     schema.model_validate(data)
                     if not isinstance(text, str):
                         text = json.dumps(data, ensure_ascii=False)
@@ -342,11 +398,19 @@ class GeminiAgent:
                 return text
             except (StructuredOutputError, json.JSONDecodeError, ValidationError) as exc:
                 last_error = exc
+                if isinstance(exc, StructuredOutputError) and not getattr(
+                    exc, "retryable", True
+                ):
+                    raise
+                preview = ""
+                if "text" in locals() and text:
+                    preview = repr(str(text)[:180])
                 logger.warning(
-                    "structured output retry %s/%s: %s",
+                    "structured output retry %s/%s: %s%s",
                     attempt + 1,
                     attempts,
                     exc,
+                    f" preview={preview}" if preview else "",
                 )
                 continue
             except Exception as exc:  # noqa: BLE001 — classified below
@@ -606,23 +670,39 @@ class GeminiAgent:
         if sys.strip():
             messages.append({"role": "system", "content": sys})
         messages.append({"role": "user", "content": prompt})
-        body = json.dumps(
-            {
-                "model": model or self.settings.groq_model,
-                "messages": messages,
-                "temperature": 0.6,
-                "max_completion_tokens": int(
-                    getattr(self.settings, "groq_max_completion_tokens", 16_384)
-                    or 16_384
-                ),
-                "top_p": 0.95,
-                "reasoning_effort": str(
-                    getattr(self.settings, "groq_reasoning_effort", "medium")
-                    or "medium"
-                ),
-                "stream": False,
-            }
-        ).encode("utf-8")
+        temperature = (
+            float(self.groq_temperature)
+            if self.groq_temperature is not None
+            else 0.6
+        )
+        effort = (
+            str(self.groq_reasoning_effort)
+            if self.groq_reasoning_effort is not None
+            else str(
+                getattr(self.settings, "groq_reasoning_effort", "medium") or "medium"
+            )
+        )
+        payload: dict[str, Any] = {
+            "model": model or self.settings.groq_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_completion_tokens": int(
+                self.groq_max_completion_tokens
+                if self.groq_max_completion_tokens is not None
+                else (
+                    getattr(self.settings, "groq_max_completion_tokens", 16_384) or 16_384
+                )
+            ),
+            "top_p": 0.95,
+            "reasoning_effort": effort,
+            "stream": False,
+        }
+        if schema is not None and effort != "none":
+            # Qwen JSON mode with reasoning_effort=none and a small completion
+            # cap returns failed_generation "{" (HTTP 400). Tafsir reformation
+            # uses that setting; parse JSON from the message instead.
+            payload["response_format"] = {"type": "json_object"}
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             GROQ_CHAT_URL,
             data=body,
@@ -639,12 +719,43 @@ class GeminiAgent:
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", "replace")
             text = err_body or str(exc)
+            lowered = text.lower()
+            too_large = (
+                exc.code == 413
+                or "reduce your message size" in lowered
+                or "on input tokens" in lowered
+                or "itpm" in lowered
+            )
+            if too_large:
+                raise RequestTooLarge(text) from exc
             if exc.code == 429:
                 raise RateLimited(text) from exc
             if exc.code in {401, 403}:
                 raise AuthInvalid(text) from exc
             if exc.code in {404, 500, 502, 503, 504}:
                 raise ProviderServerError(text) from exc
+            if exc.code == 400 and (
+                "json_validate_failed" in lowered
+                or "failed to generate json" in lowered
+                or "failed_generation" in lowered
+            ):
+                failed = ""
+                try:
+                    err = json.loads(text)
+                    failed = str((err.get("error") or {}).get("failed_generation") or "")
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    failed = ""
+                blob = coerce_structured_text(failed)
+                if blob.startswith("{") and blob.endswith("}") and len(blob) > 2:
+                    try:
+                        json.loads(blob)
+                        return blob
+                    except json.JSONDecodeError:
+                        pass
+                raise StructuredOutputError(
+                    f"Groq JSON mode failed: {text[:280]}",
+                    record_http_200=False,
+                ) from exc
             raise ProviderServerError(f"HTTP {exc.code}: {text}") from exc
         except urllib.error.URLError as exc:
             raise ProviderServerError(str(exc)) from exc
@@ -654,9 +765,12 @@ class GeminiAgent:
         choice = choices[0] or {}
         finish = str(choice.get("finish_reason") or "").lower()
         if finish in {"length", "max_tokens"}:
-            raise StructuredOutputError(f"response truncated ({finish})")
+            raise StructuredOutputError(
+                f"response truncated ({finish})",
+                retryable=False,
+            )
         message = choice.get("message") or {}
-        text = message.get("content")
+        text = _groq_message_text(message)
         if not text:
             raise StructuredOutputError("empty Groq response")
         return str(text)

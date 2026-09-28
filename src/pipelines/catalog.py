@@ -19,6 +19,7 @@ class BookSpec:
     pipeline: str
     description: str
     files: list[Path]
+    source_lang: str = ""
 
 
 def load_book_catalog() -> dict:
@@ -48,9 +49,13 @@ def resolve_book(book_id: str, raw_dir: Path | None = None) -> BookSpec:
         raise FileNotFoundError(
             f"No source files for '{book_id}' under {root} (globs={entry.get('globs')})."
         )
+    lang = str(entry.get("source_lang") or "").strip().lower()
+    if lang not in {"ar", "fa"}:
+        lang = ""
     return BookSpec(
         book_id=book_id,
         pipeline=entry["pipeline"],
         description=entry.get("description", ""),
         files=unique,
+        source_lang=lang,
     )

@@ -103,3 +103,47 @@ def test_day_report_archives_json_without_pacific_marker(tmp_path: Path):
     report.record_http(0, 200)
     report.flush()
     assert "pacific_day_start_ms" in report.json_path.read_text(encoding="utf-8")
+
+
+def test_tafsir_reformation_day_report_lists_units(tmp_path: Path):
+    day = date(2026, 9, 27)
+    report = Phase1DayReport(
+        day=day,
+        report_dir=tmp_path,
+        live=False,
+        provider="groq",
+        model="qwen/qwen3.8-27b",
+        kind="tafsir-reformation",
+    )
+    report.record_http(0, 200)
+    report.record_item("سوره 1 - آیات 1-5 | بيان")
+    report.flush()
+    text = report.md_path.read_text(encoding="utf-8")
+    assert text.startswith("# Tafsir reformation - 2026-09-27")
+    assert "## Processed units" in text
+    assert "سوره 1 - آیات 1-5 | بيان" in text
+    assert report.md_path.name == "2026-09-27-qwen-qwen3.8-27b.md"
+
+
+def test_tafsir_report_uses_local_day_not_pacific_rollover(tmp_path: Path):
+    day = date(2026, 9, 28)
+    report = Phase1DayReport(
+        day=day,
+        report_dir=tmp_path,
+        live=False,
+        provider="groq",
+        model="qwen/qwen3.8-27b",
+        kind="tafsir-reformation",
+    )
+    report.record_http(0, 200)
+    report.flush()
+    again = Phase1DayReport(
+        day=day,
+        report_dir=tmp_path,
+        live=False,
+        provider="groq",
+        model="qwen/qwen3.8-27b",
+        kind="tafsir-reformation",
+    )
+    assert again.md_path.name.startswith("2026-09-28")
+    assert again._key(1).count_200 == 1

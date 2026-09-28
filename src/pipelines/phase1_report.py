@@ -21,6 +21,11 @@ from src.agents.key_pool import pacific_calendar_date, pacific_day_start_ms
 REPORT_DIR = DATA_DIR / "reports" / "phase1"
 
 
+def reports_dir(kind: str) -> Path:
+    slug = str(kind or "phase1").strip() or "phase1"
+    return DATA_DIR / "reports" / slug
+
+
 def _clean_hadith_id(label: str) -> str:
     """Tidy older ids that still contain Persian تا."""
     return re.sub(r"_تا_", "-", str(label or "").strip())
@@ -141,9 +146,11 @@ class Phase1DayReport:
         live: bool = True,
         provider: str = "gemini",
         model: str = "",
+        kind: str = "phase1",
     ):
+        self.kind = str(kind or "phase1").strip() or "phase1"
         self.day = day or pacific_calendar_date()
-        self.report_dir = report_dir or REPORT_DIR
+        self.report_dir = report_dir or reports_dir(self.kind)
         self.live = live
         self.provider = str(provider or "gemini").strip().lower() or "gemini"
         self.model = str(model or "").strip()
@@ -230,18 +237,23 @@ class Phase1DayReport:
                 out.append(key_no - 1)
         return out
 
-    def record_hadith(self, source_path: str, payload: dict, key_no: int | None = None) -> None:
-        label = hadith_run_id(source_path, payload)
+    def record_item(self, label: str, key_no: int | None = None) -> None:
+        text = str(label or "").strip()
+        if not text:
+            return
         target = key_no if key_no is not None else self._last_ok_key
         if target is None:
             target = 0
             row = self._key(0)
         else:
             row = self._key(target)
-        if label not in row.hadiths:
-            row.hadiths.append(label)
+        if text not in row.hadiths:
+            row.hadiths.append(text)
         if self.live:
             self.flush()
+
+    def record_hadith(self, source_path: str, payload: dict, key_no: int | None = None) -> None:
+        self.record_item(hadith_run_id(source_path, payload), key_no=key_no)
 
     def _load(self) -> None:
         path = self.json_path
@@ -253,9 +265,15 @@ class Phase1DayReport:
             return
         expected_start = pacific_day_start_ms()
         stored = data.get("pacific_day_start_ms")
-        # Missing marker = pre-fix / polluted overnight merge. Archive and
-        # start empty so yesterday's 429 totals cannot overnight-lock today.
-        if stored is None or int(stored) != expected_start:
+        # Tafsir reformation follows the machine's calendar day. Gemini Phase 1
+        # stays on the Pacific free-tier day.
+        if self.kind == "tafsir-reformation":
+            if str(data.get("date") or "") != self.day.isoformat():
+                self._archive_stale_sidecar(data)
+                return
+        elif stored is None or int(stored) != expected_start:
+            # Missing marker = pre-fix / polluted overnight merge. Archive and
+            # start empty so yesterday's 429 totals cannot overnight-lock today.
             self._archive_stale_sidecar(data)
             return
         for key, stats in (data.get("keys") or {}).items():
@@ -306,6 +324,7 @@ class Phase1DayReport:
         self.report_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "date": self.day.isoformat(),
+            "kind": self.kind,
             "provider": self.provider,
             "model": self.model,
             "pacific_day_start_ms": pacific_day_start_ms(),
@@ -325,11 +344,21 @@ class Phase1DayReport:
         updated = payload.get("updated_at") or ""
         provider = str(payload.get("provider") or "").strip()
         model = str(payload.get("model") or "").strip()
-        title = f"# Phase 1 - {day}"
+        kind = str(payload.get("kind") or "phase1").strip() or "phase1"
+        heading = "Tafsir reformation" if kind == "tafsir-reformation" else "Phase 1"
+        title = f"# {heading} - {day}"
         if model:
             title = f"{title} — {model}"
         elif provider:
             title = f"{title} — {provider}"
+        items_title = (
+            "## Processed units" if kind == "tafsir-reformation" else "## Processed hadiths"
+        )
+        empty_items = (
+            "_No units flushed yet._"
+            if kind == "tafsir-reformation"
+            else "_No hadiths flushed yet._"
+        )
         keys = payload.get("keys") or {}
 
         headers = ["key", "503", "200", "429", "401", "lock", "hadiths"]
@@ -387,10 +416,10 @@ class Phase1DayReport:
             ]
         )
         if hadith_sections:
-            lines.append("## Processed hadiths")
+            lines.append(items_title)
             lines.append("")
             lines.extend(hadith_sections)
         else:
-            lines.append("_No hadiths flushed yet._")
+            lines.append(empty_items)
             lines.append("")
         return "\n".join(lines)

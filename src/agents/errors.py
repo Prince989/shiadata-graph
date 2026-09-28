@@ -31,5 +31,20 @@ class ProviderServerError(AgentError):
     """5xx / timeout from the provider."""
 
 
+class RequestTooLarge(AgentError):
+    """This prompt exceeds the provider's per-request token cap (Groq 413 / ITPM)."""
+
+
 class StructuredOutputError(AgentError):
     """Model returned JSON that did not match the requested schema."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        record_http_200: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.record_http_200 = record_http_200

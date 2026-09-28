@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import date
 from pathlib import Path
 
 import typer
@@ -32,6 +33,7 @@ from src.pipelines.proposals import (
 from src.pipelines.reset import reset_catalog_book
 from src.pipelines.phase1_report import Phase1DayReport
 from src.pipelines.runner import run_phase1
+from src.pipelines.tafsir_reformation import run_tafsir_reformation
 from src.state_manager import StateManager
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -60,14 +62,20 @@ def _stack(day_report: Phase1DayReport | None = None) -> tuple[StateManager, Gem
     return state, gemini, embeddings
 
 
-def _phase1_report() -> Phase1DayReport:
+def _day_report(kind: str = "phase1") -> Phase1DayReport:
     settings = get_settings()
     model = (
         settings.groq_model
         if settings.llm_provider == "groq"
         else settings.gemini_model
     )
-    return Phase1DayReport(provider=settings.llm_provider, model=model)
+    day = date.today() if kind == "tafsir-reformation" else None
+    return Phase1DayReport(
+        day=day,
+        provider=settings.llm_provider,
+        model=model,
+        kind=kind,
+    )
 
 
 @app.command("run-phase1")
@@ -102,7 +110,7 @@ def phase1(
     """Parse a book and run structured extraction."""
     _setup_logging()
     apply_llm_provider(provider)
-    report = _phase1_report()
+    report = _day_report()
     typer.echo(
         f"phase1 day report (live, Pacific free-tier day {report.day.isoformat()}): "
         f"{report.md_path}"
@@ -134,6 +142,81 @@ def phase1(
     finally:
         path = report.flush()
         typer.echo(f"phase1 day report saved: {path}")
+        state.close()
+    typer.echo(stats)
+
+
+@app.command("tafsir-reformation")
+def tafsir_reformation(
+    book: str = typer.Option(..., "--book", help="Catalog id, e.g. al-mizan"),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        help="Max translation windows this run (pause/resume; not whole books)",
+    ),
+    page: str | None = typer.Option(
+        None,
+        "--page",
+        help=(
+            "Only this ayah or locator fragment (debug). "
+            "'37:88' or 'سوره 37 - آیات 71-113'."
+        ),
+    ),
+    volume: str | None = typer.Option(
+        None,
+        "--volume",
+        help="With --page, restrict to جلد N",
+    ),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="LLM backend for this command: gemini or groq (overrides LLM_PROVIDER)",
+    ),
+) -> None:
+    """Translate stored tafsir units into the missing languages. Not Phase 1."""
+    _setup_logging()
+    apply_llm_provider(provider)
+    report = _day_report("tafsir-reformation")
+    typer.echo(
+        f"tafsir-reformation day report (live, local day {report.day.isoformat()}): "
+        f"{report.md_path}"
+    )
+    state, gemini, _ = _stack(day_report=report)
+    report.bind_key_pool(gemini.pool)
+    gemini.groq_reasoning_effort = "none"
+    gemini.groq_temperature = 0.2
+    gemini.groq_max_completion_tokens = 1000
+    try:
+        stats = run_tafsir_reformation(
+            book,
+            gemini,
+            limit=limit,
+            page=page,
+            volume=volume,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except AllKeysExhausted as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    except ProviderServerError as exc:
+        typer.echo(
+            "LLM provider temporarily unavailable (503/5xx). "
+            "Progress saved — re-run the same command later.\n"
+            f"{exc}",
+            err=True,
+        )
+        raise typer.Exit(code=2) from exc
+    finally:
+        path = report.flush()
+        typer.echo(f"tafsir-reformation day report saved: {path}")
         state.close()
     typer.echo(stats)
 

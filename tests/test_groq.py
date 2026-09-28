@@ -67,6 +67,11 @@ def test_collect_groq_keys_order_and_dedupe():
     assert keys == ["alpha", "beta", "gamma", "delta"]
 
 
+def test_collect_groq_key4_without_underscore():
+    keys = collect_groq_keys({"GROQ_API_KEY1": "a", "GROQ_API_KEY4": "d"})
+    assert keys == ["a", "d"]
+
+
 def test_groq_key_ids_use_groq_prefix(state: StateManager):
     pool = KeyPool(state, _groq_settings(), keys=["secret"])
     assert pool._keys[0].id.startswith("groq-0-")
@@ -109,10 +114,41 @@ def test_groq_posts_medium_reasoning_payload(state: StateManager, monkeypatch: p
     assert captured["body"]["reasoning_effort"] == "medium"
     assert captured["body"]["max_completion_tokens"] == 16384
     assert captured["body"]["temperature"] == 0.6
+    assert captured["body"]["response_format"] == {"type": "json_object"}
     assert captured["auth"] == "Bearer gsk_test"
     assert captured["ua"] == "shiadata-graph"
     system = captured["body"]["messages"][0]["content"]
     assert "Return JSON only" in system
+
+
+def test_groq_json_validate_failed_is_not_provider_outage(
+    state: StateManager, monkeypatch: pytest.MonkeyPatch
+):
+    class Tiny(BaseModel):
+        page: str
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            "https://api.groq.com/openai/v1/chat/completions",
+            400,
+            "Bad Request",
+            hdrs={},
+            fp=BytesIO(
+                b'{"error":{"message":"Failed to generate JSON. Please adjust your prompt.",'
+                b'"type":"invalid_request_error","code":"json_validate_failed",'
+                b'"failed_generation":"{"}}'
+            ),
+        )
+
+    monkeypatch.setattr("src.agents.gemini.urllib.request.urlopen", fake_urlopen)
+    settings = _groq_settings()
+    agent = GeminiAgent(
+        state,
+        settings=settings,
+        key_pool=KeyPool(state, settings, keys=["gsk_test"]),
+    )
+    with pytest.raises(StructuredOutputError, match="JSON mode failed"):
+        agent.complete_structured("Locator: x", Tiny, system="extract")
 
 
 def test_groq_429_stays_rate_limited_not_overnight(

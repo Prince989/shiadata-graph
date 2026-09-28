@@ -286,6 +286,73 @@ tafsir_fa, and tafsir_en must be complete translations of this unit, not
 short summaries.
 """
 
+def tafsir_reformation_prompt(source_lang: str) -> str:
+    """Translate one stored commentary unit; never extract mentions or ayah ids."""
+    lang = "ar" if source_lang == "ar" else "fa"
+    if lang == "fa":
+        fields = (
+            "Return only:\n"
+            "  1. tafsir_ar   complete classical tafsir Arabic of THIS unit\n"
+            "  2. tafsir_en   complete formal English of THIS unit\n"
+            "Do not return tafsir_fa. The Persian source is already stored."
+        )
+        source_note = (
+            "The source is Persian commentary. Keep it as tafsir_fa in code; "
+            "you write Arabic and English only."
+        )
+    else:
+        fields = (
+            "Return only:\n"
+            "  1. tafsir_fa   complete fluent Persian of THIS unit\n"
+            "  2. tafsir_en   complete formal English of THIS unit\n"
+            "Do not return tafsir_ar. The Arabic source is already stored. "
+            "Do not rewrite the author's Arabic."
+        )
+        source_note = (
+            "The source is Arabic commentary. Keep it as tafsir_ar in code; "
+            "you write Persian and English only."
+        )
+    return f"""\
+You translate ONE window of a stored tafsir unit. This is not Phase 1 extraction.
+The unit may be longer than this window. Windows overlap so the argument
+continues; still translate EVERY sentence in THIS window in full. Code will
+seam overlapping wording later. Do NOT summarize the window or any earlier
+part of the unit. Do NOT write "the passage discusses". Do NOT omit sentences
+because they appeared in a previous window.
+
+Do NOT extract mentions. Do NOT return quotes, cited_hadiths, core_concepts,
+or any mention list. Do NOT invent sura or ayah numbers. Do NOT split the
+unit into single verses. Do NOT assign verse numbers to sentences.
+
+{source_note}
+
+{fields}
+
+ARABIC (when you generate it)
+
+Classical tafsir Arabic (commentary register): the language of a mufassir,
+not news Arabic, not MSA boilerplate, and not a word-for-word calque of
+the Persian. Generated Arabic is a rendering of THIS text. It is not a
+claim to have recovered Tabataba'i's original al-Mizan.
+
+ENGLISH
+
+Formal Islamic-studies English, complete, not a summary.
+
+COVERAGE
+
+Translate this entire window end-to-end, including overlapping sentences.
+Forbidden: ellipsis (`...` / `…`), "the passage discusses", a 2–4 sentence
+abstract, a recap of prior windows, or translating only the opening.
+
+QUR'AN AND HADITH INSIDE THE UNIT
+
+When the unit quotes Qur'an or hadith, copy the quotation in its standard
+Arabic wording. Do not paraphrase the verse. Do not invent sura or ayah
+numbers.
+"""
+
+
 HISTORY_PROMPT = """\
 You extract historical events from a long classical Arabic narrative.
 Split into distinct events with titles, characters, concepts, and the

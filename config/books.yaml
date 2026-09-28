@@ -20,9 +20,38 @@ sahifa:
 
 al-mizan:
   pipeline: tafsir
+  source_lang: fa
   description: Al-Mizan tafsir
   globs:
     - tafsir/al-mizan.txt
+
+noor:
+  pipeline: tafsir
+  source_lang: fa
+  description: Tafsir-e Noor
+  globs:
+    - tafsir/noor.txt
+
+nemune:
+  pipeline: tafsir
+  source_lang: fa
+  description: Tafsir-e Nemune
+  globs:
+    - tafsir/nemune.txt
+
+# al-borhan:
+#   pipeline: tafsir
+#   source_lang: ar
+#   description: Tafsir al-Burhan
+#   globs:
+#     - tafsir/al-borhan-*.txt
+
+# al-ayashi:
+#   pipeline: tafsir
+#   source_lang: ar
+#   description: Tafsir al-Ayyashi
+#   globs:
+#     - tafsir/al-ayashi-*.txt
 
 waqat-siffin:
   pipeline: history

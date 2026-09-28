@@ -309,6 +309,20 @@ class TafsirExtraction(BaseModel):
     tafsir_en: str = ""
 
 
+class TafsirReformation(BaseModel):
+    """On-disk translation unit. Not Phase 1: no mentions, quotes, or cited hadiths.
+
+    `source_lang` is `fa` or `ar`. Code copies the Folklib text into that
+    language field; the model writes only the other two.
+    """
+
+    locator: str = ""
+    source_lang: str = ""
+    tafsir_fa: str = ""
+    tafsir_ar: str = ""
+    tafsir_en: str = ""
+
+
 class HistoricalEvent(BaseModel):
     event_title: str
     mentions: list[Mention] = Field(default_factory=list)
