@@ -143,6 +143,8 @@ class Settings(BaseSettings):
 
     raw_data_dir: Path = RAW_EPUBS_DIR
     state_db: Path = STATE_DB_PATH
+    # Empty keeps SQLite. Set on the VM so both jobs share Postgres.
+    database_url: str = ""
     project_root: Path = PROJECT_ROOT
 
     gemini_timeout_s: float = 120.0
@@ -208,6 +210,8 @@ class Settings(BaseSettings):
         object.__setattr__(self, "gemini_model", models[0] if models else DEFAULT_GEMINI_MODELS[0])
         if env.get("EMBEDDING_MODEL"):
             object.__setattr__(self, "embedding_model", env["EMBEDDING_MODEL"])
+        if not str(self.database_url or "").strip() and env.get("DATABASE_URL"):
+            object.__setattr__(self, "database_url", env["DATABASE_URL"].strip())
         return self
 
 

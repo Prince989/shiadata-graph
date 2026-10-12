@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: shiadata
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shiadata}
+      POSTGRES_DB: shiadata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shiadata -d shiadata"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  hadith:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://shiadata:${POSTGRES_PASSWORD:-shiadata}@postgres:5432/shiadata
+      TZ: Asia/Tehran
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - python
+      - main.py
+      - run-phase1
+      - --book
+      - hadith
+      - --provider
+      - gemini
+    restart: unless-stopped
+
+  mizan:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://shiadata:${POSTGRES_PASSWORD:-shiadata}@postgres:5432/shiadata
+      TZ: Asia/Tehran
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - python
+      - main.py
+      - tafsir-reformation
+      - --book
+      - al-mizan
+      - --limit
+      - "1000"
+      - --provider
+      - groq
+    restart: unless-stopped
+
+  migrate:
+    profiles: ["tools"]
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://shiadata:${POSTGRES_PASSWORD:-shiadata}@postgres:5432/shiadata
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["python", "scripts/migrate_sqlite_to_postgres.py"]
+    restart: "no"
+
+volumes:
+  pgdata:
