@@ -21,7 +21,9 @@ services:
       DATABASE_URL: postgresql://shiadata:${POSTGRES_PASSWORD:-shiadata}@postgres:5432/shiadata
       TZ: Asia/Tehran
     volumes:
-      - ./data:/app/data
+      - ./data/raw_epubs:/app/data/raw_epubs:ro
+      - ./data/output/phase1:/app/data/output/phase1
+      - ./data/reports/phase1:/app/data/reports/phase1
     depends_on:
       postgres:
         condition: service_healthy
@@ -42,7 +44,9 @@ services:
       DATABASE_URL: postgresql://shiadata:${POSTGRES_PASSWORD:-shiadata}@postgres:5432/shiadata
       TZ: Asia/Tehran
     volumes:
-      - ./data:/app/data
+      - ./data/raw_epubs:/app/data/raw_epubs:ro
+      - ./data/output/tafsir-reformation:/app/data/output/tafsir-reformation
+      - ./data/reports/tafsir-reformation:/app/data/reports/tafsir-reformation
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,11 +69,16 @@ services:
     environment:
       DATABASE_URL: postgresql://shiadata:${POSTGRES_PASSWORD:-shiadata}@postgres:5432/shiadata
     volumes:
-      - ./data:/app/data
+      - ./data/raw_epubs:/app/data/raw_epubs:ro
+      - ./merged-data:/app/merged-data:ro
     depends_on:
       postgres:
         condition: service_healthy
-    entrypoint: ["python", "scripts/migrate_sqlite_to_postgres.py"]
+    entrypoint:
+      - python
+      - scripts/migrate_sqlite_to_postgres.py
+      - --sqlite
+      - /app/merged-data/state.db
     restart: "no"
 
 volumes:

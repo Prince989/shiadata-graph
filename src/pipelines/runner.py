@@ -284,6 +284,11 @@ def run_hadith_phase1(
                 next_by_pos = None
                 target_indexes: list[int] = []
                 last = state.get_hadith_progress(book_id, source)
+                logger.info(
+                    "hadith resume %s %s",
+                    path.name,
+                    last if last else "from the start",
+                )
                 start_i = 0
                 if last:
                     for i, unit in enumerate(ordered):

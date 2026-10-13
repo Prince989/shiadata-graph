@@ -8,6 +8,8 @@ __pycache__
 .mypy_cache
 *.egg-info
 data
+another-data
+merged-data
 .env
 **/.env
 dist

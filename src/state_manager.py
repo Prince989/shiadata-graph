@@ -103,6 +103,17 @@ def adapt_sql(sql: str, *, postgres: bool) -> str:
     return sql.replace("?", "%s")
 
 
+def source_basename(source_path: str) -> str:
+    """File name of a stored path.
+
+    Progress was saved with a Windows absolute path. Inside Docker that same
+    file is `/app/data/.../al-kafi-5.txt`. `Path.name` on Linux does not treat
+    backslashes as separators, so the comparison is done on the normalized text.
+    """
+    text = str(source_path).replace("\\", "/").rstrip("/")
+    return text.rsplit("/", 1)[-1]
+
+
 def _settings_database_url() -> str:
     """URL from the environment or this project's .env. Does not load Settings.
 
@@ -488,16 +499,55 @@ class StateManager:
         self._conn.execute("DELETE FROM key_cooldowns")
         self._conn.commit()
 
-    def get_hadith_buffer(self, book_id: str, source_path: str) -> dict[str, Any] | None:
+    def _lookup_hadith_row(
+        self, table: str, book_id: str, source_path: str, column: str
+    ):
         row = self._conn.execute(
-            "SELECT payload_json FROM hadith_buffer WHERE book_id = ? AND source_path = ?",
+            f"SELECT {column} FROM {table} WHERE book_id = ? AND source_path = ?",
             (book_id, source_path),
         ).fetchone()
+        if row is not None:
+            return row
+        name = source_basename(source_path)
+        if not name:
+            return None
+        rows = self._conn.execute(
+            f"SELECT source_path, {column} FROM {table} WHERE book_id = ?",
+            (book_id,),
+        ).fetchall()
+        matches = [
+            item
+            for item in rows
+            if source_basename(str(item["source_path"])) == name
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _drop_other_source_keys(self, table: str, book_id: str, source_path: str) -> None:
+        name = source_basename(source_path)
+        if not name:
+            return
+        rows = self._conn.execute(
+            f"SELECT source_path FROM {table} WHERE book_id = ?",
+            (book_id,),
+        ).fetchall()
+        for row in rows:
+            stored = str(row["source_path"])
+            if stored != source_path and source_basename(stored) == name:
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE book_id = ? AND source_path = ?",
+                    (book_id, stored),
+                )
+
+    def get_hadith_buffer(self, book_id: str, source_path: str) -> dict[str, Any] | None:
+        row = self._lookup_hadith_row("hadith_buffer", book_id, source_path, "payload_json")
         return json.loads(row["payload_json"]) if row else None
 
     def set_hadith_buffer(
         self, book_id: str, source_path: str, payload: dict[str, Any] | None
     ) -> None:
+        self._drop_other_source_keys("hadith_buffer", book_id, source_path)
         if payload is None:
             self._conn.execute(
                 "DELETE FROM hadith_buffer WHERE book_id = ? AND source_path = ?",
@@ -517,13 +567,13 @@ class StateManager:
         self._conn.commit()
 
     def get_hadith_progress(self, book_id: str, source_path: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT last_locator FROM hadith_progress WHERE book_id = ? AND source_path = ?",
-            (book_id, source_path),
-        ).fetchone()
+        row = self._lookup_hadith_row(
+            "hadith_progress", book_id, source_path, "last_locator"
+        )
         return str(row["last_locator"]) if row else None
 
     def set_hadith_progress(self, book_id: str, source_path: str, last_locator: str) -> None:
+        self._drop_other_source_keys("hadith_progress", book_id, source_path)
         self._conn.execute(
             """
             INSERT INTO hadith_progress(book_id, source_path, last_locator, updated_at)
